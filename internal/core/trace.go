@@ -12,25 +12,46 @@ import (
 	"github.com/knight000/qqbot/internal/host"
 )
 
+// Level 是调试轨迹的详细程度。
+type Level string
+
+const (
+	// LevelFull 打印收到的每条事件、插件命中、发送结果与未命中提示。
+	LevelFull Level = "full"
+
+	// LevelPlugin 只打印触发插件的内容与真正发出的回复正文，
+	// 不含事件 ID、union 与未命中的消息。指令型 bot 多数消息无关，
+	// 这个级别下控制台只留下"谁触发了我、我回了什么"。
+	LevelPlugin Level = "plugin"
+)
+
 // Trace 是调试模式的控制台轨迹：一条消息从"收到"到"发出"的完整链路。
 //
 // 与 slog 的分工：slog 面向机器（可检索、可接 journald），Trace 面向人。
 // 只在 [debug].enabled=true 或命令行 -debug 时启用；格式固定、不加颜色，
 // 重定向到文件也能直接读。nil 的 Trace 表示关闭，所有方法可安全调用。
 type Trace struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu    sync.Mutex
+	w     io.Writer
+	level Level
 }
 
 // NewTrace 构造轨迹输出；w 为 nil 时返回 nil（表示关闭）。
-func NewTrace(w io.Writer) *Trace {
+// level 为空按 LevelFull 处理，保持旧行为。
+func NewTrace(w io.Writer, level Level) *Trace {
 	if w == nil {
 		return nil
 	}
-	return &Trace{w: w}
+	if level != LevelPlugin {
+		level = LevelFull
+	}
+	return &Trace{w: w, level: level}
 }
 
 func (t *Trace) enabled() bool { return t != nil && t.w != nil }
+
+// full 表示是否打印"收到/未命中"这类全量信息。
+func (t *Trace) full() bool { return t.enabled() && t.level != LevelPlugin }
 
 // emit 一次写完整块，避免多协程输出交错。
 func (t *Trace) emit(s string) {
@@ -42,8 +63,9 @@ func (t *Trace) emit(s string) {
 func stamp() string { return time.Now().Format("15:04:05.000") }
 
 // Received 打印收到的事件。放在去重之前调用，保证"收到的每一条"都能看到。
+// level=plugin 时跳过：这个级别只关心触发了插件的消息。
 func (t *Trace) Received(ev *host.Event) {
-	if !t.enabled() {
+	if !t.full() {
 		return
 	}
 
@@ -76,7 +98,7 @@ func (t *Trace) Received(ev *host.Event) {
 
 // Duplicate 打印被幂等表拦下的事件。
 func (t *Trace) Duplicate(ev *host.Event) {
-	if !t.enabled() {
+	if !t.full() {
 		return
 	}
 	t.emit(fmt.Sprintf("[%s] 重复事件，已跳过：%s\n", stamp(), dash(ev.ID)))
@@ -84,7 +106,7 @@ func (t *Trace) Duplicate(ev *host.Event) {
 
 // NoMatch 打印没有插件认领的消息。
 func (t *Trace) NoMatch(ev *host.Event) {
-	if !t.enabled() {
+	if !t.full() {
 		return
 	}
 	what := ev.Type
@@ -95,7 +117,10 @@ func (t *Trace) NoMatch(ev *host.Event) {
 }
 
 // Hit 打印路由命中的插件与具体命令。
-func (t *Trace) Hit(m Match) {
+//
+// level=plugin 时附带触发内容，并省掉优先级：这个级别下"哪条消息触发了谁"
+// 就是要看的全部信息，优先级只在排查多个插件争抢时才有意义。
+func (t *Trace) Hit(m Match, ev *host.Event) {
 	if !t.enabled() {
 		return
 	}
@@ -107,12 +132,29 @@ func (t *Trace) Hit(m Match) {
 	if m.Manifest.Version != "" {
 		name += " v" + m.Manifest.Version
 	}
-	t.emit(fmt.Sprintf("[%s] 命中插件 %s · %s · 优先级 %d\n", stamp(), name, cmd, m.Priority))
+
+	if t.full() {
+		t.emit(fmt.Sprintf("[%s] 命中插件 %s · %s · 优先级 %d\n", stamp(), name, cmd, m.Priority))
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] 命中插件 %s · %s\n", stamp(), name, cmd)
+	if ev != nil && ev.IsMessage() {
+		b.WriteString("    内容  ：" + contentBlock(ev.Content) + "\n")
+	} else if ev != nil {
+		b.WriteString("    事件  ：" + ev.Type + "\n")
+	}
+	t.emit(b.String())
 }
 
 // PluginDone 打印插件处理结果；回复正文由 Sent 统一打印，避免重复。
+// level=plugin 时成功分支不打印，只保留出错，否则每个插件会有两行冗余。
 func (t *Trace) PluginDone(m Match, cost time.Duration, reply *host.Reply, err error) {
 	if !t.enabled() {
+		return
+	}
+	if !t.full() && err == nil {
 		return
 	}
 	switch {
@@ -131,26 +173,40 @@ func (t *Trace) CoreCommand(cmd string) {
 	if !t.enabled() {
 		return
 	}
-	t.emit(fmt.Sprintf("[%s] 命中核心指令 %s（不进入插件路由）\n", stamp(), cmd))
+	if t.full() {
+		t.emit(fmt.Sprintf("[%s] 命中核心指令 %s（不进入插件路由）\n", stamp(), cmd))
+		return
+	}
+	t.emit(fmt.Sprintf("[%s] 核心指令 %s\n", stamp(), cmd))
 }
 
 // Sent 打印一次出站结果，包含实际发送的正文。
 // seq 为被动回复序号，主动消息没有 seq（传 0）。
+//
+// level=plugin 时省略目标 openid 与 seq：这个级别只回答"回了什么"。
 func (t *Trace) Sent(kind string, scene host.Scene, peer string, seq int, content string, err error, cost time.Duration) {
 	if !t.enabled() {
 		return
 	}
 
 	var b strings.Builder
-	target := dash(peer)
-	if err != nil {
-		fmt.Fprintf(&b, "[%s] 发送失败（%s %s → %s）：%v\n", stamp(), kind, sceneLabel(scene), target, err)
-	} else {
-		fmt.Fprintf(&b, "[%s] 已发送（%s %s → %s）", stamp(), kind, sceneLabel(scene), target)
-		if seq > 0 {
-			fmt.Fprintf(&b, " seq=%d", seq)
+	if t.full() {
+		target := dash(peer)
+		if err != nil {
+			fmt.Fprintf(&b, "[%s] 发送失败（%s %s → %s）：%v\n", stamp(), kind, sceneLabel(scene), target, err)
+		} else {
+			fmt.Fprintf(&b, "[%s] 已发送（%s %s → %s）", stamp(), kind, sceneLabel(scene), target)
+			if seq > 0 {
+				fmt.Fprintf(&b, " seq=%d", seq)
+			}
+			fmt.Fprintf(&b, " · %s\n", costText(cost))
 		}
-		fmt.Fprintf(&b, " · %s\n", costText(cost))
+	} else {
+		if err != nil {
+			fmt.Fprintf(&b, "[%s] %s %s 失败：%v\n", stamp(), kind, sceneLabel(scene), err)
+		} else {
+			fmt.Fprintf(&b, "[%s] %s %s · %s\n", stamp(), kind, sceneLabel(scene), costText(cost))
+		}
 	}
 	if content != "" {
 		b.WriteString("    内容  ：" + contentBlock(content) + "\n")
@@ -160,8 +216,9 @@ func (t *Trace) Sent(kind string, scene host.Scene, peer string, seq int, conten
 
 // Raw 打印平台原始事件 JSON（[debug].raw=true）。只给排查字段缺失用，
 // 正常调试不必打开：一条事件就可能几十行。
+// level=plugin 时同样不输出——那是"收到的原始事件"，与精简级别相悖。
 func (t *Trace) Raw(typ string, raw []byte) {
-	if !t.enabled() {
+	if !t.full() {
 		return
 	}
 	const limit = 16 << 10

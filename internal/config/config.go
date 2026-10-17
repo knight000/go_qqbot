@@ -104,9 +104,22 @@ type Log struct {
 // Debug 是调试模式：把收到的事件、命中的插件与回复内容打印到控制台。
 // 与 log.level 分开——日志给机器检索，调试轨迹给人看一条完整链路。
 // 命令行 -debug 可临时打开（不改配置文件）。
+// 调试轨迹级别。
+const (
+	// DebugFull 打印收到的每条事件、命中插件、发送结果与未命中提示。
+	DebugFull = "full"
+	// DebugPlugin 只打印触发插件的内容与真正发出的回复正文，
+	// 不含事件 ID、union 与无关消息。
+	DebugPlugin = "plugin"
+)
+
 type Debug struct {
 	Enabled bool `toml:"enabled"`
+	// Level 是轨迹详细程度：full（默认，收到/命中/发送全链路）或
+	// plugin（只打印触发插件的内容与回复正文）。
+	Level string `toml:"level"`
 	// Raw 额外打印平台原始 JSON，排查"某字段平台到底给没给"时用。
+	// 只在 level=full 时生效。
 	Raw bool `toml:"raw"`
 }
 
@@ -194,6 +207,10 @@ func (c *Config) applyDefaults() {
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
+	if c.Debug.Level == "" {
+		c.Debug.Level = DebugFull
+	}
+	c.Debug.Level = strings.ToLower(strings.TrimSpace(c.Debug.Level))
 	if c.Log.Format == "" {
 		c.Log.Format = "text"
 	}
@@ -222,6 +239,14 @@ func (c *Config) Validate() error {
 	case "text", "json":
 	default:
 		problems = append(problems, fmt.Sprintf("log.format=%q 非法", c.Log.Format))
+	}
+	switch strings.ToLower(c.Debug.Level) {
+	case DebugFull, DebugPlugin:
+	default:
+		problems = append(problems, fmt.Sprintf("debug.level=%q 非法（可选 full / plugin）", c.Debug.Level))
+	}
+	if c.Debug.Raw && strings.EqualFold(c.Debug.Level, DebugPlugin) {
+		problems = append(problems, "debug.raw 需要 level=full：plugin 级别不输出原始事件")
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("配置校验失败:\n  - %s", strings.Join(problems, "\n  - "))

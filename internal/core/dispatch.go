@@ -125,7 +125,7 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 	}
 
 	for _, m := range chosen {
-		d.trace.Hit(m)
+		d.trace.Hit(m, ev)
 		d.run(ctx, m, ev)
 	}
 }

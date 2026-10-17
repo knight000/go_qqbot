@@ -154,8 +154,14 @@ func run() (*core.RestartRequest, error) {
 		log.Info("本次启动由 /reload 触发", "version", bi.String())
 	}
 	if cfg.Debug.Enabled {
-		log.Info("调试模式已开启：收到的每条事件、插件命中与回复内容都会打印到控制台",
-			"raw", cfg.Debug.Raw)
+		if cfg.Debug.Level == config.DebugPlugin {
+			log.Info("调试模式已开启", "level", cfg.Debug.Level,
+				"detail", "只打印触发插件的内容与回复正文")
+		} else {
+			log.Info("调试模式已开启", "level", cfg.Debug.Level,
+				"detail", "收到的每条事件、插件命中与回复内容都会打印到控制台",
+				"raw", cfg.Debug.Raw)
+		}
 	}
 
 	var req *core.RestartRequest
