@@ -26,8 +26,10 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 cp config/config.example.toml config/config.local.toml
 # 填入 [app] id / secret，保持 sandbox = true
 
-go run ./cmd/bot -c config/config.local.toml
+go run ./cmd/bot          # 不填 -c 时默认读相对路径 config/config.local.toml
 ```
+
+默认路径是**相对当前工作目录**的 `config/config.local.toml`；换目录启动或改用 `/etc/qqbot/config.toml` 时用 `-c <路径>` 指定。
 
 启动日志里会出现：
 
