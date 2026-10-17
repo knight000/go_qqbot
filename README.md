@@ -62,7 +62,7 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 ### `level = "full"`（默认）
 
 ```
-[15:24:01.122] 收到 群聊 · GROUP_AT_MESSAGE_CREATE
+[15:24:01.122] 收到 群聊消息 · GROUP_AT_MESSAGE_CREATE
     发送者：EF9A533C3FB062916F7FEF7E39DD532D
     union ：—（平台未下发）
     peer  ：1ABC...

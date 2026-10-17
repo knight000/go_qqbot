@@ -56,6 +56,24 @@ D5 的前提是：v2 群消息事件载荷不含发送者群角色，公开接�
 | 日志（journald 限额） | 200 MB |
 | 结论 | 20 GB 盘余量充裕；1 GB 内存下与 TS3/WebDAV 共存可行，但需 `MemoryMax` 约束 |
 
+### 1.4 事件模型（三轴）
+
+平台事件统一由三个字段描述，插件只认这三个维度：
+
+| 轴 | 字段 | 取值 | 决定什么 |
+|---|---|---|---|
+| 大类 | `Kind` | `message` / `notice` / `request` / `meta` / `unknown` | 是否落库、能否进入插件路由 |
+| 场景 | `Scene` | `group` / `c2c` / `guild` | `PeerID` 的含义、回复走哪个端点 |
+| 平台事件名 | `Name` | 如 `GROUP_AT_MESSAGE_CREATE` | 只用于观测与解码表索引，插件不订阅它 |
+
+- 本地解码覆盖全部 12 个群与单聊事件（2 个群消息 + 1 个单聊消息 + 9 个通知/请求），另有 4 个跨场景事件：`FRIEND_ADD`、`FRIEND_DEL`、`INTERACTION_CREATE`、`SUBSCRIBE_MESSAGE_STATUS`。
+- `GROUP_AT_MESSAGE_CREATE`（@机器人）与 `GROUP_MESSAGE_CREATE`（全量模式：群主开启「接收所有消息」后群里每条消息都推）字段结构一致，**归一化为同一类 `message` 事件**，下游不区分。
+- 解码表里没有的事件归为 `Kind=unknown`：进调试轨迹、可观测，**永不进入插件路由**。
+- 订阅语法：`Manifest.Intents` 写 `<kind>` 或 `<scene>.<kind>`，例如 `message`、`group.message`；写错在装配阶段即拒绝加载。
+
+决策背景见 `docs/adr/0001-event-model.md`。
+
+
 ---
 
 ## 2. 总体架构

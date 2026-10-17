@@ -12,7 +12,9 @@ import (
 )
 
 // APIVersion 是核心与插件之间的契约版本，不匹配直接拒绝加载。
-const APIVersion = "1"
+//
+// 版本 2：事件改为三轴（Kind / Scene / Name），移除 Event.Type。
+const APIVersion = "2"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -23,31 +25,36 @@ const (
 	SceneGuild Scene = "guild"
 )
 
-// 事件类型与平台 t 字段一一对应。
+// Kind 是事件的大类。它决定该事件要不要落库、能不能进入插件路由。
+type Kind string
+
 const (
-	EventGroupMessage = "GROUP_AT_MESSAGE_CREATE"
-	EventC2CMessage   = "C2C_MESSAGE_CREATE"
-	EventGroupAdd     = "GROUP_ADD_ROBOT"
-	EventGroupDel     = "GROUP_DEL_ROBOT"
+	KindMessage Kind = "message" // 用户在会话里说的一句话
+	KindNotice  Kind = "notice"  // 会话状态或成员关系的变化
+	KindRequest Kind = "request" // 需要应答的请求（如申请加群）
+	KindMeta    Kind = "meta"    // 平台自身的元事件（订阅授权等）
+	KindUnknown Kind = "unknown" // 解码表里没有的事件，只观测、不路由
 )
 
 // Event 是归一化后的事件。插件只看这一层，感知不到 WSS 与 opcode。
 type Event struct {
-	ID        string // 平台事件/消息 ID，用于幂等
-	Type      string // 见 Event* 常量
-	Scene     Scene  // group | c2c | guild
-	PeerID    string // 群 openid 或用户 openid
-	SenderID  string // 发送者 openid（群为 member_openid，单聊为 user_openid）
-	UnionID   string // 平台给的跨场景标识，可能为空
-	MsgID     string // 被动回复必须携带
-	Content   string
+	ID       string // 平台事件/消息 ID，用于幂等
+	Kind     Kind   // 大类，见 Kind* 常量
+	Name     string // 平台原始事件名，只用于观测与排障
+	Scene    Scene  // group | c2c | guild；无法判定时为空
+	PeerID   string // 群 openid 或用户 openid
+	SenderID string // 发送者 openid（群为 member_openid，单聊为 user_openid）
+	UnionID  string // 平台给的跨场景标识，可能为空
+	MsgID    string // 被动回复必须携带
+	Content  string
+	// MsgType 是平台的 message_type：0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用。
+	MsgType   int
 	HasMedia  bool
+	Payload   []byte // 原始 JSON，仅未知事件保留（排查"平台到底推了什么"）
 	Timestamp time.Time
 }
 
-func (e *Event) IsMessage() bool {
-	return e.Type == EventGroupMessage || e.Type == EventC2CMessage
-}
+func (e *Event) IsMessage() bool { return e.Kind == KindMessage }
 
 // Identity 是鉴权用的发送者身份。
 //
@@ -159,7 +166,7 @@ type Manifest struct {
 	Version        string
 	APIVersion     string
 	Capabilities   []string
-	Intents        []string // 订阅的事件类型
+	Intents        []string // 订阅的事件：`message` 这样的大类，或 `group.message` 这样的场景限定
 	Commands       []Command
 	Broadcast      bool
 	AllowedDomains []string

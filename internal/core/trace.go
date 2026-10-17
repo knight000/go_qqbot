@@ -34,6 +34,8 @@ type Trace struct {
 	mu    sync.Mutex
 	w     io.Writer
 	level Level
+	// unknownPayload 让未知事件附带原始 JSON（[debug].unknown_events=true）。
+	unknownPayload bool
 }
 
 // NewTrace 构造轨迹输出；w 为 nil 时返回 nil（表示关闭）。
@@ -70,7 +72,7 @@ func (t *Trace) Received(ev *host.Event) {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "[%s] 收到 %s · %s\n", stamp(), sceneLabel(ev.Scene), ev.Type)
+	fmt.Fprintf(&b, "[%s] 收到 %s · %s\n", stamp(), eventLabel(ev), ev.Name)
 	b.WriteString("    发送者：" + dash(ev.SenderID) + "\n")
 
 	union := ev.UnionID
@@ -109,7 +111,7 @@ func (t *Trace) NoMatch(ev *host.Event) {
 	if !t.full() {
 		return
 	}
-	what := ev.Type
+	what := eventLabel(ev) + " · " + ev.Name
 	if ev.IsMessage() {
 		what = "内容 " + preview(ev.Content, 40)
 	}
@@ -143,7 +145,7 @@ func (t *Trace) Hit(m Match, ev *host.Event) {
 	if ev != nil && ev.IsMessage() {
 		b.WriteString("    内容  ：" + contentBlock(ev.Content) + "\n")
 	} else if ev != nil {
-		b.WriteString("    事件  ：" + ev.Type + "\n")
+		b.WriteString("    事件  ：" + ev.Name + "\n")
 	}
 	t.emit(b.String())
 }
@@ -241,6 +243,51 @@ func (t *Trace) Raw(typ string, raw []byte) {
 	}
 	b.WriteString("\n")
 	t.emit(b.String())
+}
+
+// SetUnknownPayload 让未知事件附带原始 JSON。nil Trace 安全。
+func (t *Trace) SetUnknownPayload(v bool) {
+	if t == nil {
+		return
+	}
+	t.unknownPayload = v
+}
+
+// Unknown 打印解码表里没有的事件。这是"平台推了、本地不认识"的唯一出口：
+// 它不进幂等表、不落库、不触发插件，所以排查"为什么没反应"时只能靠这一行。
+func (t *Trace) Unknown(ev *host.Event) {
+	if !t.enabled() {
+		return
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] 未知事件 %s（解码表里没有，不路由）\n", stamp(), ev.Name)
+	if t.unknownPayload && len(ev.Payload) > 0 {
+		b.WriteString("    原始  ：" + contentBlock(string(ev.Payload)) + "\n")
+	}
+	t.emit(b.String())
+}
+
+// eventLabel 把大类与场景压成给人看的一行：群聊消息 / 单聊通知 / 未知事件。
+func eventLabel(ev *host.Event) string {
+	if ev.Kind == host.KindUnknown {
+		return "未知事件"
+	}
+	return sceneLabel(ev.Scene) + kindLabel(ev.Kind)
+}
+
+func kindLabel(k host.Kind) string {
+	switch k {
+	case host.KindMessage:
+		return "消息"
+	case host.KindNotice:
+		return "通知"
+	case host.KindRequest:
+		return "请求"
+	case host.KindMeta:
+		return "元事件"
+	default:
+		return string(k)
+	}
 }
 
 func sceneLabel(s host.Scene) string {

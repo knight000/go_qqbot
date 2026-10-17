@@ -121,6 +121,9 @@ type Debug struct {
 	// Raw 额外打印平台原始 JSON，排查"某字段平台到底给没给"时用。
 	// 只在 level=full 时生效。
 	Raw bool `toml:"raw"`
+	// UnknownEvents 让未知事件（解码表里还没有的平台事件）附带原始 JSON，
+	// 用来确认平台新推了什么。未知事件永不进入插件路由。
+	UnknownEvents bool `toml:"unknown_events"`
 }
 
 // Plugin 返回某个插件的配置段（不存在时返回空 map，插件自行取默认值）。

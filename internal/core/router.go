@@ -28,7 +28,7 @@ type route struct {
 	plugin   host.Plugin
 	manifest host.Manifest
 	cmds     []compiledCommand
-	intents  map[string]bool
+	intents  intentSet
 }
 
 // Router 在插件的 matcher 表上做匹配，核心不解析业务语义。
@@ -48,13 +48,14 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 				m.Name, m.APIVersion, host.APIVersion)
 		}
 
+		intents, err := parseIntents(m.Name, m.Intents)
+		if err != nil {
+			return nil, err
+		}
 		rt := &route{
 			plugin:   p,
 			manifest: m,
-			intents:  make(map[string]bool, len(m.Intents)),
-		}
-		for _, it := range m.Intents {
-			rt.intents[it] = true
+			intents:  intents,
 		}
 
 		for _, c := range m.Commands {
@@ -97,7 +98,7 @@ type Match struct {
 func (r *Router) Match(ev *host.Event) []Match {
 	var out []Match
 	for _, rt := range r.routes {
-		if !rt.intents[ev.Type] {
+		if !rt.intents.match(ev) {
 			continue
 		}
 		prio, cmd, ok := matchCommands(rt.cmds, ev)
@@ -139,4 +140,68 @@ func matchCommands(cmds []compiledCommand, ev *host.Event) (priority int, comman
 		}
 	}
 	return best, command, ok
+}
+
+// intent 是解析后的订阅项：kind 必填，scene 为空表示"任意场景"。
+type intent struct {
+	scene host.Scene
+	kind  host.Kind
+}
+
+type intentSet []intent
+
+// parseIntents 解析 Manifest.Intents：`message`（任意场景）或 `group.message`（限定场景）。
+//
+// 写错在装配阶段就报错，而不是让插件"看起来订阅了、实际一条都收不到"——
+// 未知事件永不进入路由，拼写错误不会被任何运行时现象掩盖。
+func parseIntents(plugin string, list []string) (intentSet, error) {
+	set := make(intentSet, 0, len(list))
+	for _, raw := range list {
+		parts := strings.Split(strings.TrimSpace(raw), ".")
+		it := intent{}
+		switch len(parts) {
+		case 1:
+			it.kind = host.Kind(parts[0])
+		case 2:
+			it.scene = host.Scene(parts[0])
+			it.kind = host.Kind(parts[1])
+		default:
+			return nil, fmt.Errorf("插件 %s 的 intent %q 格式错误，应为 `message` 或 `group.message`", plugin, raw)
+		}
+		if !validKind(it.kind) {
+			return nil, fmt.Errorf("插件 %s 的 intent %q 含未知大类 %q（可选 message / notice / request / meta）",
+				plugin, raw, it.kind)
+		}
+		if it.scene != "" && !validScene(it.scene) {
+			return nil, fmt.Errorf("插件 %s 的 intent %q 含未知场景 %q（可选 group / c2c / guild）",
+				plugin, raw, it.scene)
+		}
+		set = append(set, it)
+	}
+	return set, nil
+}
+
+func validKind(k host.Kind) bool {
+	switch k {
+	case host.KindMessage, host.KindNotice, host.KindRequest, host.KindMeta:
+		return true
+	}
+	return false
+}
+
+func validScene(s host.Scene) bool {
+	switch s {
+	case host.SceneGroup, host.SceneC2C, host.SceneGuild:
+		return true
+	}
+	return false
+}
+
+func (s intentSet) match(ev *host.Event) bool {
+	for _, it := range s {
+		if it.kind == ev.Kind && (it.scene == "" || it.scene == ev.Scene) {
+			return true
+		}
+	}
+	return false
 }

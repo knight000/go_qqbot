@@ -308,9 +308,9 @@ func (c *Client) dispatch(ctx context.Context, t string, raw json.RawMessage) {
 	if c.o.RawDump != nil {
 		c.o.RawDump(t, raw)
 	}
-	ev, ok := Decode(t, raw)
-	if !ok {
-		c.lg.Debug("忽略未订阅事件", "t", t)
+	ev, err := Decode(t, raw)
+	if err != nil {
+		c.lg.Warn("忽略无法解码的事件", "t", t, "err", err)
 		return
 	}
 	if ev.ID == "" {
