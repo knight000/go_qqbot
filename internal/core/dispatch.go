@@ -20,6 +20,7 @@ type Dispatcher struct {
 	sender  *Sender
 	log     *slog.Logger
 	handler time.Duration
+	trace   *Trace
 
 	sem chan struct{}
 
@@ -106,6 +107,7 @@ func (d *Dispatcher) peerLoop(ctx context.Context, key string, q *peerQueue) {
 func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 	matches := d.router.Match(ev)
 	if len(matches) == 0 {
+		d.trace.NoMatch(ev)
 		d.log.Debug("无插件匹配", "type", ev.Type, "content", ev.Content)
 		return
 	}
@@ -123,6 +125,7 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 	}
 
 	for _, m := range chosen {
+		d.trace.Hit(m)
 		d.run(ctx, m, ev)
 	}
 }
@@ -140,10 +143,12 @@ func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {
 
 	start := time.Now()
 	reply, err := d.invoke(hctx, m, ev)
+	cost := time.Since(start)
+	d.trace.PluginDone(m, cost, reply, err)
 	if err != nil {
 		d.log.Error("插件处理失败",
 			"plugin", m.Manifest.Name, "event", ev.ID, "type", ev.Type,
-			"cost", time.Since(start).String(), "err", err)
+			"cost", cost.String(), "err", err)
 		return
 	}
 	if reply == nil {

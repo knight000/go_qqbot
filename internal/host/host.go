@@ -37,7 +37,8 @@ type Event struct {
 	Type      string // 见 Event* 常量
 	Scene     Scene  // group | c2c | guild
 	PeerID    string // 群 openid 或用户 openid
-	SenderID  string // 发送者 openid
+	SenderID  string // 发送者 openid（群为 member_openid，单聊为 user_openid）
+	UnionID   string // 平台给的跨场景标识，可能为空
 	MsgID     string // 被动回复必须携带
 	Content   string
 	HasMedia  bool
@@ -46,6 +47,34 @@ type Event struct {
 
 func (e *Event) IsMessage() bool {
 	return e.Type == EventGroupMessage || e.Type == EventC2CMessage
+}
+
+// Identity 是鉴权用的发送者身份。
+//
+// 三个字段缺一不可：OpenID 只在所属场景内有效，UnionID 用来跨场景识别同一个人，
+// PeerID 决定 peer_scope 是否放行。插件不要自己拼身份，直接用 Event.Identity()。
+type Identity struct {
+	OpenID  string
+	UnionID string
+	Scene   Scene
+	PeerID  string
+}
+
+func (e *Event) Identity() Identity {
+	return Identity{OpenID: e.SenderID, UnionID: e.UnionID, Scene: e.Scene, PeerID: e.PeerID}
+}
+
+// AdminTarget 是"可以主动私聊的管理员"。
+// C2COpenID 为空表示该管理员只留下过群身份，平台无法向其发起单聊。
+type AdminTarget struct {
+	Role      string // owner | admin
+	C2COpenID string
+	Note      string
+}
+
+// AdminDirectory 让插件取到通知收件人，而不用（也不允许）自己查 admins 表。
+type AdminDirectory interface {
+	Targets(ctx context.Context) ([]AdminTarget, error)
 }
 
 // Reply 是插件的唯一出站形态。
@@ -100,8 +129,8 @@ type Scheduler interface {
 
 // Host 是插件可见的全部能力。
 //
-// IsAdmin 也是能力项：插件不需要（也不允许）直接查 admins 表来判断权限，
-// 只能就"某人在某场景/某 peer 下是不是管理员"向宿主提问。
+// IsAdmin 与 Admins 也是能力项：插件不需要（也不允许）直接查 admins 表，
+// 只能就"这个人是不是管理员"向宿主提问，或者取"可以私聊谁"的收件人列表。
 type Host interface {
 	Plugin() string
 	Config() Params
@@ -110,8 +139,10 @@ type Host interface {
 	Query() QueryStore
 	HTTP() HTTP
 	Scheduler() Scheduler
-	// IsAdmin 委托 core 判定管理员身份（owner 隐含全部权限，peer_scope 为空表示全局）。
-	IsAdmin(ctx context.Context, scene Scene, openid, peer string) (bool, error)
+	// IsAdmin 委托 core 判定管理员身份；owner 与 admin 都返回 true。
+	IsAdmin(ctx context.Context, id Identity) (bool, error)
+	// Admins 提供启动通知等场景所需的收件人列表（已按单聊 openid 去重）。
+	Admins() AdminDirectory
 	Log() *slog.Logger
 }
 

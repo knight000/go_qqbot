@@ -34,6 +34,8 @@ type Options struct {
 	ShardID    int
 	Resume     bool
 	Handler    func(ctx context.Context, ev *host.Event)
+	// RawDump 非空时，每条 dispatch 事件在解码前把原始 JSON 交出去（调试用）。
+	RawDump func(typ string, raw []byte)
 }
 
 type Client struct {
@@ -303,6 +305,9 @@ func (c *Client) onReady(ctx context.Context, raw json.RawMessage) {
 }
 
 func (c *Client) dispatch(ctx context.Context, t string, raw json.RawMessage) {
+	if c.o.RawDump != nil {
+		c.o.RawDump(t, raw)
+	}
 	ev, ok := Decode(t, raw)
 	if !ok {
 		c.lg.Debug("忽略未订阅事件", "t", t)

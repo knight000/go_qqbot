@@ -10,13 +10,16 @@ import (
 )
 
 // reservedPrefixes 是核心保留指令。插件若声明相同前缀，启动即拒绝加载，
-// 否则第三方插件可以劫持 /reset 之类的不可逆操作（§3.4）。
-var reservedPrefixes = []string{"/claim", "/reset", "/grant", "/revoke"}
+// 否则第三方插件可以劫持 /reset 之类的不可逆操作（§3.4），
+// 或者用 /admin 给自己提权。
+var reservedPrefixes = []string{"/claim", "/admin", "/reset", "/grant", "/revoke"}
 
 type compiledCommand struct {
 	prefix   string
 	re       *regexp.Regexp
 	priority int
+	// label 是给人看的原始写法（prefix 或正则），只在调试轨迹里用。
+	label string
 }
 
 type route struct {
@@ -56,7 +59,7 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 			if (c.Prefix == "") == (c.Pattern == "") {
 				return nil, fmt.Errorf("插件 %s 的命令必须且只能设置 Prefix 或 Pattern 之一", m.Name)
 			}
-			cc := compiledCommand{prefix: c.Prefix, priority: c.Priority}
+			cc := compiledCommand{prefix: c.Prefix, priority: c.Priority, label: c.Prefix}
 			if c.Prefix != "" {
 				for _, rp := range reservedPrefixes {
 					if strings.HasPrefix(strings.ToLower(c.Prefix), rp) {
@@ -70,6 +73,7 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 					return nil, fmt.Errorf("插件 %s 的正则 %q 无法编译: %w", m.Name, c.Pattern, err)
 				}
 				cc.re = re
+				cc.label = c.Pattern
 			}
 			rt.cmds = append(rt.cmds, cc)
 		}
@@ -84,6 +88,8 @@ type Match struct {
 	Plugin   host.Plugin
 	Manifest host.Manifest
 	Priority int
+	// Command 是命中的命令写法（前缀或正则），供调试输出定位"为什么是它"。
+	Command string
 }
 
 func (r *Router) Match(ev *host.Event) []Match {
@@ -92,11 +98,11 @@ func (r *Router) Match(ev *host.Event) []Match {
 		if !rt.intents[ev.Type] {
 			continue
 		}
-		prio, ok := matchCommands(rt.cmds, ev)
+		prio, cmd, ok := matchCommands(rt.cmds, ev)
 		if !ok {
 			continue
 		}
-		out = append(out, Match{Plugin: rt.plugin, Manifest: rt.manifest, Priority: prio})
+		out = append(out, Match{Plugin: rt.plugin, Manifest: rt.manifest, Priority: prio, Command: cmd})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {
@@ -107,16 +113,15 @@ func (r *Router) Match(ev *host.Event) []Match {
 	return out
 }
 
-func matchCommands(cmds []compiledCommand, ev *host.Event) (int, bool) {
+func matchCommands(cmds []compiledCommand, ev *host.Event) (priority int, command string, ok bool) {
 	// 未声明命令 = 订阅该 intent 的全部事件
 	if len(cmds) == 0 {
-		return 0, true
+		return 0, "", true
 	}
 	if !ev.IsMessage() {
-		return 0, false
+		return 0, "", false
 	}
 	best := -1 << 31
-	found := false
 	content := strings.TrimSpace(ev.Content)
 	for _, c := range cmds {
 		hit := false
@@ -127,8 +132,9 @@ func matchCommands(cmds []compiledCommand, ev *host.Event) (int, bool) {
 		}
 		if hit && c.priority > best {
 			best = c.priority
-			found = true
+			command = c.label
+			ok = true
 		}
 	}
-	return best, found
+	return best, command, ok
 }

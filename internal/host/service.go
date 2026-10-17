@@ -57,9 +57,11 @@ type QueryBackend interface {
 	QueryRows(ctx context.Context, query string, args ...any) ([]map[string]any, error)
 }
 
-// AdminBackend 由 store.DB 实现，签名与其 AdminRole 完全一致，不需要适配层。
+// AdminBackend 由 core 的适配器实现：角色判定与收件人列表都走这里，
+// 插件永远拿不到 admins 表的原始访问权。
 type AdminBackend interface {
-	AdminRole(ctx context.Context, openid, scene, peer string) (role, scope string, ok bool, err error)
+	AdminRole(ctx context.Context, openid, unionID, scene, peer string) (role, scope string, ok bool, err error)
+	AdminTargets(ctx context.Context) ([]AdminTarget, error)
 }
 
 // Options 是构造插件宿主的输入。Domains 来自插件 Manifest。
@@ -118,18 +120,30 @@ func (s *Service) Log() *slog.Logger    { return s.log }
 
 // IsAdmin 查询管理员身份。查不到就是 false（fail-closed）——
 // 权限判定失败绝不能放行。只有后端故障才返回错误，让调用方决定是否静默。
-func (s *Service) IsAdmin(ctx context.Context, scene Scene, openid, peer string) (bool, error) {
+func (s *Service) IsAdmin(ctx context.Context, id Identity) (bool, error) {
 	if s.admin == nil {
 		return false, fmt.Errorf("管理员后端未初始化")
 	}
-	if openid == "" {
+	if id.OpenID == "" {
 		return false, nil
 	}
-	_, _, ok, err := s.admin.AdminRole(ctx, openid, string(scene), peer)
+	_, _, ok, err := s.admin.AdminRole(ctx, id.OpenID, id.UnionID, string(id.Scene), id.PeerID)
 	if err != nil {
 		return false, err
 	}
 	return ok, nil
+}
+
+// Admins 返回收件人目录。每次调用都重新解析，群认领者补上私聊身份后立即可见。
+func (s *Service) Admins() AdminDirectory { return adminDir{s.admin} }
+
+type adminDir struct{ db AdminBackend }
+
+func (d adminDir) Targets(ctx context.Context) ([]AdminTarget, error) {
+	if d.db == nil {
+		return nil, fmt.Errorf("管理员后端未初始化")
+	}
+	return d.db.AdminTargets(ctx)
 }
 
 type kvStore struct {

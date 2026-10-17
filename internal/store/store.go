@@ -90,7 +90,18 @@ func (db *DB) Close() error {
 	return first
 }
 
-// Migrate 幂等建表。
+// columnMigrations 给已存在的库补列。SQLite 的 ADD COLUMN 没有 IF NOT EXISTS，
+// 所以先查 PRAGMA table_info 再决定是否执行。
+var columnMigrations = []struct {
+	table  string
+	column string
+	decl   string
+}{
+	{"admins", "note", "TEXT NOT NULL DEFAULT ''"},
+	{"admins", "union_openid", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// Migrate 幂等建表并补齐新增列。
 func (db *DB) Migrate(ctx context.Context) error {
 	tx, err := db.w.BeginTx(ctx, nil)
 	if err != nil {
@@ -102,8 +113,53 @@ func (db *DB) Migrate(ctx context.Context) error {
 			return fmt.Errorf("执行 DDL 失败: %w\n%s", err, firstLine(stmt))
 		}
 	}
+	for _, m := range columnMigrations {
+		if err := ensureColumn(ctx, tx, m.table, m.column, m.decl); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交迁移: %w", err)
+	}
+	return nil
+}
+
+func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, decl string) error {
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("读取表结构 %s: %w", table, err)
+	}
+	found := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			typ       string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dfltValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("解析表结构 %s: %w", table, err)
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("遍历表结构 %s: %w", table, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭表结构游标 %s: %w", table, err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+decl); err != nil {
+		return fmt.Errorf("为 %s 补列 %s: %w", table, column, err)
 	}
 	return nil
 }

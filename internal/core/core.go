@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -24,6 +25,9 @@ type Options struct {
 	Log     *slog.Logger
 	Config  *config.Config
 	Plugins []host.Plugin
+	// Trace 为 nil 且配置里打开了 debug 时，自动输出到 stdout。
+	// 显式传入只给测试用（可写进 buffer）。
+	Trace *Trace
 }
 
 type Core struct {
@@ -32,6 +36,7 @@ type Core struct {
 	http    *httpx.Client
 	log     *slog.Logger
 	plugins []host.Plugin
+	trace   *Trace
 
 	sender   *Sender
 	router   *Router
@@ -55,8 +60,15 @@ func New(o Options) (*Core, error) {
 	if err != nil {
 		return nil, fmt.Errorf("装配插件路由: %w", err)
 	}
-	sender := NewSender(o.API, logger.With("component", "sender"))
+	trace := o.Trace
+	if trace == nil && o.Config.Debug.Enabled {
+		trace = NewTrace(os.Stdout)
+	}
+	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config))
+	sender.trace = trace
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
+	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
+	dispatch.trace = trace
 
 	return &Core{
 		store:    o.Store,
@@ -64,9 +76,10 @@ func New(o Options) (*Core, error) {
 		http:     o.HTTP,
 		log:      logger,
 		plugins:  o.Plugins,
+		trace:    trace,
 		sender:   sender,
 		router:   router,
-		dispatch: NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second),
+		dispatch: dispatch,
 		sched:    sched,
 	}, nil
 }
@@ -82,10 +95,10 @@ func (c *Core) Start(ctx context.Context) error {
 		svc := host.NewService(host.Options{
 			Name:    m.Name,
 			Config:  host.Params(c.cfg.Plugin(m.Name)),
-			Sender:  c.sender,
+			Sender:  c.sender.ForPlugin(m.Name),
 			KV:      c.store,
 			DB:      c.store,
-			Admin:   c.store,
+			Admin:   adminStore{c.store},
 			HTTP:    c.httpClient(),
 			Sched:   c.sched,
 			Log:     c.log,
@@ -138,6 +151,8 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		c.log.Warn("丢弃空事件")
 		return
 	}
+	// 先打轨迹再去重：调试模式下"收到的每一条"都要看见，包括重复投递的那条。
+	c.trace.Received(ev)
 	if ev.ID == "" {
 		c.log.Warn("丢弃缺少事件 ID 的事件", "type", ev.Type)
 		return
@@ -150,6 +165,7 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		return
 	}
 	if !seen {
+		c.trace.Duplicate(ev)
 		c.log.Debug("重复事件，忽略", "event", ev.ID)
 		return
 	}
@@ -167,6 +183,14 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		}); err != nil {
 			c.log.Warn("消息落库失败", "event", ev.ID, "err", err)
 		}
+		// 记录跨场景身份映射：群里的 member_openid 与单聊的 user_openid 不通用，
+		// 只有 union_openid 能把两者认成同一个人（群认领的 owner 私聊通知依赖它）。
+		if ev.UnionID != "" && ev.SenderID != "" {
+			if err := c.store.LinkIdentity(ctx, ev.SenderID, ev.UnionID,
+				string(ev.Scene), peerScope(ev)); err != nil {
+				c.log.Debug("记录身份映射失败", "event", ev.ID, "err", err)
+			}
+		}
 	}
 
 	if c.handleReserved(ctx, ev) {
@@ -179,4 +203,29 @@ func (c *Core) replyText(ctx context.Context, ev *host.Event, text string) {
 	if err := c.sender.Reply(ctx, ev, host.Reply{Content: text}); err != nil {
 		c.log.Warn("发送核心回复失败", "event", ev.ID, "err", err)
 	}
+}
+
+// PrintRaw 让接入层把平台原始 JSON 回吐到同一条调试轨迹上（[debug].raw=true）。
+// 放在 Core 上而不是 gateway 里，是为了与消息轨迹共用一把锁、输出不交错。
+func (c *Core) PrintRaw(typ string, raw []byte) { c.trace.Raw(typ, raw) }
+
+// activePolicy 把配置转成 Sender 用的闸门。白名单为空表示谁都不能发主动消息。
+func activePolicy(cfg *config.Config) ActivePolicy {
+	allowed := make(map[string]bool, len(cfg.Active.Plugins))
+	for _, name := range cfg.Active.Plugins {
+		allowed[name] = true
+	}
+	return ActivePolicy{
+		Enabled:      cfg.ActiveEnabled(),
+		Plugins:      allowed,
+		DailyPerPeer: cfg.Active.DailyPerPeer,
+	}
+}
+
+// peerScope 决定一条授权的有效范围：群内授权只在那个群生效，单聊授权全局（仅单聊）。
+func peerScope(ev *host.Event) string {
+	if ev.Scene == host.SceneGroup {
+		return ev.PeerID
+	}
+	return ""
 }

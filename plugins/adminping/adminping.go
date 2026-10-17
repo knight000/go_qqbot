@@ -66,7 +66,7 @@ func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error
 		return nil, nil
 	}
 
-	ok, err := p.host.IsAdmin(ctx, ev.Scene, ev.SenderID, ev.PeerID)
+	ok, err := p.host.IsAdmin(ctx, ev.Identity())
 	if err != nil {
 		// 权限查询失败一律按"不是管理员"处理：宁可管理员看不到数据，
 		// 也不能因为后端故障把机器信息回给陌生人。

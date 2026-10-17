@@ -23,7 +23,7 @@ func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.
 
 func TestSenderPassiveLimitGroup(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler))
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{})
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
 	ctx := context.Background()
 
@@ -45,7 +45,7 @@ func TestSenderPassiveLimitGroup(t *testing.T) {
 
 func TestSenderPassiveLimitC2C(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler))
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{})
 	ev := &host.Event{Scene: host.SceneC2C, PeerID: "u1", MsgID: "m2"}
 	ctx := context.Background()
 
@@ -60,8 +60,63 @@ func TestSenderPassiveLimitC2C(t *testing.T) {
 }
 
 func TestSenderActiveDisabled(t *testing.T) {
-	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler))
+	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{})
 	if err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
-		t.Fatalf("主动消息应默认关闭，实际 err=%v", err)
+		t.Fatalf("主动消息总开关关闭时应拒绝，实际 err=%v", err)
+	}
+}
+
+// 插件白名单是硬边界：即使总开关打开，未声明的插件也不能发主动消息。
+func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 5,
+	})
+
+	if err := s.ForPlugin("evil").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
+		t.Fatalf("非白名单插件应被拒绝，实际 err=%v", err)
+	}
+	if f.calls != 0 {
+		t.Fatalf("被拒绝时不应发 HTTP，实际 %d 次", f.calls)
+	}
+
+	if err := s.ForPlugin("bootnotice").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "上线"}); err != nil {
+		t.Fatalf("白名单插件应能发送: %v", err)
+	}
+	if f.calls != 1 {
+		t.Fatalf("应发 1 次，实际 %d 次", f.calls)
+	}
+	if f.bodies[0].MsgID != "" {
+		t.Errorf("主动消息不应带 msg_id，实际 %q", f.bodies[0].MsgID)
+	}
+}
+
+// 本地日预算必须在发 HTTP 之前扣除，用尽后不再打扰平台。
+func TestSenderActiveDailyBudget(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 2,
+	})
+	p := s.ForPlugin("bootnotice")
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+			t.Fatalf("第 %d 次不应失败: %v", i+1, err)
+		}
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("第 3 次应超出日预算，实际 err=%v", err)
+	}
+	if f.calls != 2 {
+		t.Fatalf("额度用尽后不应再发 HTTP，实际 %d 次", f.calls)
+	}
+	// 预算是按 peer 计的，换个收件人不受影响
+	if err := p.SendActive(ctx, host.SceneC2C, "u2", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("其他收件人不应受影响: %v", err)
 	}
 }

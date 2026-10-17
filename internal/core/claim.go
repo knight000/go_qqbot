@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/qqbot/internal/store"
 )
 
 // 认领机制（§8.2）：openid 是相对机器人加密的，注册前不可预知，
@@ -52,11 +53,21 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 
 	switch cmd {
 	case "/claim":
+		c.trace.CoreCommand(cmd)
 		c.handleClaim(ctx, ev)
 		return true
-	case "/reset", "/grant", "/revoke":
-		// 这些指令由核心独占，插件不得声明；具体分级重置逻辑属于下一步实现。
+	case "/admin":
+		c.trace.CoreCommand(cmd)
+		c.handleAdmin(ctx, ev)
+		return true
+	case "/reset":
+		// 分级重置由核心独占，插件不得声明；具体逻辑属于下一步实现。
+		c.trace.CoreCommand(cmd)
 		c.replyText(ctx, ev, "该指令属于核心保留区，当前脚手架版本尚未启用。")
+		return true
+	case "/grant", "/revoke":
+		c.trace.CoreCommand(cmd)
+		c.replyText(ctx, ev, "已改为 /admin add <openid> 与 /admin rm <openid>（仅 owner）。")
 		return true
 	}
 	return false
@@ -92,7 +103,15 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 		return
 	}
 
-	if err := c.store.AddAdmin(ctx, ev.SenderID, string(ev.Scene), "", "owner", "claim"); err != nil {
+	admin := store.Admin{
+		OpenID:    ev.SenderID,
+		UnionID:   ev.UnionID,
+		Scene:     string(ev.Scene),
+		PeerScope: "", // owner 在该场景内全局有效
+		Role:      store.RoleOwner,
+		GrantedBy: "claim",
+	}
+	if err := c.store.UpsertAdmin(ctx, admin); err != nil {
 		c.log.Error("写入管理员失败", "err", err)
 		c.replyText(ctx, ev, "认领失败，请查看日志。")
 		return
@@ -100,6 +119,7 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 
 	c.claimToken = ""
 	c.claimExp = time.Time{}
-	c.log.Info("管理员认领成功", "openid", ev.SenderID, "scene", ev.Scene)
-	c.replyText(ctx, ev, "认领成功，你已成为 owner。核心保留指令（/reset、/grant、/revoke）将在后续版本启用。")
+	c.log.Info("管理员认领成功", "openid", ev.SenderID, "union", ev.UnionID, "scene", ev.Scene)
+	c.replyText(ctx, ev, "认领成功，你已成为 owner。\n"+
+		"用 /admin add <openid> [备注] 添加辅助管理员，/admin list 查看，/admin whoami 查自己的身份。")
 }
