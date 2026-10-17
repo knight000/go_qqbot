@@ -84,11 +84,20 @@ type payload struct {
 	ID string          `json:"id"`
 }
 
+// author 是消息发送者。平台文档（group_message_create / c2c_message_create）里
+// id 是"用户唯一标识（OpenID 格式）"，member_openid / user_openid 分别标注为
+// 群聊 / 单聊场景使用；实测三者对同一个人取同一个值。因此统一以 id 为准，
+// 场景字段只作回退——跨场景识别不需要 union_openid 也能成立。
 type author struct {
 	ID           string `json:"id"`
 	MemberOpenID string `json:"member_openid"`
 	UserOpenID   string `json:"user_openid"`
 	UnionOpenID  string `json:"union_openid"`
+	// MemberRole 是群内角色：member / admin / owner。
+	// 平台在消息事件载荷里直接给出，不需要额外调接口（详见 ARCHITECTURE §8.1）。
+	MemberRole string `json:"member_role"`
+	Username   string `json:"username"`
+	Bot        bool   `json:"bot"`
 }
 
 type messageData struct {
@@ -112,6 +121,7 @@ type genericData struct {
 	MemberOpenID   string          `json:"member_openid"`
 	OpMemberOpenID string          `json:"op_member_openid"`
 	UnionOpenID    string          `json:"union_openid"`
+	MemberRole     string          `json:"member_role"`
 	Timestamp      json.RawMessage `json:"timestamp"`
 }
 
@@ -157,10 +167,25 @@ func decodeMessage(t string, scene host.Scene, raw json.RawMessage) (*host.Event
 	}
 	if scene == host.SceneGroup {
 		ev.PeerID = d.GroupOpenID
-		ev.SenderID = firstNonEmpty(d.Author.MemberOpenID, d.Author.ID)
 	} else {
 		ev.PeerID = firstNonEmpty(d.Author.UserOpenID, d.Author.ID)
+	}
+	// 优先 author.id：它是平台声明的"用户唯一标识"，群/单聊同值，
+	// 这样 admins 表里的授权不随场景漂移。
+	ev.SenderID = firstNonEmpty(d.Author.ID, d.Author.MemberOpenID, d.Author.UserOpenID)
+	if ev.SenderID == "" {
 		ev.SenderID = ev.PeerID
+	}
+
+	// 群内角色只对群消息有意义；单聊留空（未知）。
+	if scene == host.SceneGroup {
+		ev.Actor = host.Principal{
+			OpenID:    ev.SenderID,
+			UnionID:   ev.UnionID,
+			Scene:     scene,
+			PeerID:    ev.PeerID,
+			GroupRole: host.ParseGroupRole(d.Author.MemberRole),
+		}
 	}
 	return ev, nil
 }
@@ -179,7 +204,7 @@ func decodeGeneric(t string, spec eventSpec, raw json.RawMessage) (*host.Event, 
 			scene = host.SceneC2C
 		}
 	}
-	return &host.Event{
+	ev := &host.Event{
 		ID:        firstNonEmpty(d.ID, stableOpID(t, d)),
 		Kind:      spec.kind,
 		Name:      t,
@@ -188,7 +213,17 @@ func decodeGeneric(t string, spec eventSpec, raw json.RawMessage) (*host.Event, 
 		SenderID:  firstNonEmpty(d.OpMemberOpenID, d.MemberOpenID, d.OpenID, d.UserOpenID),
 		UnionID:   d.UnionOpenID,
 		Timestamp: parseAnyTime(d.Timestamp),
-	}, nil
+	}
+	// 通知/请求事件多数不带 member_role；能解出来就带上，解不出就是未知，
+	// 依赖群内角色的权限点会因此 fail-closed。
+	ev.Actor = host.Principal{
+		OpenID:    ev.SenderID,
+		UnionID:   ev.UnionID,
+		Scene:     scene,
+		PeerID:    ev.PeerID,
+		GroupRole: host.ParseGroupRole(d.MemberRole),
+	}
+	return ev, nil
 }
 
 // stableOpID 给没有平台 ID 的通知事件造一个稳定 ID，保证重连补发时能被去重表拦下。

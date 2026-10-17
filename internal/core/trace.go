@@ -150,6 +150,26 @@ func (t *Trace) Hit(m Match, ev *host.Event) {
 	t.emit(b.String())
 }
 
+// Denied 打印"命中但权限不足"的插件。
+//
+// 它不是错误：路由命中只说明命令存在，调用者级别不够而已。默认静默不回复，
+// 所以这一行是排查"为什么没反应"的唯一线索。
+func (t *Trace) Denied(m Match, ev *host.Event) {
+	if !t.enabled() {
+		return
+	}
+	cmd := ""
+	if m.Command != "" {
+		cmd = fmt.Sprintf(" · 命令 %q", m.Command)
+	}
+	what := "调用者 " + string(ev.Actor.Role)
+	if gr := ev.Actor.GroupRoleLabel(); gr != "" {
+		what += "／" + gr
+	}
+	t.emit(fmt.Sprintf("[%s] 权限不足 · 插件 %s%s（需要 %s；%s）\n",
+		stamp(), m.Manifest.Name, cmd, m.Perm.String(), what))
+}
+
 // PluginDone 打印插件处理结果；回复正文由 Sent 统一打印，避免重复。
 // level=plugin 时成功分支不打印，只保留出错，否则每个插件会有两行冗余。
 func (t *Trace) PluginDone(m Match, cost time.Duration, reply *host.Reply, err error) {

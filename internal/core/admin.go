@@ -12,19 +12,24 @@ import (
 // /admin 属于核心保留指令（不在插件路由里），因为它是权限本身的入口：
 // 一旦允许插件接管，插件就能给自己提权。
 //
-// 权限模型：
-//   - owner：认领产生，能增删 admin，其余能力与 admin 相同；
-//   - admin：辅助管理员，能执行全部管理指令，但**不能增删管理员**。
+// 权限模型分三级（ARCHITECTURE.md §8.7）：
 //
-// 注意：平台不提供 QQ 号。群成员是 member_openid、单聊是 user_openid，
-// 两者不通用，所以 /admin add 收的是 openid（或 union_openid），不是 QQ 号。
+//	user  普通用户 —— 默认角色，只能触发公开指令；
+//	admin Bot 管理员 —— 能执行全部管理指令，但**不能增删管理员**；
+//	owner Bot 所有者 —— 唯一，认领产生，能增删 admin，自身不可被增删。
+//
+// 另有一个正交维度：平台给出的群内角色（群主 / 群管理员 / 群成员）。
+// 它不是 Bot 角色——群主不会因此获得重启机器人的权限；反过来 Bot 管理员
+// 在任何群里都按群管级处理（权限叠加）。
 const adminUsage = `用法：
 /admin list                 查看管理员
-/admin add <openid> [备注]   添加 admin（仅 owner）
-/admin rm <openid>           删除 admin（仅 owner，owner 本身不可删）
-/admin whoami               查看自己的身份与角色
+/admin add <openid> [备注]   添加 Bot 管理员（仅所有者）
+/admin rm <openid>           删除 Bot 管理员（仅所有者）
+/admin whoami               查看自己的角色与标识
 
-whoami 对所有人开放（只返回你自己的标识）：把 openid 发给 owner 才能被添加为 admin。`
+角色分三级：普通用户 < Bot 管理员 < Bot 所有者。
+群主 / 群管理员是平台身份，不等于 Bot 管理员。
+whoami 对所有人开放（只返回你自己的标识）：把 openid 发给所有者才能被添加。`
 
 // adminStore 把 store.DB 的管理员能力适配成 host.AdminBackend。
 // 单独一层是为了不让 host 依赖 store，也不让插件摸到数据库。
@@ -53,17 +58,12 @@ func (c *Core) handleAdmin(ctx context.Context, ev *host.Event) {
 		sub = strings.ToLower(fields[1])
 	}
 
-	role, scope, ok, err := c.store.AdminRole(ctx, ev.SenderID, ev.UnionID, string(ev.Scene), ev.PeerID)
-	if err != nil {
-		c.log.Error("查询管理员身份失败", "event", ev.ID, "err", err)
-		c.replyText(ctx, ev, "权限查询失败，请稍后重试。")
-		return
-	}
-	if !ok {
-		// whoami 对所有人开放：要把某人加成 admin，owner 必须先知道对方的
+	p := c.authorize(ctx, ev)
+	if !p.IsBotAdmin() {
+		// whoami 对所有人开放：要把某人加成 admin，所有者必须先知道对方的
 		// openid，而平台不提供 QQ 号。它只回调用者自己的标识，不泄露他人。
 		if sub == "whoami" {
-			c.adminWhoami(ctx, ev, "", "")
+			c.adminWhoami(ctx, ev, p)
 			return
 		}
 		c.replyText(ctx, ev, "该指令仅管理员可用。")
@@ -76,11 +76,11 @@ func (c *Core) handleAdmin(ctx context.Context, ev *host.Event) {
 	case "list":
 		c.adminList(ctx, ev)
 	case "whoami":
-		c.adminWhoami(ctx, ev, role, scope)
+		c.adminWhoami(ctx, ev, p)
 	case "add":
-		c.adminAdd(ctx, ev, role, fields)
+		c.adminAdd(ctx, ev, p, fields)
 	case "rm", "remove", "del":
-		c.adminRemove(ctx, ev, role, fields)
+		c.adminRemove(ctx, ev, p, fields)
 	default:
 		c.replyText(ctx, ev, "未知子命令。\n"+adminUsage)
 	}
@@ -110,18 +110,24 @@ func (c *Core) adminList(ctx context.Context, ev *host.Event) {
 		if a.Note != "" {
 			fmt.Fprintf(&b, "（%s）", a.Note)
 		}
-		fmt.Fprintf(&b, "｜%s\n", describeAdmin(a.Scene, a.PeerScope))
+		fmt.Fprintf(&b, "｜%s\n", describeAdmin(a.PeerScope))
 	}
 	c.replyText(ctx, ev, strings.TrimRight(b.String(), "\n"))
 }
 
-func (c *Core) adminWhoami(ctx context.Context, ev *host.Event, role, scope string) {
+func (c *Core) adminWhoami(ctx context.Context, ev *host.Event, p host.Principal) {
 	var b strings.Builder
-	if role == "" {
-		b.WriteString("角色 非管理员\n")
-	} else {
-		fmt.Fprintf(&b, "角色 %s｜%s\n", role, describeAdmin(string(ev.Scene), scope))
+	fmt.Fprintf(&b, "角色 %s\n", p.RoleLabel())
+
+	// 群内角色来自平台载荷，只在群消息里有；私聊留空不打印。
+	if gr := p.GroupRoleLabel(); gr != "" {
+		where := "本群"
+		if p.Scene != host.SceneGroup {
+			where = "当前会话"
+		}
+		fmt.Fprintf(&b, "群内 %s（%s）\n", gr, where)
 	}
+
 	fmt.Fprintf(&b, "openid %s\n", ev.SenderID)
 	if ev.UnionID != "" {
 		fmt.Fprintf(&b, "union  %s\n", ev.UnionID)
@@ -132,17 +138,17 @@ func (c *Core) adminWhoami(ctx context.Context, ev *host.Event, role, scope stri
 	if ev.Scene == host.SceneGroup {
 		fmt.Fprintf(&b, "｜群 %s", shortID(ev.PeerID))
 	}
-	if role == "" {
-		b.WriteString("\n把 openid 发给 owner，即可被添加为 admin。")
+	if !p.IsBotAdmin() {
+		b.WriteString("\n把 openid 发给 Bot 所有者，即可被添加为管理员。")
 	}
 	c.replyText(ctx, ev, strings.TrimRight(b.String(), "\n"))
 }
 
 // adminAdd 只允许 owner 调用，且新建的角色恒为 admin——
-// /admin 不提供任何"再把别人变成 owner"的路径，避免 owner 被无限复制。
-func (c *Core) adminAdd(ctx context.Context, ev *host.Event, role string, fields []string) {
-	if role != store.RoleOwner {
-		c.replyText(ctx, ev, "仅 owner 可以添加或删除管理员。")
+// /admin 不提供任何"再把别人变成 owner"的路径，保证所有者唯一。
+func (c *Core) adminAdd(ctx context.Context, ev *host.Event, p host.Principal, fields []string) {
+	if !p.IsBotOwner() {
+		c.replyText(ctx, ev, "仅 Bot 所有者可以添加或删除管理员。")
 		return
 	}
 	if len(fields) < 3 {
@@ -173,22 +179,19 @@ func (c *Core) adminAdd(ctx context.Context, ev *host.Event, role string, fields
 		return
 	}
 	for _, a := range existing {
-		if a.Scene != scene {
-			continue
-		}
+		// 身份按 openid（或 union）跨场景比较：同一个人不该有两条重复授权。
 		if a.OpenID != openid && (union == "" || a.UnionID != union) {
 			continue
 		}
-		// 已有授权覆盖本次范围（全局，或同一个 peer）才算重复；
-		// 在 A 群加过的人可以再被加到 B 群。
+		// 已有的全局授权（peer_scope 为空）覆盖任何范围；同一群的重复也拦下。
 		if a.PeerScope != "" && a.PeerScope != scope {
 			continue
 		}
 		if a.Role == store.RoleOwner {
-			c.replyText(ctx, ev, "该用户已是 owner，无需添加。")
+			c.replyText(ctx, ev, "该用户已是 Bot 所有者，无需添加。")
 			return
 		}
-		c.replyText(ctx, ev, fmt.Sprintf("该用户已经是 admin（%s）。", describeAdmin(a.Scene, a.PeerScope)))
+		c.replyText(ctx, ev, fmt.Sprintf("该用户已经是 admin（%s）。", describeAdmin(a.PeerScope)))
 		return
 	}
 
@@ -214,13 +217,13 @@ func (c *Core) adminAdd(ctx context.Context, ev *host.Event, role string, fields
 	if note != "" {
 		fmt.Fprintf(&b, "（%s）", note)
 	}
-	fmt.Fprintf(&b, "\n范围 %s｜除增删管理员外，权限与 owner 相同", describeAdmin(scene, scope))
+	fmt.Fprintf(&b, "\n范围 %s｜除增删管理员外，权限与所有者相同", describeAdmin(scope))
 	c.replyText(ctx, ev, b.String())
 }
 
-func (c *Core) adminRemove(ctx context.Context, ev *host.Event, role string, fields []string) {
-	if role != store.RoleOwner {
-		c.replyText(ctx, ev, "仅 owner 可以添加或删除管理员。")
+func (c *Core) adminRemove(ctx context.Context, ev *host.Event, p host.Principal, fields []string) {
+	if !p.IsBotOwner() {
+		c.replyText(ctx, ev, "仅 Bot 所有者可以添加或删除管理员。")
 		return
 	}
 	if len(fields) < 3 {
@@ -241,22 +244,21 @@ func (c *Core) adminRemove(ctx context.Context, ev *host.Event, role string, fie
 		c.log.Info("已删除管理员", "ident", ident, "rows", removed, "by", ev.SenderID)
 		c.replyText(ctx, ev, fmt.Sprintf("已删除 %d 条 admin 授权：%s", removed, ident))
 	case owners > 0:
-		c.replyText(ctx, ev, "该用户是 owner，/admin rm 不能删除 owner。")
+		c.replyText(ctx, ev, "该用户是 Bot 所有者，/admin rm 不能删除所有者。")
 	default:
 		c.replyText(ctx, ev, "未找到该 admin。用 /admin list 查看现有管理员。")
 	}
 }
 
-// describeAdmin 把 (scene, peer_scope) 说成人话。
-func describeAdmin(scene, scope string) string {
-	switch {
-	case scene == string(host.SceneC2C):
-		return "私聊"
-	case scope == "":
-		return "全部群"
-	default:
-		return "群 " + shortID(scope)
+// describeAdmin 把 peer_scope 说成人话。
+//
+// peer_scope 只表达"群内委托"：非空 = 只在那个群生效，空 = 全局角色。
+// 场景（scene）已经不影响判定，只作来源记录，所以这里不再需要它。
+func describeAdmin(scope string) string {
+	if scope == "" {
+		return "全局（所有群与私聊）"
 	}
+	return "仅群 " + shortID(scope)
 }
 
 // shortID 保留首尾各 6 位，够人眼区分又不把整条 openid 刷满屏。

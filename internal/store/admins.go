@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"time"
@@ -10,9 +11,12 @@ import (
 // sceneGroup 与 host.SceneGroup 保持一致；store 不依赖 host，这里单独定义。
 const sceneGroup = "group"
 
-// 角色只有两级：
-//   - owner：认领产生，唯一能增删 admin；
-//   - admin：辅助管理员，除"增删管理员"外与 owner 同权限。
+// 角色定义与 host.Role 对齐（store 不依赖 host，这里单独定义）：
+//   - owner：认领产生，唯一，全局有效，能增删 admin；
+//   - admin：辅助管理员，除"增删管理员"外与 owner 同权限；
+//     群内添加时 peer_scope 非空，成为该群的委托管理员。
+//
+// 三级中的 user 不是 admins 表的值：查不到授权的自然状态就是普通用户。
 const (
 	RoleOwner = "owner"
 	RoleAdmin = "admin"
@@ -65,44 +69,49 @@ func (db *DB) UpsertAdmin(ctx context.Context, a Admin) error {
 	return nil
 }
 
-// AdminRole 查询某人在某场景/某 peer 下的最高角色。
+// AdminRole 查询某人的最高角色。
 //
-// 身份匹配三种方式（任一命中即可）：
-//  1. 本场景 openid 直接命中；
-//  2. 该条授权显式记录了 union_openid；
-//  3. 平台给出的 union_openid 与本人在 identities 里的其它身份一致
-//     （在群里认领/被添加的人，私聊里同样算管理员）。
+// 身份匹配：openid 是**跨场景同值**的用户唯一标识（平台不给 QQ 号，但事件里的
+// author.id 在群聊与单聊中对同一个人取同一个值，实测与文档一致）。因此 openid
+// 匹配不限定 scene——否则在单聊里认领的 owner 一进群就丢了权限。
+// union_openid 仍然作为兜底：平台未下发时为空，此时只按 openid 匹配。
 //
-// 作用域规则：
-//   - owner 全局有效（认领即最高权限）；
-//   - admin 在群场景只认"群内添加"的授权，且 peer_scope 必须匹配当前群；
-//     私聊场景认所有授权——在群里加的 admin 可以私聊管理机器人，
-//     但私聊加的 admin 不会自动获得群内权限。
+// 作用域规则只有一条：**admin 的群内委托**。peer_scope 非空表示"在某个群添加的
+// 管理员"，只在该群生效；peer_scope 为空（私聊添加，或 owner）是全局角色，
+// 在任何会话都生效。群内委托在私聊同样生效——群里加的管理员可以私聊运维机器人。
 func (db *DB) AdminRole(ctx context.Context, openid, unionID, scene, peer string) (role, scope string, ok bool, err error) {
-	rows, err := db.r.QueryContext(ctx,
-		`SELECT role, peer_scope, scene FROM admins
-		 WHERE (openid = ? AND scene = ?)
-		    OR (? <> '' AND union_openid = ?)
-		    OR (? <> '' AND openid IN (SELECT openid FROM identities WHERE union_openid = ?))
-		 ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END`,
-		openid, scene, unionID, unionID, unionID, unionID)
+	if openid == "" && unionID == "" {
+		return "", "", false, nil
+	}
+
+	const order = ` ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END,
+	                     CASE WHEN peer_scope = '' THEN 0 ELSE 1 END`
+	var rows *sql.Rows
+	if unionID == "" {
+		rows, err = db.r.QueryContext(ctx,
+			`SELECT role, peer_scope FROM admins WHERE openid = ?`+order,
+			openid)
+	} else {
+		rows, err = db.r.QueryContext(ctx,
+			`SELECT role, peer_scope FROM admins
+			 WHERE openid = ?
+			    OR union_openid = ?
+			    OR openid IN (SELECT openid FROM identities WHERE union_openid = ?)`+order,
+			openid, unionID, unionID)
+	}
 	if err != nil {
 		return "", "", false, fmt.Errorf("查询管理员: %w", err)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var r, s, rowScene string
-		if err := rows.Scan(&r, &s, &rowScene); err != nil {
+		var r, s string
+		if err := rows.Scan(&r, &s); err != nil {
 			return "", "", false, fmt.Errorf("解析管理员: %w", err)
 		}
-		if r != RoleOwner && scene == sceneGroup {
-			if rowScene != sceneGroup {
-				continue // 私聊里加的 admin 不扩散到群
-			}
-			if s != "" && s != peer {
-				continue // 该授权属于别的群
-			}
+		// 群内委托只在自己的群生效；其它情况（全局管理员、owner、私聊）一律放行。
+		if r != RoleOwner && scene == sceneGroup && s != "" && s != peer {
+			continue
 		}
 		return r, s, true, nil
 	}
@@ -160,6 +169,10 @@ func (db *DB) DeleteAdmin(ctx context.Context, ident string) (removed, owners in
 
 // AdminTargets 汇总启动通知的收件人：同一人的多条授权合并为一条，
 // 角色取最高，并尽量解析出可用的单聊 openid。
+//
+// 解析顺序：单聊授权自身的 openid → identities 里记录的单聊身份 → 直接用
+// 该条授权的 openid。最后这条兜底成立的前提是 openid 跨场景同值（实测如此），
+// 否则只会让主动私聊失败并留下一条 warn，不会误发给别人。
 func (db *DB) AdminTargets(ctx context.Context) ([]AdminTarget, error) {
 	admins, err := db.ListAdmins(ctx)
 	if err != nil {
@@ -194,8 +207,10 @@ func (db *DB) AdminTargets(ctx context.Context) ([]AdminTarget, error) {
 		switch {
 		case a.Scene == "c2c":
 			c2c = a.OpenID
-		case a.UnionID != "":
+		case a.UnionID != "" && c2cByUnion[a.UnionID] != "":
 			c2c = c2cByUnion[a.UnionID]
+		default:
+			c2c = a.OpenID
 		}
 		key := c2c
 		if key == "" {

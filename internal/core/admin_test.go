@@ -88,7 +88,7 @@ func TestAdminCannotMutateAdmins(t *testing.T) {
 	for _, cmd := range []string{"/admin add target-1", "/admin rm admin-1"} {
 		ev := adminEvent(cmd, "admin-1", "", host.SceneGroup, "g1")
 		c.handleReserved(ctx, ev)
-		if got := lastReply(t, f); !strings.Contains(got, "仅 owner") {
+		if got := lastReply(t, f); !strings.Contains(got, "仅 Bot 所有者") {
 			t.Errorf("%s 应由 owner 专属，实际: %q", cmd, got)
 		}
 	}
@@ -150,7 +150,7 @@ func TestOwnerAddSelfIsRejected(t *testing.T) {
 
 	c.handleReserved(context.Background(),
 		adminEvent("/admin add owner-1", "owner-1", "", host.SceneGroup, "g1"))
-	if got := lastReply(t, f); !strings.Contains(got, "已是 owner") {
+	if got := lastReply(t, f); !strings.Contains(got, "已是 Bot 所有者") {
 		t.Fatalf("重复添加 owner 应提示，实际: %q", got)
 	}
 }
@@ -171,7 +171,7 @@ func TestOwnerRemovesAdmin(t *testing.T) {
 
 	// owner 自身不能被删
 	c.handleReserved(ctx, adminEvent("/admin rm owner-1", "owner-1", "", host.SceneGroup, "g1"))
-	if got := lastReply(t, f); !strings.Contains(got, "不能删除 owner") {
+	if got := lastReply(t, f); !strings.Contains(got, "不能删除所有者") {
 		t.Fatalf("删除 owner 应被拒绝，实际: %q", got)
 	}
 	if _, _, ok, _ := c.store.AdminRole(ctx, "owner-1", "", "group", "g1"); !ok {
@@ -185,21 +185,22 @@ func TestOwnerRemovesAdmin(t *testing.T) {
 	}
 }
 
-// 在私聊里添加：范围是单聊，且在群里不生效。
+// 在私聊里添加：没有群上下文，产生的是全局 admin。
 func TestOwnerAddsAdminInC2C(t *testing.T) {
 	c, f := newAdminCore(t)
 	seedAdmin(t, c, "owner-c2c", "", "c2c", "", store.RoleOwner)
 	ctx := context.Background()
 
 	c.handleReserved(ctx, adminEvent("/admin add helper-c2c 值班", "owner-c2c", "", host.SceneC2C, "owner-c2c"))
-	if got := lastReply(t, f); !strings.Contains(got, "私聊") {
-		t.Fatalf("应说明范围是私聊，实际: %q", got)
+	if got := lastReply(t, f); !strings.Contains(got, "全局") {
+		t.Fatalf("应说明范围是全局，实际: %q", got)
 	}
 	if _, _, ok, _ := c.store.AdminRole(ctx, "helper-c2c", "", "c2c", "helper-c2c"); !ok {
 		t.Fatal("私聊添加的 admin 应在私聊生效")
 	}
-	if _, _, ok, _ := c.store.AdminRole(ctx, "helper-c2c", "", "group", "g1"); ok {
-		t.Fatal("私聊添加的 admin 不应在群里生效")
+	// 私聊没有群上下文，scope 为空 = 全局角色，进群同样有效。
+	if _, _, ok, _ := c.store.AdminRole(ctx, "helper-c2c", "", "group", "g1"); !ok {
+		t.Fatal("全局 admin 应在群内生效")
 	}
 }
 
@@ -229,7 +230,7 @@ func TestWhoamiOpenForEveryone(t *testing.T) {
 	c.handleReserved(context.Background(),
 		adminEvent("/admin whoami", "stranger", "union-s", host.SceneC2C, "stranger"))
 	got := lastReply(t, f)
-	for _, want := range []string{"非管理员", "openid stranger", "union-s"} {
+	for _, want := range []string{"普通用户", "openid stranger", "union-s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("whoami 缺少 %q:\n%s", want, got)
 		}
@@ -284,9 +285,48 @@ func TestAdminListShowsRoleAndScope(t *testing.T) {
 
 	c.handleReserved(context.Background(), adminEvent("/admin list", "owner-1", "", host.SceneGroup, "g1"))
 	got := lastReply(t, f)
-	for _, want := range []string{"管理员 2 条", "owner owner-1", "admin admin-1", "全部群"} {
+	for _, want := range []string{"管理员 2 条", "owner owner-1", "admin admin-1", "全局"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("list 缺少 %q:\n%s", want, got)
 		}
+	}
+}
+
+// 回归：在单聊里认领的 owner，进群后必须仍是 owner。
+// 这是线上实际出现的问题——C2C 里 /ping 正常，同一个群里却判成非管理员。
+func TestOwnerClaimedInC2CWorksInGroup(t *testing.T) {
+	c, f := newAdminCore(t)
+	seedAdmin(t, c, "owner-1", "", "c2c", "", store.RoleOwner)
+
+	c.handleReserved(context.Background(), adminEvent("/admin list", "owner-1", "", host.SceneGroup, "g1"))
+	if got := lastReply(t, f); !strings.Contains(got, "管理员 1 条") {
+		t.Fatalf("单聊认领的 owner 应能在群里管理，实际: %q", got)
+	}
+}
+
+// whoami 要同时展示两个维度：Bot 角色与平台群内角色。
+func TestWhoamiShowsGroupRole(t *testing.T) {
+	c, f := newAdminCore(t)
+	ev := adminEvent("/admin whoami", "member-1", "", host.SceneGroup, "g1")
+	ev.Actor.GroupRole = host.GroupRoleAdmin
+
+	c.handleReserved(context.Background(), ev)
+	got := lastReply(t, f)
+	for _, want := range []string{"普通用户", "群管理员", "openid member-1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("whoami 缺少 %q:/n%s", want, got)
+		}
+	}
+}
+
+// 平台群主不是 Bot 管理员：群内身份只用于群管级权限，不能换来管理指令。
+func TestGroupOwnerIsNotBotAdmin(t *testing.T) {
+	c, f := newAdminCore(t)
+	ev := adminEvent("/admin list", "group-owner", "", host.SceneGroup, "g1")
+	ev.Actor.GroupRole = host.GroupRoleOwner
+
+	c.handleReserved(context.Background(), ev)
+	if got := lastReply(t, f); !strings.Contains(got, "仅管理员可用") {
+		t.Fatalf("群主不应获得 Bot 管理权限，实际: %q", got)
 	}
 }

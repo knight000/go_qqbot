@@ -30,16 +30,17 @@ func (d *Duration) UnmarshalText(text []byte) error {
 func (d Duration) MarshalText() ([]byte, error) { return []byte(d.Duration.String()), nil }
 
 type Config struct {
-	App       App                       `toml:"app"`
-	Bot       Bot                       `toml:"bot"`
-	Store     Store                     `toml:"store"`
-	Retention Retention                 `toml:"retention"`
-	Media     Media                     `toml:"media"`
-	HTTP      HTTP                      `toml:"http"`
-	Active    Active                    `toml:"active"`
-	Log       Log                       `toml:"log"`
-	Debug     Debug                     `toml:"debug"`
-	Plugins   map[string]map[string]any `toml:"plugins"`
+	App        App                       `toml:"app"`
+	Bot        Bot                       `toml:"bot"`
+	Store      Store                     `toml:"store"`
+	Retention  Retention                 `toml:"retention"`
+	Media      Media                     `toml:"media"`
+	HTTP       HTTP                      `toml:"http"`
+	Active     Active                    `toml:"active"`
+	Permission Permission                `toml:"permission"`
+	Log        Log                       `toml:"log"`
+	Debug      Debug                     `toml:"debug"`
+	Plugins    map[string]map[string]any `toml:"plugins"`
 }
 
 type App struct {
@@ -94,6 +95,17 @@ func (c *Config) ActiveEnabled() bool {
 		return true
 	}
 	return *c.Active.Enabled
+}
+
+// Permission 是全局权限策略。
+//
+// 权限本身由核心在路由阶段判定（见 ARCHITECTURE.md §8.7），这里只控制
+// "拒绝时的表现"：插件通过 DenyReply 提供文案，是否真的发出去由这个开关决定。
+type Permission struct {
+	// DenyReply 控制权限不足时是否回复插件声明的拒绝语。
+	// 默认 false（静默）：在群里回一句"你没权限"等于告诉所有人这里有条隐藏指令，
+	// 还会暴露机器人的能力边界。私聊或调试期可以临时打开。
+	DenyReply bool `toml:"deny_reply"`
 }
 
 type Log struct {

@@ -13,8 +13,9 @@ import (
 
 // APIVersion 是核心与插件之间的契约版本，不匹配直接拒绝加载。
 //
-// 版本 2：事件改为三轴（Kind / Scene / Name），移除 Event.Type。
-const APIVersion = "2"
+// 版本 3：新增全局权限模型（Event.Actor、Command.Permission / DenyReply、
+// Manifest.Permission），事件载荷新增群内角色。
+const APIVersion = "3"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -43,7 +44,7 @@ type Event struct {
 	Name     string // 平台原始事件名，只用于观测与排障
 	Scene    Scene  // group | c2c | guild；无法判定时为空
 	PeerID   string // 群 openid 或用户 openid
-	SenderID string // 发送者 openid（群为 member_openid，单聊为 user_openid）
+	SenderID string // 发送者 openid（跨场景同值，平台不另给 QQ 号）
 	UnionID  string // 平台给的跨场景标识，可能为空
 	MsgID    string // 被动回复必须携带
 	Content  string
@@ -52,14 +53,18 @@ type Event struct {
 	HasMedia  bool
 	Payload   []byte // 原始 JSON，仅未知事件保留（排查"平台到底推了什么"）
 	Timestamp time.Time
+
+	// Actor 是调用者身份与权限，由核心在投递插件之前填好：网关填群内角色，
+	// 核心填 Bot 角色。插件只读——判权不落在插件里，插件漏写检查也不会越权。
+	Actor Principal
 }
 
 func (e *Event) IsMessage() bool { return e.Kind == KindMessage }
 
 // Identity 是鉴权用的发送者身份。
 //
-// 三个字段缺一不可：OpenID 只在所属场景内有效，UnionID 用来跨场景识别同一个人，
-// PeerID 决定 peer_scope 是否放行。插件不要自己拼身份，直接用 Event.Identity()。
+// 权限判定请读 Event.Actor；Identity 保留给"把这个人是谁告诉宿主"这类场景
+// （如 Host.IsAdmin、日志）。OpenID 跨场景同值，PeerID 决定 peer_scope 是否放行。
 type Identity struct {
 	OpenID  string
 	UnionID string
@@ -136,8 +141,11 @@ type Scheduler interface {
 
 // Host 是插件可见的全部能力。
 //
-// IsAdmin 与 Admins 也是能力项：插件不需要（也不允许）直接查 admins 表，
-// 只能就"这个人是不是管理员"向宿主提问，或者取"可以私聊谁"的收件人列表。
+// 权限有两条路，推荐前者：
+//   - 声明式：Manifest.Permission / Command.Permission，核心在路由阶段拦截，
+//     插件代码里不出现任何判权语句；
+//   - 命令式：IsAdmin 就"这个人是不是管理员"向宿主提问，只用于展示或
+//     非命令场景（如回调里再确认一次）。
 type Host interface {
 	Plugin() string
 	Config() Params
@@ -146,7 +154,8 @@ type Host interface {
 	Query() QueryStore
 	HTTP() HTTP
 	Scheduler() Scheduler
-	// IsAdmin 委托 core 判定管理员身份；owner 与 admin 都返回 true。
+	// IsAdmin 委托 core 判定 Bot 管理员身份；owner 与 admin 都返回 true。
+	// 不判断群内角色——那取决于平台载荷，读 Event.Actor.GroupRole。
 	IsAdmin(ctx context.Context, id Identity) (bool, error)
 	// Admins 提供启动通知等场景所需的收件人列表（已按单聊 openid 去重）。
 	Admins() AdminDirectory
@@ -159,6 +168,13 @@ type Command struct {
 	Pattern     string
 	Priority    int
 	Description string
+
+	// Permission 是执行该命令所需的权限点（任一满足）。零值 = 不限制。
+	// 未设置时继承 Manifest.Permission。
+	Permission Perm
+	// DenyReply 是权限不足时由核心回复的文本；空串表示静默丢弃。
+	// 放在核心而不是插件里，是为了让"拒绝"也不依赖插件实现。
+	DenyReply string
 }
 
 type Manifest struct {
@@ -171,6 +187,12 @@ type Manifest struct {
 	Broadcast      bool
 	AllowedDomains []string
 	ConfigSchema   map[string]string // 配置项声明，启动时做存在性校验
+
+	// Permission 是插件级默认权限：命令自身未声明时继承它。
+	// 零值 = 不限制（等价 PermUser）。
+	Permission Perm
+	// DenyReply 是插件级默认的拒绝语，被 Command.DenyReply 覆盖。
+	DenyReply string
 }
 
 // Plugin 是 P1（编译期注册）插件的生命周期契约。

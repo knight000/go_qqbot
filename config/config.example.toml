@@ -76,16 +76,17 @@ raw = false
 # 用于确认"平台到底推了什么"；未知事件永远不会进入插件路由。
 unknown_events = false
 
+# 权限策略：角色与权限点见 README「权限」一节，这里只控制拒绝时的表现
+[permission]
+# false（默认）：权限不足时不发任何消息，避免在群里暴露隐藏指令；
+# true：发出插件声明的拒绝语，便于调试权限链路。
+deny_reply = false
+
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取
 [plugins.echo]
 reply_prefix = ""
 
-# adminping：/ping 仅管理员可用，指标采集无需配置
-[plugins.adminping]
-# true（默认）：非管理员发 /ping 完全静默，连"无权限"都不回，
-#               避免在群里暴露该指令与机器信息；
-# false：回一句"该指令仅管理员可用。"，便于调试权限链路。
-silent = true
+# adminping：/ping 仅管理员可用，权限由 Manifest 声明，无需配置
 
 # bootnotice：启动/重启后主动私聊管理员，报告上线时间与插件清单
 [plugins.bootnotice]

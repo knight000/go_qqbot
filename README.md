@@ -96,41 +96,60 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 
 生产环境保持 `enabled = false`：轨迹里有消息正文与 openid，不适合进 journald。
 
-## 管理员：owner 与 admin
+## 权限：三级角色 + 群内身份
+
+权限判定在**核心**里完成，插件只声明"需要什么"，代码里不写判权语句。
 
 | 角色 | 产生方式 | 能做什么 |
 |---|---|---|
-| `owner` | `/claim` 认领（一次性令牌） | 全部管理指令，**并且能增删 admin** |
-| `admin` | owner 用 `/admin add` 添加 | 与 owner 相同，唯独**不能增删管理员**（也不能把别人提成 owner） |
+| `user` 普通用户 | 默认 | 触发公开指令 |
+| `admin` Bot 管理员 | 所有者用 `/admin add` 添加 | 全部管理指令，唯独**不能增删管理员**，也不能把别人提成 owner |
+| `owner` Bot 所有者 | `/claim` 认领（一次性令牌，全局唯一） | 全部权限，**并且能增删 admin** |
+
+另有一个正交维度是**平台给出的群内角色**（`author.member_role`）：群成员 / 群管理员 / 群主。
+它用于"群管级"权限点，**不是** Bot 管理员——群主不会因此获得重启机器人或看主机指标的权限；
+反过来，Bot 管理员在任何群里都按群管级处理。
 
 | 指令 | 权限 | 说明 |
 |---|---|---|
-| `/admin list` | owner / admin | 列出全部授权、角色与作用范围 |
-| `/admin add <openid> [备注]` | 仅 owner | 新增 admin；备注可写 QQ 号，方便人眼识别 |
-| `/admin rm <openid>` | 仅 owner | 删除 admin 的所有授权；owner 本身不可删 |
-| `/admin whoami` | **所有人** | 只回自己的 openid / union / 角色，用于把标识报给 owner |
-| `/reload [说明]` | owner / admin | 重启进程加载磁盘上的新二进制，见下节 |
+| `/admin list` | Bot 管理员 / 所有者 | 列出全部授权、角色与作用范围 |
+| `/admin add <openid> [备注]` | 仅所有者 | 新增 admin；备注可写 QQ 号，方便人眼识别 |
+| `/admin rm <openid>` | 仅所有者 | 删除 admin 的所有授权；所有者本身不可删 |
+| `/admin whoami` | **所有人** | 只回自己的 openid / union / Bot 角色 / 群内角色 |
+| `/reload [说明]` | Bot 管理员 / 所有者 | 重启进程加载磁盘上的新二进制，见下节 |
 
 群聊里需 @ 机器人后发送，单聊直接发。
 
+插件侧的声明方式（`plugins/adminping` 就是范例）：
+
+```go
+Commands: []host.Command{{
+    Prefix:     "/ping",
+    Permission: host.PermBotAdmin,      // 核心在路由阶段拦截
+    DenyReply:  "该指令仅管理员可用。",   // 是否真的发出由 [permission].deny_reply 决定
+}},
+```
+
 ### 为什么是 openid 而不是 QQ 号
 
-QQ 机器人 v2 **不下发 QQ 号**，只有 openid：群里是 `member_openid`，单聊是 `user_openid`，两者不能互换。平台另给一个 `union_openid` 作为跨场景标识（部分事件版本可能为空）。
+QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平台声明的用户唯一标识，
+群聊的 `member_openid` 与单聊的 `user_openid` 对同一个人取同一个值（实测与官方示例一致），
+所以 openid 可以直接当跨场景主键用，`union_openid` 只是兜底（可能为空）。
 
-因此添加管理员的实际流程是：
+添加管理员的实际流程：
 
 1. 对方在群里或私聊发送 `/admin whoami`，拿到自己的 openid；
-2. 把 openid 发给 owner；
-3. owner 执行 `/admin add <openid> 123456789`（备注写 QQ 号）。
+2. 把 openid 发给所有者；
+3. 所有者执行 `/admin add <openid> 123456789`（备注写 QQ 号）。
 
-授权范围按**添加时的场景**决定，并用 `admins.peer_scope` 约束：
+授权范围按**添加时的场景**决定，用 `admins.peer_scope` 约束：
 
-- `owner` 全局有效——认领后在该场景之外（如私聊）同样可用；
-- 在 A 群添加的 admin → A 群 + 私聊，不会扩散到 B 群；
-- 在私聊添加的 admin → 只作用于私聊，不会因为同一个人进群就获得群内权限；
-- 若对方已有单聊/群两种身份，且平台回传了 `union_openid`，则同一个人跨场景互相识别（上面的规则才成立）；平台不给 union 时，两种身份无法关联。
+- `owner` 全局有效——单聊里认领，进群后同样是 owner；
+- 在 A 群添加的 admin → 只在 A 群（+ 私聊运维）有效，不扩散到 B 群；
+- 在私聊添加的 admin → 没有群上下文，是**全局管理员**，任何群都生效。
 
-`identities` 表记录 openid ↔ union_openid 的对应关系（每条消息一条 upsert），这也是"群里认领的 owner 能收到启动私聊通知"的前提。平台不给 union 时，群身份无法主动私聊，日志里会写明。
+`identities` 表仍记录 openid ↔ union_openid 的对应关系，`AdminTargets` 优先用它解析
+单聊投递地址；解析不到时直接用同一 openid（跨场景同值），所以群里的管理员也能收到启动通知。
 
 ## 启动通知与主动消息
 
@@ -141,7 +160,7 @@ QQ 机器人 v2 **不下发 QQ 号**，只有 openid：群里是 `member_openid`
 启动 10-17 14:56:19｜windows/amd64
 上次启动 10-17 12:51（2小时5分前）
 启用插件 3 个
-· adminping v0.1.0（/ping）
+· adminping v0.2.0（/ping）
 · bootnotice v0.1.0
 · echo v0.1.0（!ping、!echo）
 ```
@@ -222,13 +241,17 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 
 ## `/ping`（仅管理员）
 
-群聊需 @ 机器人后发送 `/ping`，单聊直接发。**非管理员默认完全静默**（连"无权限"都不回），避免在群里暴露该指令与机器信息；权限后端故障时同样静默并按 fail-closed 处理。
+群聊需 @ 机器人后发送 `/ping`，单聊直接发。鉴权由核心完成：`adminping` 在 Manifest 里
+声明 `Permission = PermBotAdmin`，非管理员在路由阶段就被拦下，插件根本不会被调用。
+
+**默认完全静默**（连"无权限"都不回），避免在群里暴露该指令与机器信息；权限查询失败
+同样按 fail-closed 处理。
 
 ```toml
-[plugins.adminping]
-# 默认 true：非管理员 / 鉴权失败时不发任何消息
-# false：回一句"该指令仅管理员可用。"或"权限查询失败，本次请求已忽略。"，便于调试权限链路
-silent = true
+[permission]
+# 默认 false：权限不足时不发任何消息
+# true：发出插件声明的拒绝语（如"该指令仅管理员可用。"），便于调试权限链路
+deny_reply = false
 ```
 
 ```
