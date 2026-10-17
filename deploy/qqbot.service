@@ -1,0 +1,27 @@
+[Unit]
+Description=QQ Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qqbot
+WorkingDirectory=/opt/qqbot
+ExecStart=/opt/qqbot/bin/qqbot -c /etc/qqbot/config.toml
+# 认证已写入 /etc/qqbot/config.toml（600）。若改用环境变量覆盖，
+# 再启用下面一行，AppID/Secret 不落配置文件。
+# EnvironmentFile=-/etc/qqbot/env
+Restart=on-failure
+RestartSec=10
+# 防止 session 配额（1000 天）被重启循环吃掉：配置错就停在 failed 等人看
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/qqbot
+
+[Install]
+WantedBy=multi-user.target
