@@ -29,10 +29,7 @@ func (p *Plugin) Manifest() host.Manifest {
 		Version:      "0.1.0",
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.reply", "log"},
-		Intents: []string{
-			host.EventGroupMessage,
-			host.EventC2CMessage,
-		},
+		Intents:      []string{"message"},
 		Commands: []host.Command{
 			{Prefix: "!ping", Priority: 100, Description: "连通性检查"},
 			{Prefix: "!echo", Priority: 100, Description: "回显文本"},

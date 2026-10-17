@@ -67,7 +67,8 @@ func TestTraceEndToEnd(t *testing.T) {
 	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
 	c.Handle(context.Background(), &host.Event{
 		ID:       "e1",
-		Type:     host.EventGroupMessage,
+		Kind:     host.KindMessage,
+		Name:     "GROUP_AT_MESSAGE_CREATE",
 		Scene:    host.SceneGroup,
 		PeerID:   "g1",
 		SenderID: "u1",
@@ -78,7 +79,7 @@ func TestTraceEndToEnd(t *testing.T) {
 	waitFor(t, out, "已发送")
 	got := out.String()
 	for _, want := range []string{
-		"收到 群聊 · GROUP_AT_MESSAGE_CREATE",
+		"收到 群聊消息 · GROUP_AT_MESSAGE_CREATE",
 		"发送者：u1",
 		"peer  ：g1",
 		"内容  ：!ping",
@@ -125,7 +126,8 @@ func TestTracePluginLevel(t *testing.T) {
 	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
 	c.Handle(context.Background(), &host.Event{
 		ID:       "EVENT-ID-123",
-		Type:     host.EventGroupMessage,
+		Kind:     host.KindMessage,
+		Name:     "GROUP_AT_MESSAGE_CREATE",
 		Scene:    host.SceneGroup,
 		PeerID:   "GROUP-OPENID-999",
 		SenderID: "SENDER-OPENID-888",
@@ -168,7 +170,7 @@ func TestTracePluginLevelSkipsNoise(t *testing.T) {
 	out := &syncBuffer{}
 	tr := NewTrace(out, LevelPlugin)
 	ev := &host.Event{
-		ID: "e1", Type: host.EventC2CMessage, Scene: host.SceneC2C,
+		ID: "e1", Kind: host.KindMessage, Name: "C2C_MESSAGE_CREATE", Scene: host.SceneC2C,
 		PeerID: "u1", SenderID: "u1", UnionID: "union-1", Content: "随便聊聊",
 	}
 	tr.Received(ev)
@@ -183,7 +185,7 @@ func TestTracePluginLevelSkipsNoise(t *testing.T) {
 
 func TestNilTraceIsSafe(t *testing.T) {
 	var tr *Trace
-	ev := &host.Event{ID: "e", Type: host.EventC2CMessage, Scene: host.SceneC2C}
+	ev := &host.Event{ID: "e", Kind: host.KindMessage, Name: "C2C_MESSAGE_CREATE", Scene: host.SceneC2C}
 	tr.Received(ev)
 	tr.Duplicate(ev)
 	tr.NoMatch(ev)
@@ -227,7 +229,7 @@ func TestRouterMatchReportsCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms := r.Match(&host.Event{Type: host.EventGroupMessage, Content: "!b x"})
+	ms := r.Match(&host.Event{Kind: host.KindMessage, Scene: host.SceneGroup, Content: "!b x"})
 	if len(ms) != 1 || ms[0].Command != "!b" || ms[0].Priority != 100 {
 		t.Fatalf("应命中 !b(100)，实际 %+v", ms)
 	}

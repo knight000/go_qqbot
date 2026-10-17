@@ -72,6 +72,9 @@ level = "full"
 # 额外打印平台原始 JSON，用于排查"某个字段平台到底下发没有"；
 # 输出较啰嗦，只在需要时打开，且要求 level = "full"。
 raw = false
+# 未知事件（平台新推出、本地解码表还没有的事件）附带原始 JSON。
+# 用于确认"平台到底推了什么"；未知事件永远不会进入插件路由。
+unknown_events = false
 
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取
 [plugins.echo]

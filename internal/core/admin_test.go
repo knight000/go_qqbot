@@ -36,13 +36,10 @@ func newAdminCore(t *testing.T) (*Core, *fakeAPI) {
 }
 
 func adminEvent(content, sender, union string, scene host.Scene, peer string) *host.Event {
-	typ := host.EventGroupMessage
-	if scene == host.SceneC2C {
-		typ = host.EventC2CMessage
-	}
 	return &host.Event{
 		ID:       fmt.Sprintf("e-%s-%s", sender, content),
-		Type:     typ,
+		Kind:     host.KindMessage,
+		Name:     "TEST_MESSAGE_CREATE",
 		Scene:    scene,
 		PeerID:   peer,
 		SenderID: sender,

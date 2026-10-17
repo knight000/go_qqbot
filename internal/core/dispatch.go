@@ -70,7 +70,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, ev *host.Event) {
 	case q.ch <- ev:
 	default:
 		// 背压：队列满说明该 peer 处理不过来，宁可丢事件也不拖垮全局
-		d.log.Warn("peer 队列已满，丢弃事件", "peer", key, "event", ev.ID, "type", ev.Type)
+		d.log.Warn("peer 队列已满，丢弃事件", "peer", key, "event", ev.ID, "name", ev.Name)
 	}
 }
 
@@ -108,7 +108,7 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 	matches := d.router.Match(ev)
 	if len(matches) == 0 {
 		d.trace.NoMatch(ev)
-		d.log.Debug("无插件匹配", "type", ev.Type, "content", ev.Content)
+		d.log.Debug("无插件匹配", "name", ev.Name, "content", ev.Content)
 		return
 	}
 
@@ -147,7 +147,7 @@ func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {
 	d.trace.PluginDone(m, cost, reply, err)
 	if err != nil {
 		d.log.Error("插件处理失败",
-			"plugin", m.Manifest.Name, "event", ev.ID, "type", ev.Type,
+			"plugin", m.Manifest.Name, "event", ev.ID, "name", ev.Name,
 			"cost", cost.String(), "err", err)
 		return
 	}

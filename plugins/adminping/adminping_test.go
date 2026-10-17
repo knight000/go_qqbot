@@ -49,7 +49,8 @@ func newPlugin(t *testing.T, admin bool, err error, cfg host.Params) *Plugin {
 func ev(content string) *host.Event {
 	return &host.Event{
 		ID:       "e1",
-		Type:     host.EventGroupMessage,
+		Kind:     host.KindMessage,
+		Name:     "GROUP_AT_MESSAGE_CREATE",
 		Scene:    host.SceneGroup,
 		PeerID:   "group-1",
 		SenderID: "user-1",

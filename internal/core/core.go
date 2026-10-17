@@ -69,6 +69,9 @@ func New(o Options) (*Core, error) {
 	if trace == nil && o.Config.Debug.Enabled {
 		trace = NewTrace(os.Stdout, Level(o.Config.Debug.Level))
 	}
+	if trace != nil {
+		trace.SetUnknownPayload(o.Config.Debug.UnknownEvents)
+	}
 	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config))
 	sender.trace = trace
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
@@ -158,10 +161,17 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		c.log.Warn("丢弃空事件")
 		return
 	}
+	// 未知事件只观测、不路由：它是"平台推了但本地不认识"的唯一出口，
+	// 不进幂等表、不落库、不触发任何插件（否则就成了绕过 Manifest.Intents 的后门）。
+	if ev.Kind == host.KindUnknown {
+		c.trace.Unknown(ev)
+		c.log.Debug("未知事件，仅记录不路由", "name", ev.Name)
+		return
+	}
 	// 先打轨迹再去重：调试模式下"收到的每一条"都要看见，包括重复投递的那条。
 	c.trace.Received(ev)
 	if ev.ID == "" {
-		c.log.Warn("丢弃缺少事件 ID 的事件", "type", ev.Type)
+		c.log.Warn("丢弃缺少事件 ID 的事件", "name", ev.Name)
 		return
 	}
 
@@ -184,7 +194,7 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 			Scene:        string(ev.Scene),
 			PeerOpenID:   ev.PeerID,
 			SenderOpenID: ev.SenderID,
-			MsgType:      0,
+			MsgType:      ev.MsgType,
 			Content:      ev.Content,
 			HasMedia:     ev.HasMedia,
 		}); err != nil {
