@@ -27,7 +27,7 @@ const adminUsage = `用法：
 /admin rm <openid>           删除 Bot 管理员（仅所有者）
 /admin whoami               查看自己的角色与标识
 
-角色分三级：普通用户 < Bot 管理员 < Bot 所有者。
+角色分三级：普通用户 < Bot 管理员 < Bot 所有者；角色全局有效，群里加与私聊加一致。
 群主 / 群管理员是平台身份，不等于 Bot 管理员。
 whoami 对所有人开放（只返回你自己的标识）：把 openid 发给所有者才能被添加。`
 
@@ -35,8 +35,8 @@ whoami 对所有人开放（只返回你自己的标识）：把 openid 发给�
 // 单独一层是为了不让 host 依赖 store，也不让插件摸到数据库。
 type adminStore struct{ db *store.DB }
 
-func (a adminStore) AdminRole(ctx context.Context, openid, unionID, scene, peer string) (string, string, bool, error) {
-	return a.db.AdminRole(ctx, openid, unionID, scene, peer)
+func (a adminStore) AdminRole(ctx context.Context, openid, unionID string) (string, bool, error) {
+	return a.db.AdminRole(ctx, openid, unionID)
 }
 
 func (a adminStore) AdminTargets(ctx context.Context) ([]host.AdminTarget, error) {
@@ -100,7 +100,7 @@ func (c *Core) adminList(ctx context.Context, ev *host.Event) {
 
 	const maxLines = 20
 	var b strings.Builder
-	fmt.Fprintf(&b, "管理员 %d 条\n", len(admins))
+	fmt.Fprintf(&b, "管理员 %d 条（全局角色，所有群与私聊）\n", len(admins))
 	for i, a := range admins {
 		if i == maxLines {
 			fmt.Fprintf(&b, "…另有 %d 条，未显示\n", len(admins)-maxLines)
@@ -110,7 +110,10 @@ func (c *Core) adminList(ctx context.Context, ev *host.Event) {
 		if a.Note != "" {
 			fmt.Fprintf(&b, "（%s）", a.Note)
 		}
-		fmt.Fprintf(&b, "｜%s\n", describeAdmin(a.PeerScope))
+		if src := describeScene(a.SourceScene); src != "" {
+			fmt.Fprintf(&b, "｜%s添加", src)
+		}
+		b.WriteString("\n")
 	}
 	c.replyText(ctx, ev, strings.TrimRight(b.String(), "\n"))
 }
@@ -119,13 +122,12 @@ func (c *Core) adminWhoami(ctx context.Context, ev *host.Event, p host.Principal
 	var b strings.Builder
 	fmt.Fprintf(&b, "角色 %s\n", p.RoleLabel())
 
-	// 群内角色来自平台载荷，只在群消息里有；私聊留空不打印。
-	if gr := p.GroupRoleLabel(); gr != "" {
-		where := "本群"
-		if p.Scene != host.SceneGroup {
-			where = "当前会话"
+	// 群内角色来自平台载荷，只在群消息里有。
+	// 私聊虽然按 member 作为权限基线，但不是"群内角色"，不在这里展示。
+	if p.Scene == host.SceneGroup {
+		if gr := p.GroupRoleLabel(); gr != "" {
+			fmt.Fprintf(&b, "群内 %s（本群）\n", gr)
 		}
-		fmt.Fprintf(&b, "群内 %s（%s）\n", gr, where)
 	}
 
 	fmt.Fprintf(&b, "openid %s\n", ev.SenderID)
@@ -162,14 +164,13 @@ func (c *Core) adminAdd(ctx context.Context, ev *host.Event, p host.Principal, f
 		note = string(r[:40])
 	}
 
-	// 默认按"在当前场景手写 openid"处理；能解析到已知身份就用已知的
-	// 场景/范围，这样按 union_openid 添加也能落到正确的那个场景。
-	scene, scope := string(ev.Scene), peerScope(ev)
+	// 允许按 union_openid 添加：能解析到已知身份就用它的 openid，
+	// 这样"把某人的 union 发过来"也能落到正确的用户上。
 	openid, union := ident, ""
-	if idn, ok, err := c.store.ResolveIdentity(ctx, ident, scene, scope); err != nil {
+	if idn, ok, err := c.store.ResolveIdentity(ctx, ident, string(ev.Scene), peerScope(ev)); err != nil {
 		c.log.Warn("解析待添加身份失败，按 openid 处理", "ident", ident, "err", err)
 	} else if ok {
-		openid, union, scene, scope = idn.OpenID, idn.UnionID, idn.Scene, idn.PeerScope
+		openid, union = idn.OpenID, idn.UnionID
 	}
 
 	existing, err := c.store.ListAdmins(ctx)
@@ -179,30 +180,25 @@ func (c *Core) adminAdd(ctx context.Context, ev *host.Event, p host.Principal, f
 		return
 	}
 	for _, a := range existing {
-		// 身份按 openid（或 union）跨场景比较：同一个人不该有两条重复授权。
+		// 角色全局唯一：同一个人不该有第二条授权（openid 或 union 命中都算）。
 		if a.OpenID != openid && (union == "" || a.UnionID != union) {
-			continue
-		}
-		// 已有的全局授权（peer_scope 为空）覆盖任何范围；同一群的重复也拦下。
-		if a.PeerScope != "" && a.PeerScope != scope {
 			continue
 		}
 		if a.Role == store.RoleOwner {
 			c.replyText(ctx, ev, "该用户已是 Bot 所有者，无需添加。")
 			return
 		}
-		c.replyText(ctx, ev, fmt.Sprintf("该用户已经是 admin（%s）。", describeAdmin(a.PeerScope)))
+		c.replyText(ctx, ev, "该用户已经是 admin（全局角色）。")
 		return
 	}
 
 	row := store.Admin{
-		OpenID:    openid,
-		UnionID:   union,
-		Scene:     scene,
-		PeerScope: scope,
-		Role:      store.RoleAdmin,
-		Note:      note,
-		GrantedBy: ev.SenderID,
+		OpenID:      openid,
+		UnionID:     union,
+		Role:        store.RoleAdmin,
+		Note:        note,
+		GrantedBy:   ev.SenderID,
+		SourceScene: string(ev.Scene),
 	}
 	if err := c.store.UpsertAdmin(ctx, row); err != nil {
 		c.log.Error("写入管理员失败", "openid", openid, "err", err)
@@ -210,14 +206,14 @@ func (c *Core) adminAdd(ctx context.Context, ev *host.Event, p host.Principal, f
 		return
 	}
 	c.log.Info("已添加管理员", "openid", openid, "role", store.RoleAdmin,
-		"scene", scene, "scope", scope, "by", ev.SenderID)
+		"source", ev.Scene, "by", ev.SenderID)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "已添加 admin：%s", openid)
 	if note != "" {
 		fmt.Fprintf(&b, "（%s）", note)
 	}
-	fmt.Fprintf(&b, "\n范围 %s｜除增删管理员外，权限与所有者相同", describeAdmin(scope))
+	b.WriteString("\n角色全局有效：所有群与私聊，除增删管理员外权限与所有者相同")
 	c.replyText(ctx, ev, b.String())
 }
 
@@ -250,15 +246,15 @@ func (c *Core) adminRemove(ctx context.Context, ev *host.Event, p host.Principal
 	}
 }
 
-// describeAdmin 把 peer_scope 说成人话。
-//
-// peer_scope 只表达"群内委托"：非空 = 只在那个群生效，空 = 全局角色。
-// 场景（scene）已经不影响判定，只作来源记录，所以这里不再需要它。
-func describeAdmin(scope string) string {
-	if scope == "" {
-		return "全局（所有群与私聊）"
+// describeScene 把来源场景说成人话，只用于 /admin list 的注脚。
+func describeScene(scene string) string {
+	switch scene {
+	case string(host.SceneGroup):
+		return "群聊"
+	case string(host.SceneC2C):
+		return "私聊"
 	}
-	return "仅群 " + shortID(scope)
+	return ""
 }
 
 // shortID 保留首尾各 6 位，够人眼区分又不把整条 openid 刷满屏。

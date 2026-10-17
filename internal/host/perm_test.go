@@ -59,6 +59,8 @@ func TestPermAdmitsMatrix(t *testing.T) {
 	c2c := func(role Role) Principal {
 		return Principal{Scene: SceneC2C, Role: role}
 	}
+	// 私聊的角色基线是 member：没有群，但调用者仍是普通成员。
+	c2cMember := Principal{Scene: SceneC2C, Role: RoleUser, GroupRole: GroupRoleMember}
 
 	cases := []struct {
 		name string
@@ -71,7 +73,8 @@ func TestPermAdmitsMatrix(t *testing.T) {
 		{"零值放行群成员", 0, group(RoleUser, GroupRoleMember), true},
 
 		{"PermUser 放行私聊", PermUser, c2c(RoleUser), true},
-		{"PermGroupMember 拒绝私聊", PermGroupMember, c2c(RoleUser), false},
+		{"PermGroupMember 拒绝未知私聊角色", PermGroupMember, c2c(RoleUser), false},
+		{"PermGroupMember 放行私聊成员（默认基线）", PermGroupMember, c2cMember, true},
 		{"PermGroupMember 放行群成员", PermGroupMember, group(RoleUser, GroupRoleMember), true},
 		{"PermGroupMember 放行群管", PermGroupMember, group(RoleUser, GroupRoleAdmin), true},
 
@@ -79,6 +82,7 @@ func TestPermAdmitsMatrix(t *testing.T) {
 		{"group-admin 放行平台群主", PermGroupAdmin, group(RoleUser, GroupRoleOwner), true},
 		{"group-admin 拒绝群成员", PermGroupAdmin, group(RoleUser, GroupRoleMember), false},
 		{"group-admin 拒绝私聊", PermGroupAdmin, c2c(RoleUser), false},
+		{"group-admin 拒绝私聊成员", PermGroupAdmin, c2cMember, false},
 		{"group-admin 放行 Bot 管理员（叠加）", PermGroupAdmin, group(RoleAdmin, GroupRoleMember), true},
 		{"group-admin 拒绝私聊里的 Bot 管理员（群权限不适用于私聊）", PermGroupAdmin, c2c(RoleAdmin), false},
 

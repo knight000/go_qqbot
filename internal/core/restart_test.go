@@ -31,7 +31,7 @@ func TestReloadEnqueuesForAdmin(t *testing.T) {
 	for _, role := range []string{store.RoleOwner, store.RoleAdmin} {
 		t.Run(role, func(t *testing.T) {
 			c, f := newAdminCore(t)
-			seedAdmin(t, c, "u-"+role, "", "c2c", "", role)
+			seedAdmin(t, c, "u-"+role, "", role)
 
 			c.handleReserved(context.Background(),
 				adminEvent("/reload 升级到新构建", "u-"+role, "", host.SceneC2C, "u-"+role))
@@ -61,7 +61,7 @@ func TestReloadEnqueuesForAdmin(t *testing.T) {
 // 同一个进程只接受一条重启请求：第二条只回提示，不再入队。
 func TestReloadIsIdempotentWithinProcess(t *testing.T) {
 	c, f := newAdminCore(t)
-	seedAdmin(t, c, "u1", "", "c2c", "", store.RoleOwner)
+	seedAdmin(t, c, "u1", "", store.RoleOwner)
 	ctx := context.Background()
 
 	c.handleReserved(ctx, adminEvent("/reload", "u1", "", host.SceneC2C, "u1"))
@@ -80,7 +80,7 @@ func TestReloadIsIdempotentWithinProcess(t *testing.T) {
 
 func TestReloadHelpDoesNotRestart(t *testing.T) {
 	c, f := newAdminCore(t)
-	seedAdmin(t, c, "u1", "", "c2c", "", store.RoleOwner)
+	seedAdmin(t, c, "u1", "", store.RoleOwner)
 
 	c.handleReserved(context.Background(), adminEvent("/reload help", "u1", "", host.SceneC2C, "u1"))
 
@@ -95,7 +95,7 @@ func TestReloadHelpDoesNotRestart(t *testing.T) {
 // /restart 是 /reload 的别名，两者行为一致。
 func TestRestartAliasConsumed(t *testing.T) {
 	c, _ := newAdminCore(t)
-	seedAdmin(t, c, "u1", "", "c2c", "", store.RoleOwner)
+	seedAdmin(t, c, "u1", "", store.RoleOwner)
 
 	if !c.handleReserved(context.Background(), adminEvent("/restart", "u1", "", host.SceneC2C, "u1")) {
 		t.Fatal("/restart 应被核心消费")

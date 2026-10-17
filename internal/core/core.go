@@ -33,6 +33,7 @@ type Options struct {
 type Core struct {
 	store   *store.DB
 	cfg     *config.Config
+	api     *api.Client
 	http    *httpx.Client
 	log     *slog.Logger
 	plugins []host.Plugin
@@ -82,6 +83,7 @@ func New(o Options) (*Core, error) {
 	return &Core{
 		store:     o.Store,
 		cfg:       o.Config,
+		api:       o.API,
 		http:      o.HTTP,
 		log:       logger,
 		plugins:   o.Plugins,
@@ -135,6 +137,7 @@ func (c *Core) Start(ctx context.Context) error {
 	if err := c.ensureOwner(ctx); err != nil {
 		return err
 	}
+	c.logGroupGateState(ctx)
 	go c.gcLoop(ctx)
 
 	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.App.Sandbox)
@@ -156,7 +159,7 @@ func (c *Core) Shutdown(ctx context.Context) {
 	}
 }
 
-// Handle 是接入层唯一入口：去重 → 落库 → 核心保留指令 → 路由。
+// Handle 是接入层唯一入口：群准入 → 去重 → 落库 → 核心保留指令 → 路由。
 func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	if ev == nil {
 		c.log.Warn("丢弃空事件")
@@ -174,6 +177,17 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	if ev.ID == "" {
 		c.log.Warn("丢弃缺少事件 ID 的事件", "name", ev.Name)
 		return
+	}
+
+	// 群准入：在去重与落库之前判定，未授权的群不会留下任何业务数据。
+	// 例外只给 Bot 管理员的 /group 指令——否则新群无法在群内自助加入白名单。
+	if allowed, g, reason := c.groupAccess(ctx, ev); !allowed {
+		if !c.groupControlExempt(ctx, ev, g) {
+			c.trace.GroupDropped(ev, reason)
+			c.log.Debug("群未放行，丢弃事件",
+				"peer", ev.PeerID, "mode", g.Mode, "reason", reason)
+			return
+		}
 	}
 
 	seen, err := c.store.MarkEventSeen(ctx, ev.ID)

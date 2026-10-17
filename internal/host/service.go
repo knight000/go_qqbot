@@ -59,8 +59,10 @@ type QueryBackend interface {
 
 // AdminBackend 由 core 的适配器实现：角色判定与收件人列表都走这里，
 // 插件永远拿不到 admins 表的原始访问权。
+//
+// 角色是全局的：openid 跨场景同值，所以不需要 scene / peer 参数。
 type AdminBackend interface {
-	AdminRole(ctx context.Context, openid, unionID, scene, peer string) (role, scope string, ok bool, err error)
+	AdminRole(ctx context.Context, openid, unionID string) (role string, ok bool, err error)
 	AdminTargets(ctx context.Context) ([]AdminTarget, error)
 }
 
@@ -130,11 +132,11 @@ func (s *Service) IsAdmin(ctx context.Context, id Identity) (bool, error) {
 	if id.OpenID == "" {
 		return false, nil
 	}
-	_, _, ok, err := s.admin.AdminRole(ctx, id.OpenID, id.UnionID, string(id.Scene), id.PeerID)
+	role, ok, err := s.admin.AdminRole(ctx, id.OpenID, id.UnionID)
 	if err != nil {
 		return false, err
 	}
-	return ok, nil
+	return ok && Role(role).Level() >= RoleAdmin.Level(), nil
 }
 
 // Admins 返回收件人目录。每次调用都重新解析，群认领者补上私聊身份后立即可见。

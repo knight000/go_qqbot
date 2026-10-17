@@ -6,9 +6,11 @@ import (
 
 // 权限模型（ARCHITECTURE.md §8.7）由两个正交维度组成：
 //
-//	Bot 角色 Role        本系统认定，来自 admins 表：user < admin < owner；
+//	Bot 角色 Role        本系统认定，来自 admins 表：user < admin < owner，
+//	                     全局有效——群里添加与私聊添加效果一致；
 //	群内角色 GroupRole   平台在事件载荷里直接给出（author.member_role）：
-//	                     unknown < member < admin < owner。
+//	                     unknown < member < admin < owner。私聊没有群，
+//	                     但调用者仍是"普通成员"，因此默认等价于 member。
 //
 // 两者**叠加而非替代**：Bot 管理员在任何群里都按群管级处理；平台群主不会因此
 // 变成 Bot 管理员。这条边界是刻意的——把群主当 Bot 管理员，等于把"谁在这个群
@@ -159,7 +161,8 @@ type Perm uint32
 const (
 	// PermUser 覆盖所有人（含私聊、通知事件）。
 	PermUser Perm = 1 << iota
-	// PermGroupMember 要求事件来自群聊（群主与群管也满足）。
+	// PermGroupMember 要求事件来自一次真实会话：群聊，或私聊里的成员
+	// （私聊没有群角色，默认按 member 处理）。
 	PermGroupMember
 	// PermGroupAdmin 要求群管级：平台群管/群主，或 Bot 管理员。
 	PermGroupAdmin
@@ -192,8 +195,9 @@ func (p Perm) Admits(pr Principal) bool {
 		return true
 	}
 	if pr.Scene != SceneGroup {
-		// 群相关的三个权限点只在群聊里成立
-		return false
+		// 私聊只有"成员"这一档：resolveActor 会把私聊角色填成 member。
+		// 群管/群主权限在私聊恒不成立，除非调用者是 Bot 管理员（上面已处理）。
+		return p&PermGroupMember != 0 && pr.GroupRole.Level() >= GroupRoleMember.Level()
 	}
 	if p&PermGroupMember != 0 {
 		return true

@@ -28,12 +28,18 @@ func (c *Core) resolveActor(ctx context.Context, ev *host.Event) {
 	ev.Actor.Scene = ev.Scene
 	ev.Actor.PeerID = ev.PeerID
 	ev.Actor.Role = host.RoleUser
-	// GroupRole 由网关填；这里绝不覆盖——核心没有比平台更权威的来源。
+	// GroupRole 由网关填，核心没有比平台更权威的来源，绝不覆盖群聊里的值。
+	// 但私聊没有群角色：调用者仍是"普通成员"，因此默认等价于 member——
+	// 这让"要求成员及以上"的权限点在私聊里同样成立，而不是因为场景不同失效。
+	if ev.Scene == host.SceneC2C && ev.Actor.GroupRole == host.GroupRoleUnknown {
+		ev.Actor.GroupRole = host.GroupRoleMember
+	}
 
 	if ev.SenderID == "" || c.store == nil {
 		return
 	}
-	role, _, ok, err := c.store.AdminRole(ctx, ev.SenderID, ev.UnionID, string(ev.Scene), ev.PeerID)
+	// Bot 角色是全局的：openid 跨场景同值，不需要 scene / peer 参与判定。
+	role, ok, err := c.store.AdminRole(ctx, ev.SenderID, ev.UnionID)
 	if err != nil {
 		c.log.Error("查询角色失败，本次按普通用户处理", "event", ev.ID, "err", err)
 		return
