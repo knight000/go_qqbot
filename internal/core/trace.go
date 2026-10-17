@@ -106,6 +106,17 @@ func (t *Trace) Duplicate(ev *host.Event) {
 	t.emit(fmt.Sprintf("[%s] 重复事件，已跳过：%s\n", stamp(), dash(ev.ID)))
 }
 
+// GroupDropped 打印因群准入被丢弃的事件。
+//
+// 只在 full 级别输出：plugin 级别只关心"谁触发了我"，被丢弃的消息没有触发任何人。
+// 它也不进幂等表——同一个群反复刷屏时，这里会反复出现，属于预期。
+func (t *Trace) GroupDropped(ev *host.Event, reason string) {
+	if !t.full() {
+		return
+	}
+	t.emit(fmt.Sprintf("[%s] 群未放行，已丢弃（%s）：%s\n", stamp(), reason, dash(ev.PeerID)))
+}
+
 // NoMatch 打印没有插件认领的消息。
 func (t *Trace) NoMatch(ev *host.Event) {
 	if !t.full() {
@@ -163,7 +174,8 @@ func (t *Trace) Denied(m Match, ev *host.Event) {
 		cmd = fmt.Sprintf(" · 命令 %q", m.Command)
 	}
 	what := "调用者 " + string(ev.Actor.Role)
-	if gr := ev.Actor.GroupRoleLabel(); gr != "" {
+	// 私聊的角色基线也是 member，但那是权限默认值，不是"群内身份"，不打印。
+	if gr := ev.Actor.GroupRoleLabel(); gr != "" && ev.Scene == host.SceneGroup {
 		what += "／" + gr
 	}
 	t.emit(fmt.Sprintf("[%s] 权限不足 · 插件 %s%s（需要 %s；%s）\n",

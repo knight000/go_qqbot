@@ -64,6 +64,10 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		c.trace.CoreCommand(cmd)
 		c.handleAdmin(ctx, ev)
 		return true
+	case "/group":
+		c.trace.CoreCommand(cmd)
+		c.handleGroup(ctx, ev)
+		return true
 	case "/reload", "/restart":
 		c.trace.CoreCommand(cmd)
 		c.handleReload(ctx, ev)
@@ -112,12 +116,11 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 	}
 
 	admin := store.Admin{
-		OpenID:    ev.SenderID,
-		UnionID:   ev.UnionID,
-		Scene:     string(ev.Scene),
-		PeerScope: "", // owner 在该场景内全局有效
-		Role:      store.RoleOwner,
-		GrantedBy: "claim",
+		OpenID:      ev.SenderID,
+		UnionID:     ev.UnionID,
+		Role:        store.RoleOwner,
+		GrantedBy:   "claim",
+		SourceScene: string(ev.Scene),
 	}
 	if err := c.store.UpsertAdmin(ctx, admin); err != nil {
 		c.log.Error("写入管理员失败", "err", err)
@@ -129,5 +132,6 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 	c.claimExp = time.Time{}
 	c.log.Info("管理员认领成功", "openid", ev.SenderID, "union", ev.UnionID, "scene", ev.Scene)
 	c.replyText(ctx, ev, "认领成功，你已成为 owner。\n"+
-		"用 /admin add <openid> [备注] 添加辅助管理员，/admin list 查看，/admin whoami 查自己的身份。")
+		"用 /admin add <openid> [备注] 添加辅助管理员，/admin list 查看，/admin whoami 查自己的身份。\n"+
+		"群准入默认开启：新群需用 /group allow <group_openid> 加入白名单，或由你在群内发 /group allow。")
 }

@@ -10,7 +10,7 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | `internal/httpx` | 统一出站：https 强制、域名白名单、令牌桶、重试与全抖动退避 |
 | `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息 |
 | `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避 |
-| `internal/core` | 事件去重、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC、`/reload` 自重启 |
+| `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC、`/reload` 自重启 |
 | `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
 | `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 收件人目录 / 日志） |
@@ -96,7 +96,9 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 
 生产环境保持 `enabled = false`：轨迹里有消息正文与 openid，不适合进 journald。
 
-## 权限：三级角色 + 群内身份
+## 权限与群准入
+
+### 三级角色（全局）
 
 权限判定在**核心**里完成，插件只声明"需要什么"，代码里不写判权语句。
 
@@ -106,16 +108,20 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 | `admin` Bot 管理员 | 所有者用 `/admin add` 添加 | 全部管理指令，唯独**不能增删管理员**，也不能把别人提成 owner |
 | `owner` Bot 所有者 | `/claim` 认领（一次性令牌，全局唯一） | 全部权限，**并且能增删 admin** |
 
+Bot 角色是**全局**的：openid 跨场景同值，群里添加与私聊添加效果一致，
+不存在"只在某个群生效"的委托。
+
 另有一个正交维度是**平台给出的群内角色**（`author.member_role`）：群成员 / 群管理员 / 群主。
 它用于"群管级"权限点，**不是** Bot 管理员——群主不会因此获得重启机器人或看主机指标的权限；
-反过来，Bot 管理员在任何群里都按群管级处理。
+反过来，Bot 管理员在任何群里都按群管级处理。私聊没有群，角色默认等价于 `member`。
 
 | 指令 | 权限 | 说明 |
 |---|---|---|
-| `/admin list` | Bot 管理员 / 所有者 | 列出全部授权、角色与作用范围 |
+| `/admin list` | Bot 管理员 / 所有者 | 列出全部授权与来源场景 |
 | `/admin add <openid> [备注]` | 仅所有者 | 新增 admin；备注可写 QQ 号，方便人眼识别 |
-| `/admin rm <openid>` | 仅所有者 | 删除 admin 的所有授权；所有者本身不可删 |
+| `/admin rm <openid>` | 仅所有者 | 删除 admin；所有者本身不可删 |
 | `/admin whoami` | **所有人** | 只回自己的 openid / union / Bot 角色 / 群内角色 |
+| `/group ...` | Bot 管理员 / 所有者 | 群准入管理，见下 |
 | `/reload [说明]` | Bot 管理员 / 所有者 | 重启进程加载磁盘上的新二进制，见下节 |
 
 群聊里需 @ 机器人后发送，单聊直接发。
@@ -130,6 +136,41 @@ Commands: []host.Command{{
 }},
 ```
 
+### 群准入（白名单 / 黑名单）
+
+群准入决定"哪些群能跟机器人说话"，和权限一样由核心负责，插件无法接管。
+
+| 指令 | 说明 |
+|---|---|
+| `/group list [allow\|deny\|all]` | 列出已登记的群：openid ↔ 名称 ↔ 名单 |
+| `/group status [openid]` | 私聊不带参数看总览；群聊不带参数看当前群 |
+| `/group allow [openid]` | 加入白名单 |
+| `/group deny [openid]` | 加入黑名单 |
+| `/group clear [openid]` | 移出黑白名单 |
+| `/group name [openid] <名称>` | 更新群名称 |
+
+群聊里省略 `openid` 表示当前群；按 id 操作通常在私聊进行（id 是 32 位十六进制）。
+
+- 两套开关独立，默认都开；黑名单优先于白名单。
+- 判定发生在去重、落库、路由**之前**：未放行的群消息不落库、不触发插件，
+  调试轨迹里只留一行 `群未放行，已丢弃（原因）`。
+- 群事件仍会登记 `group_openid`，所以被拦下的群也能在 `/group list` 里看到。
+- **唯一例外**：Bot 管理员在"未进白名单"的群里发 `/group allow`，用于新群自助接入；
+  黑名单是硬阻断，群内任何人都不能自助解除，只能从私聊操作。
+- 群名来自 `GET /v2/groups/{id}/info`（该接口需要内邀，错误码 `11253`）：
+  能取到就自动记录，取不到留空，用 `/group name` 补；手工名字不会被自动抓取覆盖。
+
+```toml
+[group]
+whitelist  = true   # 只允许白名单群
+blacklist  = true   # 丢弃黑名单群（优先于白名单）
+fetch_name = true   # 首次见群时尝试调用群信息接口取名称
+```
+
+> **升级提示**：白名单默认开启且初始为空，升级后所有群消息都会被丢弃。
+> 先私聊机器人 `/group list` 找到目标群 id（只要收到过该群消息就会登记），
+> 再 `/group allow <id>`；或者以 Bot 管理员身份在群里直接发 `/group allow`。
+
 ### 为什么是 openid 而不是 QQ 号
 
 QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平台声明的用户唯一标识，
@@ -142,12 +183,7 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 2. 把 openid 发给所有者；
 3. 所有者执行 `/admin add <openid> 123456789`（备注写 QQ 号）。
 
-授权范围按**添加时的场景**决定，用 `admins.peer_scope` 约束：
-
-- `owner` 全局有效——单聊里认领，进群后同样是 owner；
-- 在 A 群添加的 admin → 只在 A 群（+ 私聊运维）有效，不扩散到 B 群；
-- 在私聊添加的 admin → 没有群上下文，是**全局管理员**，任何群都生效。
-
+授权是全局的：无论在哪添加，之后在任何群与私聊都生效。
 `identities` 表仍记录 openid ↔ union_openid 的对应关系，`AdminTargets` 优先用它解析
 单聊投递地址；解析不到时直接用同一 openid（跨场景同值），所以群里的管理员也能收到启动通知。
 

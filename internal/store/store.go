@@ -119,17 +119,79 @@ func (db *DB) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	// 必须放在补列之后：旧库可能还缺 note / union_openid，先补齐才能完整搬运。
+	if err := migrateLegacyAdmins(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交迁移: %w", err)
 	}
 	return nil
 }
 
-func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, decl string) error {
+// migrateLegacyAdmins 把带 peer_scope 的旧 admins 表重建成全局角色表。
+//
+// 旧模型里授权分场景/分群，新模型里 admin 与 owner 都是全局角色，
+// 所以按 openid 去重：owner 优先，否则 admin。整个过程在一个事务里，
+// 失败会回滚到旧表，不会留下半成品。
+func migrateLegacyAdmins(ctx context.Context, tx *sql.Tx) error {
+	old, err := hasColumn(ctx, tx, "admins", "peer_scope")
+	if err != nil {
+		return err
+	}
+	if old {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE admins RENAME TO admins_legacy`); err != nil {
+			return fmt.Errorf("重命名旧 admins 表: %w", err)
+		}
+	}
+	exists, err := tableExists(ctx, tx, "admins_legacy")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, adminTableDDL); err != nil {
+		return fmt.Errorf("重建 admins 表: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO admins(openid, union_openid, role, note, granted_by, source_scene, created_at)
+		SELECT openid,
+		       COALESCE(MAX(union_openid), ''),
+		       CASE WHEN MAX(CASE WHEN role = 'owner' THEN 1 ELSE 0 END) = 1
+		            THEN 'owner' ELSE 'admin' END,
+		       COALESCE(MAX(note), ''),
+		       MAX(granted_by),
+		       CASE WHEN MAX(CASE WHEN role = 'owner' THEN 1 ELSE 0 END) = 1
+		            THEN MAX(CASE WHEN role = 'owner' THEN scene ELSE '' END)
+		            ELSE MAX(scene) END,
+		       MIN(created_at)
+		  FROM admins_legacy
+		 GROUP BY openid`); err != nil {
+		return fmt.Errorf("搬运旧管理员授权: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE admins_legacy`); err != nil {
+		return fmt.Errorf("删除旧 admins 表: %w", err)
+	}
+	return nil
+}
+
+func tableExists(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&n); err != nil {
+		return false, fmt.Errorf("检查表 %s: %w", table, err)
+	}
+	return n > 0, nil
+}
+
+func hasColumn(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
 	rows, err := tx.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
-		return fmt.Errorf("读取表结构 %s: %w", table, err)
+		return false, fmt.Errorf("读取表结构 %s: %w", table, err)
 	}
+	defer rows.Close()
 	found := false
 	for rows.Next() {
 		var (
@@ -141,19 +203,22 @@ func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, decl string) e
 			pk        int
 		)
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &dfltValue, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("解析表结构 %s: %w", table, err)
+			return false, fmt.Errorf("解析表结构 %s: %w", table, err)
 		}
 		if name == column {
 			found = true
 		}
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("遍历表结构 %s: %w", table, err)
+		return false, fmt.Errorf("遍历表结构 %s: %w", table, err)
 	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("关闭表结构游标 %s: %w", table, err)
+	return found, nil
+}
+
+func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, decl string) error {
+	found, err := hasColumn(ctx, tx, table, column)
+	if err != nil {
+		return err
 	}
 	if found {
 		return nil

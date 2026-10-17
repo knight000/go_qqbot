@@ -214,6 +214,29 @@ type MessageBody struct {
 	Image   string `json:"image,omitempty"`
 }
 
+// GroupInfo 是 GET /v2/groups/{group_openid}/info 的响应。
+//
+// 该接口目前标注为"仅白名单机器人可用"（错误码 11253），因此调用方必须
+// 把失败当作正常分支处理：群名留空，由管理员用 /group name 手工补。
+type GroupInfo struct {
+	GroupOpenID    string   `json:"group_openid"`
+	GroupName      string   `json:"group_name"`
+	GroupMemo      string   `json:"group_finger_memo"`
+	GroupClass     string   `json:"group_class_text"`
+	GroupTags      []string `json:"group_tags"`
+	GroupMemberNum int      `json:"group_member_num"`
+}
+
+// GroupInfo 获取群基本信息（主要是群名称）。
+func (c *Client) GroupInfo(ctx context.Context, groupOpenID string) (GroupInfo, error) {
+	var out GroupInfo
+	if groupOpenID == "" {
+		return out, fmt.Errorf("群 openid 为空")
+	}
+	err := c.Get(ctx, "/v2/groups/"+url.PathEscape(groupOpenID)+"/info", &out)
+	return out, err
+}
+
 // SendMessage 按场景分发到群/单聊接口。
 // 频道场景当前未实现（ARCHITECTURE.md D3：频道作为可选扩展）。
 func (c *Client) SendMessage(ctx context.Context, scene, peer string, body MessageBody) error {

@@ -64,7 +64,8 @@ func (e *Event) IsMessage() bool { return e.Kind == KindMessage }
 // Identity 是鉴权用的发送者身份。
 //
 // 权限判定请读 Event.Actor；Identity 保留给"把这个人是谁告诉宿主"这类场景
-// （如 Host.IsAdmin、日志）。OpenID 跨场景同值，PeerID 决定 peer_scope 是否放行。
+// （如 Host.IsAdmin、日志）。OpenID 跨场景同值，Bot 角色全局有效，
+// 因此 Scene / PeerID 只是上下文，不参与角色判定。
 type Identity struct {
 	OpenID  string
 	UnionID string

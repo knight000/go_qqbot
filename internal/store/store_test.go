@@ -90,10 +90,10 @@ func TestKVTTLAndAdmin(t *testing.T) {
 		t.Fatal("过期 KV 应视为不存在")
 	}
 
-	if err := db.UpsertAdmin(ctx, Admin{OpenID: "u1", Scene: "group", Role: RoleOwner, GrantedBy: "claim"}); err != nil {
+	if err := db.UpsertAdmin(ctx, Admin{OpenID: "u1", Role: RoleOwner, GrantedBy: "claim"}); err != nil {
 		t.Fatal(err)
 	}
-	role, _, ok, err := db.AdminRole(ctx, "u1", "", "group", "any-group")
+	role, ok, err := db.AdminRole(ctx, "u1", "")
 	if err != nil || !ok || role != RoleOwner {
 		t.Fatalf("管理员解析失败: role=%q ok=%v err=%v", role, ok, err)
 	}

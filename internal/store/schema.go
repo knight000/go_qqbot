@@ -1,5 +1,19 @@
 package store
 
+// adminTableDDL 单独提出来，因为旧库迁移要先把旧表改名、再用它重建。
+//
+// 角色是**全局**的：openid 跨场景同值，群内添加与私聊添加效果一致，
+// 因此主键只有 openid。source_scene 只记录"在哪类会话里被添加"，不参与判定。
+const adminTableDDL = `CREATE TABLE IF NOT EXISTS admins (
+		openid       TEXT PRIMARY KEY,
+		union_openid TEXT NOT NULL DEFAULT '',
+		role         TEXT NOT NULL,
+		note         TEXT NOT NULL DEFAULT '',
+		granted_by   TEXT,
+		source_scene TEXT NOT NULL DEFAULT '',
+		created_at   INTEGER NOT NULL
+	)`
+
 // schema 与 ARCHITECTURE.md §4.1 完全一致。
 // 迁移采用「幂等 DDL 列表」而非版本号：当前是脚手架，表结构变更时
 // 追加新的 ALTER 语句并留下注释；正式上线后建议切换到版本化迁移。
@@ -53,17 +67,23 @@ var schema = []string{
 		PRIMARY KEY (plugin, k)
 	)`,
 
-	`CREATE TABLE IF NOT EXISTS admins (
-		openid       TEXT NOT NULL,
-		scene        TEXT NOT NULL,
-		peer_scope   TEXT NOT NULL DEFAULT '',
-		role         TEXT NOT NULL,
-		granted_by   TEXT,
-		note         TEXT NOT NULL DEFAULT '',
-		union_openid TEXT NOT NULL DEFAULT '',
-		created_at   INTEGER NOT NULL,
-		PRIMARY KEY (openid, scene, peer_scope)
+	adminTableDDL,
+
+	// qq_groups 是"见过的群"的注册表，也是黑白名单的唯一存储。
+	//
+	// 平台没有"列出机器人加入的群"的接口，所以只能靠收到群事件时登记；
+	// group_name 可能为空（群信息接口 11253 需要内邀），由 /group name 手工补。
+	// mode: ''=未设置 / 'allow'=白名单 / 'deny'=黑名单。
+	`CREATE TABLE IF NOT EXISTS qq_groups (
+		group_openid  TEXT PRIMARY KEY,
+		group_name    TEXT NOT NULL DEFAULT '',
+		name_source   TEXT NOT NULL DEFAULT '',
+		mode          TEXT NOT NULL DEFAULT '',
+		first_seen_at INTEGER NOT NULL,
+		last_seen_at  INTEGER NOT NULL,
+		updated_at    INTEGER NOT NULL
 	)`,
+	`CREATE INDEX IF NOT EXISTS idx_qq_groups_mode ON qq_groups(mode, last_seen_at)`,
 
 	// identities 记录「同一个人在各场景下的身份」。
 	// openid 本身跨场景同值（author.id），所以鉴权不依赖这张表；

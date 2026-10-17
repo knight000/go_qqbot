@@ -13,7 +13,7 @@ import (
 // 否则第三方插件可以劫持 /reset 之类的不可逆操作（§3.4），
 // 或者用 /admin 给自己提权、用 /reload 让机器人反复下线。
 var reservedPrefixes = []string{
-	"/claim", "/admin", "/reset", "/grant", "/revoke", "/reload", "/restart",
+	"/claim", "/admin", "/group", "/reset", "/grant", "/revoke", "/reload", "/restart",
 }
 
 type compiledCommand struct {

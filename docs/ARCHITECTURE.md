@@ -13,6 +13,7 @@
 | D3 | 平台场景 | **个人主体已可开发 QQ 群 + 消息列表单聊** | 群/单聊为主战场；频道作为可选扩展 |
 | D4 | 出站 API | Torn 为机器人主动调用（非对外供接口） | 无需入站端口、无需反代与备案域名 |
 | D5 | 管理员重置 | 对话指令触发，**自建鉴权**（平台只给群内身份，不给 Bot 运维身份） | 需 `admins` 表 + 认领机制 + 二次确认 |
+| D6 | 群准入 | **白名单 / 黑名单两套独立开关，默认都开**；Bot 角色为全局角色（无群内委托） | 新增 `qq_groups` 表 + `/group` 指令；未授权群在去重前丢弃 |
 
 D1/D2 是耦合决策：Go 缺少可靠的运行时动态插件机制（`.so` 插件要求工具链与依赖版本完全一致），因此选择 Go 即等于选择 P1。
 
@@ -35,6 +36,7 @@ D5 的前提有两层，必须分清：
 | R5 | 可能有**定时任务** | 库表驱动的调度器，不依赖外部 cron |
 | R6 | 每个部件**插件化**，主体与功能插件分离 | 核心层只做接入/存储/调度，业务全在插件 |
 | R7 | **管理员可主动重置机器人** | 需管理员认定 + 分级重置语义 + 二次确认 + 审计（见第 8 章） |
+| R8 | **群准入可控**：未授权群不得进入机器人 | 群注册表 + 白/黑名单两套独立开关 + `/group` 管理指令（§8.8） |
 
 ### 1.2 平台硬约束（已核实官方文档）
 
@@ -289,17 +291,31 @@ CREATE TABLE plugin_kv (
 );
 
 -- 管理员（Bot 角色：平台群角色只描述群内身份，不参与这里的授权）
--- peer_scope 空串表示全局；非空表示"只在那个群生效"的委托管理员
--- 身份按 openid 跨场景匹配（openid 是平台给出的用户唯一标识，群/单聊同值）
+-- 角色是全局的：openid 跨场景同值，群里加与私聊加效果一致
+-- source_scene 只记录来源，不参与判定
 CREATE TABLE admins (
-  openid     TEXT NOT NULL,
-  scene      TEXT NOT NULL,                -- group | c2c（来源记录，不参与判定）
-  peer_scope TEXT NOT NULL DEFAULT '',     -- ''=全局 / 否则限定该群
-  role       TEXT NOT NULL,                -- owner | admin
-  granted_by TEXT,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (openid, scene, peer_scope)
+  openid       TEXT PRIMARY KEY,
+  union_openid TEXT NOT NULL DEFAULT '',   -- 平台可能不下发；仅作兜底匹配
+  role         TEXT NOT NULL,              -- owner | admin
+  note         TEXT NOT NULL DEFAULT '',
+  granted_by   TEXT,
+  source_scene TEXT NOT NULL DEFAULT '',   -- group | c2c（来源记录）
+  created_at   INTEGER NOT NULL
 );
+
+-- 群注册表 + 黑/白名单。
+-- 平台没有"列出机器人加入的群"的接口，只能靠收到群事件时登记；
+-- group_name 可能为空（群信息接口 11253 需内邀），由 /group name 手工补。
+CREATE TABLE qq_groups (
+  group_openid  TEXT PRIMARY KEY,
+  group_name    TEXT NOT NULL DEFAULT '',
+  name_source   TEXT NOT NULL DEFAULT '',  -- api | manual | ''
+  mode          TEXT NOT NULL DEFAULT '',  -- ''=未设置 / allow / deny
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at  INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE INDEX idx_qq_groups_mode ON qq_groups(mode, last_seen_at);
 
 -- 重置审计（不可省略：重置是不可逆操作）
 CREATE TABLE reset_audit (
@@ -446,7 +462,7 @@ Torn 的响应是 `{"error": {"code": .., "error": ".."}}` 形式的业务错误
 
 **没给 QQ 号**：但 `author.id` 是平台声明的用户唯一标识，群聊的 `member_openid` 与
 单聊的 `user_openid` 对同一个人取同一个值（实测与文档示例一致）。因此 `admins`
-表直接用 openid 做跨场景主键；`union_openid` 退化为兜底（可能为空）。
+表只用 openid 做主键，**角色全局有效**；`union_openid` 退化为兜底（可能为空）。
 
 这三条决定了两件事：
 
@@ -462,9 +478,10 @@ Torn 的响应是 `{"error": {"code": .., "error": ".."}}` 形式的业务错误
 openid 是相对本机器人加密的，注册前无法预知，因此**不能在配置文件里硬编码首个管理员**。采用认领机制：
 
 1. 启动时若 `admins` 为空，生成 32 字节随机令牌，打印到 journald（`journalctl -u qqbot | grep CLAIM`）；
-2. 用户在目标会话发送 `/claim <token>`，核验通过即写入 `admins`，`role=owner`、`peer_scope=''`；
+2. 用户在目标会话发送 `/claim <token>`，核验通过即写入 `admins`，`role=owner`；
 3. 令牌**一次性、10 分钟过期**，认领成功后从内存清除，并不再打印；
-4. 之后由 owner 用 `/admin add` / `/admin rm` 管理：群内添加产生**该群的委托管理员**（`peer_scope=<群>`），私聊添加产生**全局管理员**（`peer_scope=''`）。
+4. 之后由 owner 用 `/admin add` / `/admin rm` 管理。admin 与 owner 都是**全局角色**：
+   无论通过群内还是私聊添加，效果一致（openid 跨场景同值，`admins` 主键只有 openid）。
 
 代价是部署时必须看一眼日志；收益是**不存在“默认口令”这个永久攻击面**。
 
@@ -473,8 +490,8 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 | 级别 | 语义 | 数据影响 | 所需身份 | 冷却 |
 |---|---|---|---|---|
 | R0 重连 | 主动断开 WSS 后重连（先 Resume，失败再 Identify） | 无 | owner | 60 s |
-| R1 会话 | 清该 peer 的 `plugin_kv` 与各插件会话上下文 | 该群/该用户需重新开始对话 | 该 peer 的 admin | 10 min |
-| R2 数据 | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` | 该群历史不可恢复 | 该 peer 的 admin + 二次确认 | 1 h |
+| R1 会话 | 清该 peer 的 `plugin_kv` 与各插件会话上下文 | 该群/该用户需重新开始对话 | Bot 管理员 | 10 min |
+| R2 数据 | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
 | R3 全量 | 清空全部业务表（**保留 `admins` 与 `bot_state`**） | 全库不可恢复 | 仅 owner + 二次确认 + 短语输入 | 24 h |
 
 三条硬约定：
@@ -512,10 +529,10 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
                              (admin) ──/admin rm──► (none)  executed / discard
 ```
 
-权限是**叠加**而非层级替换：owner 隐含全部；`peer_scope` 非空的委托 admin 只能在
-该群执行群管级操作，全局 admin 不受限；R0 与 R3 恒为 owner 专属。
+权限是**叠加**而非层级替换：owner 隐含全部；admin 除增删管理员外与 owner 相同；
+R0 与 R3 恒为 owner 专属。
 
-### 8.7 权限模型：三级角色 + 群内身份
+### 8.7 权限模型：三级角色 + 会话内身份
 
 参考 nonebot 的 `Permission` 思路（`SUPERUSER | GROUP_ADMIN` 表示任一满足），但把
 判定收进核心：插件只声明"要什么"，核心在路由阶段决定"给不给"。插件里没有判权代码，
@@ -528,16 +545,17 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 | Bot 角色 `Role` | `user` < `admin` < `owner` | `admins` 表 | 能否管理机器人 |
 | 群内角色 `GroupRole` | `unknown` < `member` < `admin` < `owner` | 事件载荷 `author.member_role` | 能否执行群管级操作 |
 
-叠加规则：Bot 管理员在任何群都按群管级处理；平台群主**不会**因此成为 Bot 管理员。
-未知群内角色（私聊、通知事件、字段缺失）按"低于成员"处理，任何依赖群角色的权限点
-都会失败（fail-closed）。
+- **Bot 角色是全局的**：openid 跨场景同值，群内添加与私聊添加效果一致，没有"只在某个群生效"的委托；
+- **私聊的群内角色默认等价于 `member`**：没有群，但调用者仍是普通成员，"要求成员及以上"的权限点在私聊里照常成立；
+- 叠加规则：Bot 管理员在任何群都按群管级处理；平台群主**不会**因此成为 Bot 管理员；
+- 未知群内角色（通知事件、字段缺失）按"低于成员"处理，依赖群角色的权限点失败（fail-closed）。
 
 **权限点**（`host.Perm`，按位或组合，语义为"任一满足"）
 
 | 权限点 | 成立条件 |
 |---|---|
-| `PermUser` | 任何人（含私聊） |
-| `PermGroupMember` | 事件来自群聊 |
+| `PermUser` | 任何人（含私聊、通知事件） |
+| `PermGroupMember` | 群聊，或私聊里的成员（默认基线） |
 | `PermGroupAdmin` | 平台群管 / 群主，或 Bot 管理员 |
 | `PermGroupOwner` | 平台群主，或 Bot 管理员 |
 | `PermBotAdmin` | Bot 管理员或所有者 |
@@ -554,6 +572,46 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 **为什么不在插件里判权**：插件一旦能接管 `/admin` 就能给自己提权；同理，判权逻辑
 分散在每个插件里时，任何一处漏写就是一个越权口子。核心统一判定 + 装配期校验
 （未定义的权限位直接拒绝加载）把这类错误前移到启动阶段。
+
+### 8.8 群准入：白名单与黑名单
+
+**为什么放在核心**：群准入决定"这个群能不能跟机器人说话"，属于接入层策略，
+和管理员权限一样不能让插件接管——否则一个插件就能把机器人拉回被拉黑的群。
+
+**存储**：`qq_groups` 一行一个群，`mode` 三态（`''` / `allow` / `deny`）。
+用三态而不是两个布尔列，是为了让"同时在黑白名单"这种自相矛盾的状态不可能出现。
+
+**判定顺序**（`Core.Handle`，在去重、落库、路由之前）：
+
+1. 群事件先登记 `group_openid`；首次见到时异步尝试取一次群名（失败留空）；
+2. 黑名单开启且 `mode=deny` → 丢弃；
+3. 白名单开启且 `mode≠allow` → 丢弃；
+4. 其余放行。两个开关都关 = 不设准入。
+
+被丢弃的消息**不落 `messages`、不进 `processed_events`、不触发任何插件**——
+"不进入 bot 系统"是字面意思，调试轨迹里只留一行 `群未放行，已丢弃（原因）`。
+登记发生在判定之前，所以被丢弃的群仍会出现在 `/group list` 里，管理员能按 id 补救。
+
+**唯一例外**：Bot 管理员的 `/group` 指令在"未加入白名单"的群里可以穿过闸门，
+否则新群无法自助接入（白名单默认开启且为空时，所有群都会被拦）。黑名单是硬阻断，
+群内任何人（包括 owner）都不能自助解除，只能从私聊操作。
+
+**群名**：`GET /v2/groups/{group_openid}/info` 返回 `group_name` 等字段，但该接口
+标注为"仅白名单机器人可用"（`11253`）。因此每个新群只尝试一次：成功写入
+`name_source=api`，失败留空；`/group name` 手工设置后 `name_source=manual`，
+自动抓取不得覆盖它。
+
+**已知短板**：平台没有"列出机器人加入的群"的接口，`/group list` 只能列出
+"收到过事件的群"。刚被拉进群、还没人说话时不会出现在列表里。
+
+**配置**（两套开关独立，默认都开）：
+
+```toml
+[group]
+whitelist  = true   # 只允许白名单群
+blacklist  = true   # 丢弃黑名单群（优先于白名单）
+fetch_name = true   # 首次见群时尝试调用群信息接口取名称
+```
 
 ---
 
@@ -623,7 +681,8 @@ WantedBy=multi-user.target
 |---|---|---|
 | 高 | session 配额 1000/天被重启循环耗尽 | `StartLimitBurst` + 退避 + 持久化 session（4.1 / 9.2） |
 | 高 | **重置误操作**：R2/R3 不可逆，群内误触发即丢历史 | 分级 + 二次确认码 + 冷却 + `reset_audit`（第 8 章） |
-| 中 | **管理员鉴权来源单一**：平台不给群角色，只能靠本地 allowlist | 认领令牌 + owner/admin 分离 + `peer_scope` 限制；官方若开放角色则升级为双因子 |
+| 中 | **管理员鉴权来源单一**：平台给群内身份，不给 Bot 运维身份，只能靠本地 allowlist | 认领令牌 + owner/admin 分离 + 全局角色；官方若开放 Bot 级身份则升级为双因子 |
+| 中 | **空白名单自锁**：白名单默认开启且初始为空 → 所有群消息被丢弃 | 启动时 warn；未入名单的群里放行 Bot 管理员的 `/group allow` 自助接入；也可私聊 `/group list` 按 id 添加 |
 | 中 | 认领令牌泄露 → 他人抢先成为 owner | 一次性 + 10 min 过期 + 仅打印到本机 journald；认领后不再可用 |
 | 中 | P1 同进程插件无隔离，插件 panic/内存泄漏波及核心 | `recover` + 超时 + 连续失败熔断 + `MemoryMax` |
 | 中 | SQLite 与 aria2 同机争 IO，出现 `database is locked` | `busy_timeout=5000` + 单写连接 + 分批 GC |

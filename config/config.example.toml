@@ -76,11 +76,21 @@ raw = false
 # 用于确认"平台到底推了什么"；未知事件永远不会进入插件路由。
 unknown_events = false
 
-# 权限策略：角色与权限点见 README「权限」一节，这里只控制拒绝时的表现
+# 权限策略：角色与权限点见 README「权限与群准入」一节，这里只控制拒绝时的表现
 [permission]
 # false（默认）：权限不足时不发任何消息，避免在群里暴露隐藏指令；
 # true：发出插件声明的拒绝语，便于调试权限链路。
 deny_reply = false
+
+# 群准入：两套开关独立，默认都开启。
+# 开启白名单时，只有 /group allow 过的群能进入机器人；黑名单优先于白名单。
+# 未放行的群消息在去重、落库、路由之前就被丢弃。
+[group]
+whitelist = true
+blacklist = true
+# 首次见到新群时尝试调用 GET /v2/groups/{id}/info 取群名。
+# 该接口目前仅白名单机器人可用（11253），取不到就留空，用 /group name 手工设置。
+fetch_name = true
 
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取
 [plugins.echo]

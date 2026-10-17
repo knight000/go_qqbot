@@ -151,3 +151,46 @@ raw = true
 		t.Fatalf("plugin + raw 应报错，实际 err=%v", err)
 	}
 }
+
+// 群准入两套开关默认都开：未配置时必须按"只允许白名单群"处理。
+func TestGroupGateDefaultsToEnabled(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+id = "123"
+secret = "s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.WhitelistEnabled() {
+		t.Fatal("白名单应默认开启")
+	}
+	if !cfg.BlacklistEnabled() {
+		t.Fatal("黑名单应默认开启")
+	}
+	if !cfg.GroupNameFetchEnabled() {
+		t.Fatal("自动取群名应默认开启")
+	}
+}
+
+// 显式关闭必须生效：这是"只开一套名单"或"完全不设准入"的唯一方式。
+func TestGroupGateCanBeDisabledExplicitly(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+id = "123"
+secret = "s"
+
+[group]
+whitelist = false
+blacklist = false
+fetch_name = false
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WhitelistEnabled() || cfg.BlacklistEnabled() || cfg.GroupNameFetchEnabled() {
+		t.Fatalf("显式 false 应关闭全部群准入开关: %+v", cfg.Group)
+	}
+}

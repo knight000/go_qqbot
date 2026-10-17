@@ -38,6 +38,7 @@ type Config struct {
 	HTTP       HTTP                      `toml:"http"`
 	Active     Active                    `toml:"active"`
 	Permission Permission                `toml:"permission"`
+	Group      Group                     `toml:"group"`
 	Log        Log                       `toml:"log"`
 	Debug      Debug                     `toml:"debug"`
 	Plugins    map[string]map[string]any `toml:"plugins"`
@@ -106,6 +107,48 @@ type Permission struct {
 	// 默认 false（静默）：在群里回一句"你没权限"等于告诉所有人这里有条隐藏指令，
 	// 还会暴露机器人的能力边界。私聊或调试期可以临时打开。
 	DenyReply bool `toml:"deny_reply"`
+}
+
+// Group 是群准入闸门（ARCHITECTURE.md §8.8）。
+//
+// 白名单与黑名单是两套独立开关，默认都开启：
+//   - 白名单开启时，只有被显式加入白名单的群能进入机器人；
+//   - 黑名单开启时，被加入黑名单的群一律丢弃（优先级高于白名单）；
+//   - 两个都关闭时，任何群消息都放行。
+//
+// 用指针是为了区分"没写"与"显式关闭"：默认值必须是 true，否则升级后
+// 白名单是空的，机器人会把所有群都当成未授权。
+type Group struct {
+	Whitelist *bool `toml:"whitelist"`
+	Blacklist *bool `toml:"blacklist"`
+	// FetchName 控制首次见到新群时是否调用 GET /v2/groups/{id}/info 取群名。
+	// 该接口目前仅白名单机器人可用（错误码 11253），取不到就留空，
+	// 之后可用 /group name 手动设置。默认开启：能取到时省一次手工操作。
+	FetchName *bool `toml:"fetch_name"`
+}
+
+// WhitelistEnabled 返回白名单开关的最终值（默认 true）。
+func (c *Config) WhitelistEnabled() bool {
+	if c.Group.Whitelist == nil {
+		return true
+	}
+	return *c.Group.Whitelist
+}
+
+// BlacklistEnabled 返回黑名单开关的最终值（默认 true）。
+func (c *Config) BlacklistEnabled() bool {
+	if c.Group.Blacklist == nil {
+		return true
+	}
+	return *c.Group.Blacklist
+}
+
+// GroupNameFetchEnabled 返回"是否自动取群名"的最终值（默认 true）。
+func (c *Config) GroupNameFetchEnabled() bool {
+	if c.Group.FetchName == nil {
+		return true
+	}
+	return *c.Group.FetchName
 }
 
 type Log struct {
