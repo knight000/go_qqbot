@@ -1,0 +1,21 @@
+# 本地配置含 AppSecret，永不入库
+/config/config.local.toml
+/config/env
+
+# 运行期数据
+/.temp/
+/media/
+/bin/
+qqbot
+qqbot.exe
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+
+# 编辑器 / 本地工具状态
+.idea/
+.vscode/
+.workbuddy/
+*.swp

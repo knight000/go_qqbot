@@ -1,0 +1,65 @@
+# qqbot 配置样例
+#
+# 本地开发：复制为 config.local.toml（已在 .gitignore 中），把 [app] 的 id/secret 填进去。
+# 生产环境：放 /etc/qqbot/config.toml，权限 600，属主 qqbot。
+#
+# 认证（认证存本地 config，按你的要求）：
+#   [app] id / secret 直接写本文件，不再依赖 EnvironmentFile。
+#   仍支持 QQ_APP_ID / QQ_APP_SECRET 环境变量覆盖，便于容器或临时调试。
+
+[app]
+# 机器人 AppID
+id = ""
+# 机器人 AppSecret（敏感，勿入 git）
+secret = ""
+# true → sandbox.api.sgroup.qq.com；false → api.sgroup.qq.com
+sandbox = true
+# 以下留空即用平台默认值
+# api_base   = "https://sandbox.api.sgroup.qq.com"
+# token_url  = "https://bots.qq.com/app/getAppAccessToken"
+
+[bot]
+# 1<<25 = 33554432，群与单聊（GROUP_AND_C2C_EVENT）
+intents = 33554432
+shard_total = 1
+shard_id = 0
+# true → 优先 Resume，省 session 配额
+resume = true
+
+[store]
+# 数据库与 WAL 必须在本地盘，禁止 tmpfs / 网络盘
+path = "./.temp/data/qqbot.db"
+
+[retention]
+messages = "168h"   # 7 天
+events   = "72h"    # 覆盖 resume 窗口
+job_runs = "168h"
+
+[media]
+# 默认不接收图片，只记 has_media=1；音视频在入口过滤
+enabled = false
+dir = "./.temp/media"
+max_file_bytes = 8388608
+quota_bytes = 268435456
+
+[http]
+timeout = "5s"
+retries = 2
+# 统一出站限流（消息与业务 API 共用）。平台消息接口本身限制 100 QPS，
+# 这里默认更保守；业务插件（如 Torn）另受自身 key 限额约束。
+rate_per_min = 100
+
+[log]
+level = "info"    # debug | info | warn | error
+format = "text"   # 生产建议 json，对接 journald
+
+# 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取
+[plugins.echo]
+reply_prefix = ""
+
+# adminping：/ping 仅管理员可用，指标采集无需配置
+[plugins.adminping]
+# true（默认）：非管理员发 /ping 完全静默，连"无权限"都不回，
+#               避免在群里暴露该指令与机器信息；
+# false：回一句"该指令仅管理员可用。"，便于调试权限链路。
+silent = true

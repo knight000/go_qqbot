@@ -1,0 +1,7 @@
+# 统一 LF：Windows 上开发、Linux 上部署，避免 systemd 单元与脚本带 CRLF
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.webp binary
