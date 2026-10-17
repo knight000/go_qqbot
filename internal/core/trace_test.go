@@ -1,0 +1,160 @@
+package core
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/qqbot/internal/store"
+)
+
+// syncBuffer 让测试在读输出时不必担心调度协程正在写。
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+type replyPlugin struct{ fakePlugin }
+
+func (p *replyPlugin) Handle(context.Context, *host.Event) (*host.Reply, error) {
+	return &host.Reply{Content: "pong"}, nil
+}
+
+// 端到端：一条消息走完 收到 → 命中插件 → 返回回复 → 实际发送，四段都要出现在轨迹里。
+func TestTraceEndToEnd(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out)
+	log := slog.New(slog.DiscardHandler)
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "trace.db"))
+	if err != nil {
+		t.Fatalf("打开测试库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+
+	plug := &replyPlugin{fakePlugin{m: manifest("echo", 100, "!ping")}}
+	router, err := NewRouter([]host.Plugin{plug})
+	if err != nil {
+		t.Fatalf("装配路由: %v", err)
+	}
+	f := &fakeAPI{}
+	sender := NewSender(f, log, ActivePolicy{})
+	sender.trace = tr
+	disp := NewDispatcher(router, sender, log, time.Second)
+	disp.trace = tr
+
+	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
+	c.Handle(context.Background(), &host.Event{
+		ID:       "e1",
+		Type:     host.EventGroupMessage,
+		Scene:    host.SceneGroup,
+		PeerID:   "g1",
+		SenderID: "u1",
+		MsgID:    "e1",
+		Content:  "!ping",
+	})
+
+	waitFor(t, out, "已发送")
+	got := out.String()
+	for _, want := range []string{
+		"收到 群聊 · GROUP_AT_MESSAGE_CREATE",
+		"发送者：u1",
+		"peer  ：g1",
+		"内容  ：!ping",
+		`命中插件 echo · 命令 "!ping" · 优先级 100`,
+		"插件 echo 返回回复",
+		"已发送（被动回复 群聊 → g1）",
+		"seq=1",
+		"内容  ：pong",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("轨迹缺少 %q，实际输出:\n%s", want, got)
+		}
+	}
+}
+
+// 关闭调试时 trace 为 nil，所有方法必须安全可调用。
+func TestNilTraceIsSafe(t *testing.T) {
+	var tr *Trace
+	ev := &host.Event{ID: "e", Type: host.EventC2CMessage, Scene: host.SceneC2C}
+	tr.Received(ev)
+	tr.Duplicate(ev)
+	tr.NoMatch(ev)
+	tr.Hit(Match{})
+	tr.PluginDone(Match{}, 0, nil, nil)
+	tr.CoreCommand("/admin")
+	tr.Sent("被动回复", host.SceneC2C, "u", 1, "x", nil, 0)
+	tr.Raw("C2C_MESSAGE_CREATE", []byte(`{}`))
+}
+
+// 重复事件也要留痕：调试时"为什么没回复"往往是去重表拦下了。
+func TestTraceDuplicate(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out)
+	tr.Duplicate(&host.Event{ID: "e1"})
+	if got := out.String(); !strings.Contains(got, "重复事件，已跳过：e1") {
+		t.Fatalf("重复事件未被标记，实际: %q", got)
+	}
+}
+
+func TestTraceRaw(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out)
+	tr.Raw("GROUP_AT_MESSAGE_CREATE", []byte(`{"author":{"member_openid":"abc"}}`))
+	got := out.String()
+	for _, want := range []string{"原始事件 GROUP_AT_MESSAGE_CREATE", `"member_openid": "abc"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("原始事件输出缺少 %q:\n%s", want, got)
+		}
+	}
+}
+
+// 路由要告诉调试输出"命中的是哪条命令"，否则多命令插件看不出原因。
+func TestRouterMatchReportsCommand(t *testing.T) {
+	m := manifest("multi", 0, "")
+	m.Commands = []host.Command{
+		{Prefix: "!a", Priority: 10},
+		{Prefix: "!b", Priority: 100},
+	}
+	r, err := NewRouter([]host.Plugin{&fakePlugin{m: m}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := r.Match(&host.Event{Type: host.EventGroupMessage, Content: "!b x"})
+	if len(ms) != 1 || ms[0].Command != "!b" || ms[0].Priority != 100 {
+		t.Fatalf("应命中 !b(100)，实际 %+v", ms)
+	}
+}
+
+func waitFor(t *testing.T, out *syncBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("等待轨迹中的 %q 超时，当前输出:\n%s", want, out.String())
+}

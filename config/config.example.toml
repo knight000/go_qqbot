@@ -49,9 +49,25 @@ retries = 2
 # 这里默认更保守；业务插件（如 Torn）另受自身 key 限额约束。
 rate_per_min = 100
 
+[active]
+# 主动消息总开关。平台每日额度约 1000 条/用户，本地另设更严的每日预算。
+# 只有下面白名单里的插件能发；其余插件调用 SendActive 直接返回"未开启"。
+enabled = true
+plugins = ["bootnotice"]
+# 每 (场景, 收件人) 每日上限。启动通知每次进程启动才发 1 条。
+daily_per_peer = 5
+
 [log]
 level = "info"    # debug | info | warn | error
 format = "text"   # 生产建议 json，对接 journald
+
+[debug]
+# 调试模式：把收到的每条事件、命中的插件与回复正文打印到控制台。
+# 也可用命令行 -debug 临时打开（会同时把 log.level 降到 debug）。
+enabled = false
+# 额外打印平台原始 JSON，用于排查"某个字段平台到底下发没有"；
+# 输出较啰嗦，只在需要时打开。
+raw = false
 
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取
 [plugins.echo]
@@ -63,3 +79,13 @@ reply_prefix = ""
 #               避免在群里暴露该指令与机器信息；
 # false：回一句"该指令仅管理员可用。"，便于调试权限链路。
 silent = true
+
+# bootnotice：启动/重启后主动私聊管理员，报告上线时间与插件清单
+[plugins.bootnotice]
+enabled = true
+# 等网关与 token 就绪再发
+delay = "10s"
+# 距上次启动不足该间隔则整轮跳过，避免崩溃重启刷屏
+min_interval = "10m"
+# 发送失败只重试一次（主动消息没有 msg_id 幂等键，多试就是重复推送）
+retry_delay = "30s"

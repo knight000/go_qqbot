@@ -26,6 +26,7 @@ import (
 	"github.com/knight000/qqbot/internal/store"
 
 	_ "github.com/knight000/qqbot/plugins/adminping"
+	_ "github.com/knight000/qqbot/plugins/bootnotice"
 	_ "github.com/knight000/qqbot/plugins/echo"
 )
 
@@ -38,14 +39,24 @@ func main() {
 
 func run() error {
 	cfgPath := flag.String("c", "config/config.local.toml", "配置文件路径")
+	debugMode := flag.Bool("debug", false, "调试模式：打印收到的事件、命中的插件与回复内容（等同 [debug].enabled=true）")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
+	// 命令行参数优先于配置文件：临时排查不必改文件，也不会漏提交。
+	if *debugMode {
+		cfg.Debug.Enabled = true
+	}
 
-	log := logx.New(cfg.Log.Level, cfg.Log.Format)
+	// 调试模式顺带把日志降到 debug：两边看到的细节应当一致。
+	logLevel := cfg.Log.Level
+	if cfg.Debug.Enabled {
+		logLevel = "debug"
+	}
+	log := logx.New(logLevel, cfg.Log.Format)
 	slog.SetDefault(log)
 
 	db, err := store.Open(cfg.Store.Path)
@@ -101,6 +112,7 @@ func run() error {
 		ShardID:    cfg.Bot.ShardID,
 		Resume:     cfg.Bot.Resume,
 		Handler:    coreImpl.Handle,
+		RawDump:    rawDumpFunc(cfg, coreImpl),
 	})
 
 	gwDone := make(chan struct{})
@@ -113,7 +125,12 @@ func run() error {
 		"config", *cfgPath,
 		"db", db.Path(),
 		"sandbox", cfg.App.Sandbox,
+		"debug", cfg.Debug.Enabled,
 		"plugins", len(host.Registered()))
+	if cfg.Debug.Enabled {
+		log.Info("调试模式已开启：收到的每条事件、插件命中与回复内容都会打印到控制台",
+			"raw", cfg.Debug.Raw)
+	}
 
 	<-ctx.Done()
 	stop()
@@ -132,4 +149,13 @@ func run() error {
 
 	log.Info("已退出")
 	return nil
+}
+
+// rawDumpFunc 只在 [debug].enabled 与 [debug].raw 同时为真时，
+// 把平台原始 JSON 接到核心的调试轨迹上；否则返回 nil，接入层不做任何额外工作。
+func rawDumpFunc(cfg *config.Config, c *core.Core) func(string, []byte) {
+	if !cfg.Debug.Enabled || !cfg.Debug.Raw {
+		return nil
+	}
+	return c.PrintRaw
 }

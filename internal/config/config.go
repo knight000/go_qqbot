@@ -36,7 +36,9 @@ type Config struct {
 	Retention Retention                 `toml:"retention"`
 	Media     Media                     `toml:"media"`
 	HTTP      HTTP                      `toml:"http"`
+	Active    Active                    `toml:"active"`
 	Log       Log                       `toml:"log"`
+	Debug     Debug                     `toml:"debug"`
 	Plugins   map[string]map[string]any `toml:"plugins"`
 }
 
@@ -78,9 +80,34 @@ type HTTP struct {
 	RatePerMin int      `toml:"rate_per_min"`
 }
 
+// Active 是主动消息策略。Enabled 用指针区分"未配置"与"显式关闭"：
+// 未配置时按开启处理（启动通知依赖它），显式写 false 才真正关掉。
+type Active struct {
+	Enabled      *bool    `toml:"enabled"`
+	Plugins      []string `toml:"plugins"`
+	DailyPerPeer int      `toml:"daily_per_peer"`
+}
+
+// ActiveEnabled 返回主动消息总开关的最终值。
+func (c *Config) ActiveEnabled() bool {
+	if c.Active.Enabled == nil {
+		return true
+	}
+	return *c.Active.Enabled
+}
+
 type Log struct {
 	Level  string `toml:"level"`
 	Format string `toml:"format"`
+}
+
+// Debug 是调试模式：把收到的事件、命中的插件与回复内容打印到控制台。
+// 与 log.level 分开——日志给机器检索，调试轨迹给人看一条完整链路。
+// 命令行 -debug 可临时打开（不改配置文件）。
+type Debug struct {
+	Enabled bool `toml:"enabled"`
+	// Raw 额外打印平台原始 JSON，排查"某字段平台到底给没给"时用。
+	Raw bool `toml:"raw"`
 }
 
 // Plugin 返回某个插件的配置段（不存在时返回空 map，插件自行取默认值）。
@@ -157,6 +184,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.HTTP.RatePerMin <= 0 {
 		c.HTTP.RatePerMin = 100
+	}
+	if len(c.Active.Plugins) == 0 {
+		c.Active.Plugins = []string{"bootnotice"}
+	}
+	if c.Active.DailyPerPeer <= 0 {
+		c.Active.DailyPerPeer = 5
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"

@@ -12,10 +12,11 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避 |
 | `internal/core` | 事件去重、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
-| `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 日志） |
+| `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 收件人目录 / 日志） |
 | `internal/sysinfo` | 跨平台资源采集：CPU、内存、进程 RSS、分区容量、目录占用（无 cgo） |
 | `plugins/echo` | 最小插件，演示 Manifest、配置读取、`!ping` / `!echo` |
 | `plugins/adminping` | 仅管理员可用的 `/ping`：运行时长 + CPU / 内存 / 磁盘 / 目录占用 |
+| `plugins/bootnotice` | 启动/重启后主动私聊管理员：上线时间、距上次启动间隔、启用插件清单 |
 | `deploy/qqbot.service` | systemd 单元，含 `StartLimitBurst` 与 `MemoryMax` |
 
 认证信息按约定写在**本地 config**（`config/config.local.toml`，已 gitignore），不再依赖 `EnvironmentFile`；仍支持 `QQ_APP_ID` / `QQ_APP_SECRET` 覆盖。
@@ -38,7 +39,117 @@ WARN 未检测到管理员，已生成一次性认领令牌 ttl=10m0s token=<64�
 ```
 
 在目标群或单聊发送 `/claim <token>` 即成为 owner（一次性、10 分钟过期）。
-之后可用 `/ping` 查看运行状态，用 `!ping`、`!echo <文本>` 验证收发链路。
+之后可用 `/admin add <openid> [备注]` 添加辅助管理员，用 `/ping` 查看运行状态，用 `!ping`、`!echo <文本>` 验证收发链路。
+
+## 调试模式
+
+打开后，每收到一条事件都会在控制台输出一段人工可读的轨迹：谁发的、命中哪个插件的哪条命令、插件返回了什么、最终发出的正文。两种打开方式，**命令行优先于配置文件**：
+
+```bash
+go run ./cmd/bot -debug     # 临时开，不改文件
+```
+
+```toml
+[debug]
+enabled = true   # 常开
+raw = false      # 额外打印平台原始 JSON（排查"某字段平台给没给"）
+```
+
+`-debug` 会顺带把 `log.level` 降到 `debug`，两边细节保持一致。轨迹走 stdout、不加颜色，重定向到文件也能直接读。
+
+```
+[15:24:01.122] 收到 群聊 · GROUP_AT_MESSAGE_CREATE
+    发送者：EF9A533C3FB062916F7FEF7E39DD532D
+    union ：—（平台未下发）
+    peer  ：1ABC...
+    事件  ：ROBOT1.0_...
+    内容  ：!ping
+[15:24:01.123] 命中插件 echo v0.1.0 · 命令 "!ping" · 优先级 100
+[15:24:01.124] 插件 echo 返回回复（1.20ms，4 字）
+[15:24:01.140] 已发送（被动回复 群聊 → 1ABC...） seq=1 · 16ms
+    内容  ：pong
+```
+
+三个刻意的取舍：
+
+- **在去重之前打印**：重复投递也会留一行 `重复事件，已跳过`，排查"为什么没回复"时不会误判成插件没命中；
+- **正文只打一次**：插件返回时只报字数，真正发出去时再打全文，同一条内容不会出现两遍；
+- **`raw = true` 才打原始 JSON**：一条事件可能几十行，只在确认平台字段时打开。
+
+生产环境保持 `enabled = false`：轨迹里有消息正文与 openid，不适合进 journald。
+
+## 管理员：owner 与 admin
+
+| 角色 | 产生方式 | 能做什么 |
+|---|---|---|
+| `owner` | `/claim` 认领（一次性令牌） | 全部管理指令，**并且能增删 admin** |
+| `admin` | owner 用 `/admin add` 添加 | 与 owner 相同，唯独**不能增删管理员**（也不能把别人提成 owner） |
+
+| 指令 | 权限 | 说明 |
+|---|---|---|
+| `/admin list` | owner / admin | 列出全部授权、角色与作用范围 |
+| `/admin add <openid> [备注]` | 仅 owner | 新增 admin；备注可写 QQ 号，方便人眼识别 |
+| `/admin rm <openid>` | 仅 owner | 删除 admin 的所有授权；owner 本身不可删 |
+| `/admin whoami` | **所有人** | 只回自己的 openid / union / 角色，用于把标识报给 owner |
+
+群聊里需 @ 机器人后发送，单聊直接发。
+
+### 为什么是 openid 而不是 QQ 号
+
+QQ 机器人 v2 **不下发 QQ 号**，只有 openid：群里是 `member_openid`，单聊是 `user_openid`，两者不能互换。平台另给一个 `union_openid` 作为跨场景标识（部分事件版本可能为空）。
+
+因此添加管理员的实际流程是：
+
+1. 对方在群里或私聊发送 `/admin whoami`，拿到自己的 openid；
+2. 把 openid 发给 owner；
+3. owner 执行 `/admin add <openid> 123456789`（备注写 QQ 号）。
+
+授权范围按**添加时的场景**决定，并用 `admins.peer_scope` 约束：
+
+- `owner` 全局有效——认领后在该场景之外（如私聊）同样可用；
+- 在 A 群添加的 admin → A 群 + 私聊，不会扩散到 B 群；
+- 在私聊添加的 admin → 只作用于私聊，不会因为同一个人进群就获得群内权限；
+- 若对方已有单聊/群两种身份，且平台回传了 `union_openid`，则同一个人跨场景互相识别（上面的规则才成立）；平台不给 union 时，两种身份无法关联。
+
+`identities` 表记录 openid ↔ union_openid 的对应关系（每条消息一条 upsert），这也是"群里认领的 owner 能收到启动私聊通知"的前提。平台不给 union 时，群身份无法主动私聊，日志里会写明。
+
+## 启动通知与主动消息
+
+`plugins/bootnotice` 在进程启动（含重启）后，等网关就绪，主动私聊全部可联系的管理员：
+
+```
+机器人已上线
+启动 10-17 14:56:19｜windows/amd64
+上次启动 10-17 12:51（2小时5分前）
+启用插件 3 个
+· adminping v0.1.0（/ping）
+· bootnotice v0.1.0
+· echo v0.1.0（!ping、!echo）
+```
+
+主动消息在本项目里是**受控通道**，而不是默认放开的能力：
+
+| 闸门 | 位置 | 行为 |
+|---|---|---|
+| 总开关 | `[active] enabled` | 关闭后所有 `SendActive` 直接返回 `ErrActiveDisabled` |
+| 插件白名单 | `[active] plugins` | 只有名单内插件能发；插件拿到的 Sender 是带名字的包装 |
+| 每日预算 | `[active] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，先扣预算再发 HTTP |
+| 重启抑制 | `[plugins.bootnotice] min_interval` | 距上次启动不足该间隔则整轮跳过，防崩溃重启刷屏 |
+| 重试 | `[plugins.bootnotice] retry_delay` | 失败只重试一次；主动消息没有 `msg_id` 幂等键，多试等于重复推送 |
+
+```toml
+[active]
+enabled = true
+plugins = ["bootnotice"]
+daily_per_peer = 5
+
+[plugins.bootnotice]
+enabled = true
+delay = "10s"
+min_interval = "10m"
+retry_delay = "30s"
+```
+
 
 ## `/ping`（仅管理员）
 
@@ -101,25 +212,27 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 
 ## 尚未实现（下一步）
 
-- 第 8 章分级重置：`/reset R0–R3`、二次确认码、冷却、`reset_audit` 的完整流程（当前仅 `/claim` 可用，其余保留指令返回提示）；
+- 第 8 章分级重置：`/reset R0–R3`、二次确认码、冷却、`reset_audit` 的完整流程（`/reset` 仍是占位回复；`/grant`、`/revoke` 已由 `/admin add|rm` 取代）；
 - `GROUP_ADD_ROBOT` / `GROUP_DEL_ROBOT` 的异步清理（§8.5）：事件已解码并入库，尚未接业务动作；
 - 媒体下载与配额淘汰（表结构与 GC 已就位，`media.enabled=false` 时只记 `has_media`）；
 - `plugins/torn`：业务插件与 Torn 限流/缓存分层；
 - 多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
+- 单实例保护：两个进程共用同一个库时会互相 `4902 reset by resume`，当前靠部署约束（systemd 单实例），未做文件锁。
 
 ## 目录
 
 ```
 cmd/bot/          入口与唯一装配点
 internal/gateway/ WSS 状态机、心跳、resume、事件解码
-internal/core/    路由、幂等、频控、调度、GC、认领
+internal/core/    路由、幂等、频控、调度、GC、认领、/admin 权限
 internal/host/    Host 能力实现（插件唯一可见的 API）
 internal/sysinfo/ 跨平台资源采集（build tag 分 windows / linux）
-internal/store/   schema、迁移、分批 GC
+internal/store/   schema、迁移、分批 GC、管理员与身份映射
 internal/httpx/   统一出站客户端
 internal/api/     QQ 开放平台 REST 封装
 plugins/echo/     示例插件
 plugins/adminping/ 管理员 /ping
+plugins/bootnotice/ 启动/重启主动私聊通知
 config/           配置样例与本地配置（后者不入 git）
 deploy/           systemd 单元
 ```

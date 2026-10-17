@@ -28,9 +28,11 @@ func (f *fakeHost) Log() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func (f *fakeHost) IsAdmin(ctx context.Context, scene host.Scene, openid, peer string) (bool, error) {
+func (f *fakeHost) IsAdmin(ctx context.Context, id host.Identity) (bool, error) {
 	return f.admin, f.err
 }
+
+func (f *fakeHost) Admins() host.AdminDirectory { return nil }
 
 func newPlugin(t *testing.T, admin bool, err error, cfg host.Params) *Plugin {
 	t.Helper()

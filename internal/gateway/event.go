@@ -31,6 +31,7 @@ type author struct {
 	ID           string `json:"id"`
 	MemberOpenID string `json:"member_openid"`
 	UserOpenID   string `json:"user_openid"`
+	UnionOpenID  string `json:"union_openid"`
 }
 
 type messageData struct {
@@ -63,6 +64,7 @@ func Decode(t string, raw json.RawMessage) (*host.Event, bool) {
 			Scene:     host.SceneGroup,
 			PeerID:    d.GroupOpenID,
 			SenderID:  firstNonEmpty(d.Author.MemberOpenID, d.Author.ID),
+			UnionID:   d.Author.UnionOpenID,
 			MsgID:     d.ID,
 			Content:   strings.TrimSpace(d.Content),
 			HasMedia:  len(d.Attachments) > 0,
@@ -80,6 +82,7 @@ func Decode(t string, raw json.RawMessage) (*host.Event, bool) {
 			Scene:     host.SceneC2C,
 			PeerID:    d.Author.UserOpenID,
 			SenderID:  firstNonEmpty(d.Author.UserOpenID, d.Author.ID),
+			UnionID:   d.Author.UnionOpenID,
 			MsgID:     d.ID,
 			Content:   strings.TrimSpace(d.Content),
 			HasMedia:  len(d.Attachments) > 0,

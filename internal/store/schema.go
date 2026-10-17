@@ -54,14 +54,30 @@ var schema = []string{
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS admins (
-		openid     TEXT NOT NULL,
-		scene      TEXT NOT NULL,
-		peer_scope TEXT NOT NULL DEFAULT '',
-		role       TEXT NOT NULL,
-		granted_by TEXT,
-		created_at INTEGER NOT NULL,
+		openid       TEXT NOT NULL,
+		scene        TEXT NOT NULL,
+		peer_scope   TEXT NOT NULL DEFAULT '',
+		role         TEXT NOT NULL,
+		granted_by   TEXT,
+		note         TEXT NOT NULL DEFAULT '',
+		union_openid TEXT NOT NULL DEFAULT '',
+		created_at   INTEGER NOT NULL,
 		PRIMARY KEY (openid, scene, peer_scope)
 	)`,
+
+	// identities 记录「同一个人在不同场景下的 openid」。
+	// 平台不给 QQ 号，群 member_openid 与单聊 user_openid 也不通用；
+	// union_openid 是平台给出的跨场景唯一标识，用它把两种身份连起来，
+	// 才能让在群里认领的 owner 收到单聊通知、并在私聊里继续管理。
+	`CREATE TABLE IF NOT EXISTS identities (
+		openid       TEXT NOT NULL,
+		scene        TEXT NOT NULL,
+		peer_scope   TEXT NOT NULL DEFAULT '',
+		union_openid TEXT NOT NULL DEFAULT '',
+		last_seen    INTEGER NOT NULL,
+		PRIMARY KEY (openid, scene, peer_scope)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_identities_union ON identities(union_openid)`,
 
 	`CREATE TABLE IF NOT EXISTS reset_audit (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
