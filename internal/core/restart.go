@@ -58,13 +58,8 @@ func (c *Core) requestRestart(req RestartRequest) error {
 }
 
 func (c *Core) handleReload(ctx context.Context, ev *host.Event) {
-	role, _, ok, err := c.store.AdminRole(ctx, ev.SenderID, ev.UnionID, string(ev.Scene), ev.PeerID)
-	if err != nil {
-		c.log.Error("查询管理员身份失败", "event", ev.ID, "err", err)
-		c.replyText(ctx, ev, "权限查询失败，请稍后重试。")
-		return
-	}
-	if !ok {
+	p := c.authorize(ctx, ev)
+	if !p.IsBotAdmin() {
 		// 与 adminping 的静默策略不同：/reload 属于核心指令，
 		// 明确回一句比让发送者以为"没反应"更好，也不泄露任何机器信息。
 		c.replyText(ctx, ev, "该指令仅管理员可用。")
@@ -110,13 +105,13 @@ func (c *Core) handleReload(ctx context.Context, ev *host.Event) {
 	// 先发回复再入队：被动回复窗口在重启后就不存在了，顺序反了这条消息必丢。
 	c.replyText(ctx, ev, b.String())
 
-	req := RestartRequest{By: ev.SenderID, Role: role, Scene: ev.Scene, Reason: reason, At: time.Now()}
+	req := RestartRequest{By: ev.SenderID, Role: string(p.Role), Scene: ev.Scene, Reason: reason, At: time.Now()}
 	if err := c.requestRestart(req); err != nil {
 		c.log.Warn("重启请求未入队", "by", ev.SenderID, "err", err)
 		return
 	}
 	c.log.Warn("收到 /reload，准备重启",
-		"by", ev.SenderID, "role", role, "scene", ev.Scene, "reason", reason, "exe", exe)
+		"by", ev.SenderID, "role", p.Role, "scene", ev.Scene, "reason", reason, "exe", exe)
 }
 
 // isGoRunBinary 判断当前二进制是不是 go run 的临时产物。

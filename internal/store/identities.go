@@ -8,8 +8,11 @@ import (
 )
 
 // Identity 是某个用户在一个场景下的身份记录。
-// 平台不提供 QQ 号：群成员是 member_openid，单聊是 user_openid，
-// 两者不可互换；union_openid 是平台给出的跨场景唯一标识。
+//
+// openid 是平台给出的用户唯一标识（author.id），群聊与单聊对同一个人取同一个值，
+// 所以鉴权不依赖这张表也能成立。这张表仍保留两个用途：
+//   - 解析主动消息的投递地址（优先用显式记录的单聊 openid）；
+//   - 在平台回传 union_openid 时提供跨应用身份的兜底匹配。
 type Identity struct {
 	OpenID    string
 	UnionID   string

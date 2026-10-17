@@ -20,6 +20,10 @@ type compiledCommand struct {
 	prefix   string
 	re       *regexp.Regexp
 	priority int
+	// perm 是解析后的权限要求（已处理"命令级覆盖插件级"的继承）。
+	perm host.Perm
+	// deny 是权限不足时的回复，空串表示静默。
+	deny string
 	// label 是给人看的原始写法（prefix 或正则），只在调试轨迹里用。
 	label string
 }
@@ -52,6 +56,12 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 		if err != nil {
 			return nil, err
 		}
+		// 权限位写错（拼了一个不存在的位）会让插件变成"谁都能用"或"谁都不能用"，
+		// 属于装配期错误，必须在启动时报出来而不是线上观察。
+		if !m.Permission.Valid() {
+			return nil, fmt.Errorf("插件 %s 的 Manifest.Permission 含未定义的权限位（%s）",
+				m.Name, m.Permission.String())
+		}
 		rt := &route{
 			plugin:   p,
 			manifest: m,
@@ -62,7 +72,17 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 			if (c.Prefix == "") == (c.Pattern == "") {
 				return nil, fmt.Errorf("插件 %s 的命令必须且只能设置 Prefix 或 Pattern 之一", m.Name)
 			}
-			cc := compiledCommand{prefix: c.Prefix, priority: c.Priority, label: c.Prefix}
+			if !c.Permission.Valid() {
+				return nil, fmt.Errorf("插件 %s 的命令 %q 含未定义的权限位（%s）",
+					m.Name, c.Prefix+c.Pattern, c.Permission.String())
+			}
+			cc := compiledCommand{
+				prefix:   c.Prefix,
+				priority: c.Priority,
+				label:    c.Prefix,
+				perm:     inheritPerm(m.Permission, c.Permission),
+				deny:     inheritDeny(m.DenyReply, c.DenyReply),
+			}
 			if c.Prefix != "" {
 				for _, rp := range reservedPrefixes {
 					if strings.HasPrefix(strings.ToLower(c.Prefix), rp) {
@@ -93,6 +113,10 @@ type Match struct {
 	Priority int
 	// Command 是命中的命令写法（前缀或正则），供调试输出定位"为什么是它"。
 	Command string
+	// Perm 是执行该命令所需的权限（已解析继承关系）；零值表示不限制。
+	Perm host.Perm
+	// DenyReply 是权限不足时的回复文本，空串表示静默丢弃。
+	DenyReply string
 }
 
 func (r *Router) Match(ev *host.Event) []Match {
@@ -101,11 +125,19 @@ func (r *Router) Match(ev *host.Event) []Match {
 		if !rt.intents.match(ev) {
 			continue
 		}
-		prio, cmd, ok := matchCommands(rt.cmds, ev)
+		cmd, ok := matchCommands(rt.cmds, ev)
 		if !ok {
 			continue
 		}
-		out = append(out, Match{Plugin: rt.plugin, Manifest: rt.manifest, Priority: prio, Command: cmd})
+		m := Match{Plugin: rt.plugin, Manifest: rt.manifest}
+		if cmd == nil {
+			// 未声明命令 = 订阅该 intent 的全部事件，权限取插件级
+			m.Perm, m.DenyReply = rt.manifest.Permission, rt.manifest.DenyReply
+		} else {
+			m.Priority, m.Command = cmd.priority, cmd.label
+			m.Perm, m.DenyReply = cmd.perm, cmd.deny
+		}
+		out = append(out, m)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {
@@ -116,30 +148,45 @@ func (r *Router) Match(ev *host.Event) []Match {
 	return out
 }
 
-func matchCommands(cmds []compiledCommand, ev *host.Event) (priority int, command string, ok bool) {
+// inheritPerm 处理"命令级覆盖插件级"：命令未声明（零值）时继承插件默认。
+// 想让某个命令显式公开，写 PermUser——零值不能表达"公开"，因为零值表示未声明。
+func inheritPerm(plugin, cmd host.Perm) host.Perm {
+	if cmd == 0 {
+		return plugin
+	}
+	return cmd
+}
+
+func inheritDeny(plugin, cmd string) string {
+	if cmd == "" {
+		return plugin
+	}
+	return cmd
+}
+
+// matchCommands 返回命中的命令（nil 表示该插件没有声明命令，订阅全部事件）。
+func matchCommands(cmds []compiledCommand, ev *host.Event) (best *compiledCommand, ok bool) {
 	// 未声明命令 = 订阅该 intent 的全部事件
 	if len(cmds) == 0 {
-		return 0, "", true
+		return nil, true
 	}
 	if !ev.IsMessage() {
-		return 0, "", false
+		return nil, false
 	}
-	best := -1 << 31
 	content := strings.TrimSpace(ev.Content)
-	for _, c := range cmds {
+	for i := range cmds {
+		c := &cmds[i]
 		hit := false
 		if c.prefix != "" {
 			hit = strings.HasPrefix(content, c.prefix)
 		} else if c.re != nil {
 			hit = c.re.MatchString(content)
 		}
-		if hit && c.priority > best {
-			best = c.priority
-			command = c.label
-			ok = true
+		if hit && (best == nil || c.priority > best.priority) {
+			best = c
 		}
 	}
-	return best, command, ok
+	return best, best != nil
 }
 
 // intent 是解析后的订阅项：kind 必填，scene 为空表示"任意场景"。

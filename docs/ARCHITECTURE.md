@@ -12,10 +12,13 @@
 | D2 | 插件形态 | **P1 编译期注册** | 无 IPC、无版本错配；加插件需重编译（5–10 s） |
 | D3 | 平台场景 | **个人主体已可开发 QQ 群 + 消息列表单聊** | 群/单聊为主战场；频道作为可选扩展 |
 | D4 | 出站 API | Torn 为机器人主动调用（非对外供接口） | 无需入站端口、无需反代与备案域名 |
-| D5 | 管理员重置 | 对话指令触发，**自建鉴权**（平台不提供群角色） | 需 `admins` 表 + 认领机制 + 二次确认 |
+| D5 | 管理员重置 | 对话指令触发，**自建鉴权**（平台只给群内身份，不给 Bot 运维身份） | 需 `admins` 表 + 认领机制 + 二次确认 |
 
 D1/D2 是耦合决策：Go 缺少可靠的运行时动态插件机制（`.so` 插件要求工具链与依赖版本完全一致），因此选择 Go 即等于选择 P1。
-D5 的前提是：v2 群消息事件载荷不含发送者群角色，公开接口索引中亦无群成员角色查询能力——**“管理员”必须由本系统自己认定**，不能依赖平台身份。
+
+D5 的前提有两层，必须分清：
+- **平台确实给了群内身份**：群消息事件的 `author.member_role` 直接是 `member / admin / owner`，不需要额外接口（§8.1）；
+- **但群内身份不等于 Bot 运维身份**：一个群主能管好这个群，不代表有权重启机器人、清库、看主机指标。因此“谁有权管理 Bot”仍由本系统的三级角色认定（§8.7），平台的群角色只用于“群管级”权限点。
 
 ---
 
@@ -285,11 +288,12 @@ CREATE TABLE plugin_kv (
   PRIMARY KEY (plugin, k)
 );
 
--- 管理员（自建鉴权：官方不提供群成员角色）
--- peer_scope 用空串表示全局，避免 NULL 参与主键比较
+-- 管理员（Bot 角色：平台群角色只描述群内身份，不参与这里的授权）
+-- peer_scope 空串表示全局；非空表示"只在那个群生效"的委托管理员
+-- 身份按 openid 跨场景匹配（openid 是平台给出的用户唯一标识，群/单聊同值）
 CREATE TABLE admins (
   openid     TEXT NOT NULL,
-  scene      TEXT NOT NULL,                -- group | c2c
+  scene      TEXT NOT NULL,                -- group | c2c（来源记录，不参与判定）
   peer_scope TEXT NOT NULL DEFAULT '',     -- ''=全局 / 否则限定该群
   role       TEXT NOT NULL,                -- owner | admin
   granted_by TEXT,
@@ -430,19 +434,28 @@ Torn 的响应是 `{"error": {"code": .., "error": ".."}}` 形式的业务错误
 
 ## 8. 管理员重置与状态管理（R7）
 
-### 8.1 问题的实质：平台不提供“管理员”这个身份
+### 8.1 平台给了什么、没给什么
 
-三条事实决定了本模块的做法：
+**给了群内身份**：群消息事件（`GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE`）的
+`author.member_role` 直接是 `member / admin / owner`，与 `author.id` 在同一条载荷里到达，
+零额外请求、零配额消耗。另外 `GET /v2/groups/{group_openid}/members/{member_openid}`
+也返回 `member_role`，但该接口处于内邀阶段（错误码 `11253`，仅白名单机器人可用），
+不能作为可靠依赖——**所以本项目不调用它**，群内角色只从事件载荷取。
 
-1. v2 群消息事件载荷只有发送者 openid，**不含群角色**（owner / admin / member）；
-2. 公开接口索引中**没有**“查询群成员角色”的能力（只有消息、富媒体、菜单、指令面板、互动回调、频道管理）；
-3. 群管理员在 QQ 客户端可以直接移除/重新添加机器人，这会以 `GROUP_DEL_ROBOT` / `GROUP_ADD_ROBOT` 事件异步到达。
+**没给 Bot 运维身份**：平台不知道“谁是这台机器人的管理员”。群主是群主，不是 owner。
 
-所以：
-- “谁有权重置”**必须由本系统自己认定** → `admins` 表 + 认领流程；
-- “群管理员在客户端移除机器人”这条路径**完全不经过我们的鉴权**，必须靠事件做异步清理，不能假设所有重置都由指令发起。
+**没给 QQ 号**：但 `author.id` 是平台声明的用户唯一标识，群聊的 `member_openid` 与
+单聊的 `user_openid` 对同一个人取同一个值（实测与文档示例一致）。因此 `admins`
+表直接用 openid 做跨场景主键；`union_openid` 退化为兜底（可能为空）。
 
-> 若日后官方开放群成员角色查询或事件里带上角色字段，应改为“平台角色 + 本地 allowlist”双因子；当前的单一来源是已知短板。
+这三条决定了两件事：
+
+- “谁有权重置 / 重启 / 看指标”**必须由本系统自己认定** → `admins` 表 + 认领流程（§8.2）；
+- 平台群角色只用于“群管级”权限点（§8.7）：**群主不会自动获得 Bot 管理权**。
+
+还有一条路径完全不经过鉴权：群管理员在 QQ 客户端直接把机器人移出群，这以
+`GROUP_DEL_ROBOT` / `GROUP_ADD_ROBOT` 异步到达，只能靠事件做清理（§8.5），
+不能假设所有变更都由对话指令发起。
 
 ### 8.2 管理员认定：一次性认领令牌
 
@@ -451,7 +464,7 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 1. 启动时若 `admins` 为空，生成 32 字节随机令牌，打印到 journald（`journalctl -u qqbot | grep CLAIM`）；
 2. 用户在目标会话发送 `/claim <token>`，核验通过即写入 `admins`，`role=owner`、`peer_scope=''`；
 3. 令牌**一次性、10 分钟过期**，认领成功后从内存清除，并不再打印；
-4. 之后由 owner 用 `/grant` / `/revoke` 管理，`/grant` 必须显式指定 scene 与 `peer_scope`。
+4. 之后由 owner 用 `/admin add` / `/admin rm` 管理：群内添加产生**该群的委托管理员**（`peer_scope=<群>`），私聊添加产生**全局管理员**（`peer_scope=''`）。
 
 代价是部署时必须看一眼日志；收益是**不存在“默认口令”这个永久攻击面**。
 
@@ -494,12 +507,53 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
               /claim <token>                    /reset <level>
   (none) ───────────────────► (owner) ──────────────────────► pending
                                 │                               │
-                    /grant      │                     code 校验 │ 60 s 超时
+                    /admin add  │                     code 校验 │ 60 s 超时
                                 ▼                               ▼
-                             (admin) ──/revoke──► (none)    executed / discard
+                             (admin) ──/admin rm──► (none)  executed / discard
 ```
 
-权限是**叠加**而非层级：owner 隐含全部；admin 只能作用于自己 `peer_scope` 内的 R1/R2；R0 与 R3 恒为 owner 专属。
+权限是**叠加**而非层级替换：owner 隐含全部；`peer_scope` 非空的委托 admin 只能在
+该群执行群管级操作，全局 admin 不受限；R0 与 R3 恒为 owner 专属。
+
+### 8.7 权限模型：三级角色 + 群内身份
+
+参考 nonebot 的 `Permission` 思路（`SUPERUSER | GROUP_ADMIN` 表示任一满足），但把
+判定收进核心：插件只声明"要什么"，核心在路由阶段决定"给不给"。插件里没有判权代码，
+漏写检查也不会越权。
+
+**两个正交维度**
+
+| 维度 | 取值 | 来源 | 用途 |
+|---|---|---|---|
+| Bot 角色 `Role` | `user` < `admin` < `owner` | `admins` 表 | 能否管理机器人 |
+| 群内角色 `GroupRole` | `unknown` < `member` < `admin` < `owner` | 事件载荷 `author.member_role` | 能否执行群管级操作 |
+
+叠加规则：Bot 管理员在任何群都按群管级处理；平台群主**不会**因此成为 Bot 管理员。
+未知群内角色（私聊、通知事件、字段缺失）按"低于成员"处理，任何依赖群角色的权限点
+都会失败（fail-closed）。
+
+**权限点**（`host.Perm`，按位或组合，语义为"任一满足"）
+
+| 权限点 | 成立条件 |
+|---|---|
+| `PermUser` | 任何人（含私聊） |
+| `PermGroupMember` | 事件来自群聊 |
+| `PermGroupAdmin` | 平台群管 / 群主，或 Bot 管理员 |
+| `PermGroupOwner` | 平台群主，或 Bot 管理员 |
+| `PermBotAdmin` | Bot 管理员或所有者 |
+| `PermBotOwner` | 仅 Bot 所有者 |
+
+**声明方式**：`Manifest.Permission` 是插件级默认，`Command.Permission` 覆盖它
+（零值 = 未声明 = 继承；要显式公开写 `PermUser`）。`DenyReply` 提供拒绝文案，
+是否真的发出由 `[permission].deny_reply` 统一控制，默认关闭（静默）。
+
+**判定时机**：`Core.Handle` 在去重之后、路由之前填 `Event.Actor`（Bot 角色查库，
+群内角色已由网关填好），`Dispatcher` 在调用插件前过滤。权限先于优先级：高优先级但
+无权限的插件不会挡住后面能处理该消息的插件。
+
+**为什么不在插件里判权**：插件一旦能接管 `/admin` 就能给自己提权；同理，判权逻辑
+分散在每个插件里时，任何一处漏写就是一个越权口子。核心统一判定 + 装配期校验
+（未定义的权限位直接拒绝加载）把这类错误前移到启动阶段。
 
 ---
 

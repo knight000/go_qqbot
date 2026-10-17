@@ -77,6 +77,7 @@ func New(o Options) (*Core, error) {
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
 	dispatch.trace = trace
+	dispatch.denyReply = o.Config.Permission.DenyReply
 
 	return &Core{
 		store:     o.Store,
@@ -186,6 +187,10 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		c.log.Debug("重复事件，忽略", "event", ev.ID)
 		return
 	}
+
+	// 权限视图必须在落库、核心指令与插件路由之前就位：下游只读 ev.Actor。
+	// 重复事件不会走到这里，所以每条真正处理的事件只产生一次查询。
+	c.resolveActor(ctx, ev)
 
 	if ev.IsMessage() {
 		if err := c.store.InsertMessage(ctx, store.Message{

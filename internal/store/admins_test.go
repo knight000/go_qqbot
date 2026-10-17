@@ -69,9 +69,10 @@ func TestAdminRoleScopeIsolation(t *testing.T) {
 	if _, _, ok, _ := db.AdminRole(ctx, "admin-1", "", "group", "g2"); ok {
 		t.Fatal("admin 不应在未授权群生效")
 	}
-	// 群授权不跨越到单聊
-	if _, _, ok, _ := db.AdminRole(ctx, "admin-1", "", "c2c", "admin-1"); ok {
-		t.Fatal("群内 admin 不应自动获得单聊权限")
+	// 群内委托只约束"别的群"：同一个人在私聊里仍是 admin
+	// （openid 跨场景同值，私聊没有 peer 概念）。
+	if role, _, ok, _ := db.AdminRole(ctx, "admin-1", "", "c2c", "admin-1"); !ok || role != RoleAdmin {
+		t.Fatalf("admin 应在私聊同样生效: role=%q ok=%v", role, ok)
 	}
 	// 陌生人
 	if _, _, ok, _ := db.AdminRole(ctx, "stranger", "", "group", "g1"); ok {
@@ -132,7 +133,8 @@ func TestAdminRoleUnionLinkAcrossScenes(t *testing.T) {
 		t.Fatal("g1 的 admin 不应在 g2 生效")
 	}
 
-	// 私聊加的 admin 不扩散到群：即便 union 能认出同一个人
+	// 私聊加的 admin 是全局角色：群内也生效
+	// （peer_scope 为空 = 全局；这与"群内委托只在那个群生效"是同一条规则的两面）
 	if err := db.LinkIdentity(ctx, "c2c-D", "union-D", "c2c", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -145,8 +147,8 @@ func TestAdminRoleUnionLinkAcrossScenes(t *testing.T) {
 	if _, _, ok, _ := db.AdminRole(ctx, "c2c-D", "union-D", "c2c", "c2c-D"); !ok {
 		t.Fatal("私聊 admin 应在私聊生效")
 	}
-	if _, _, ok, _ := db.AdminRole(ctx, "member-D", "union-D", "group", "g1"); ok {
-		t.Fatal("私聊加的 admin 不应在群里生效")
+	if _, _, ok, _ := db.AdminRole(ctx, "member-D", "union-D", "group", "g1"); !ok {
+		t.Fatal("全局 admin 应在群内生效")
 	}
 }
 
@@ -170,11 +172,13 @@ func TestAdminTargetsResolveC2C(t *testing.T) {
 	if len(targets) != 1 {
 		t.Fatalf("应有 1 个收件人，实际 %d", len(targets))
 	}
-	if targets[0].C2COpenID != "" {
-		t.Fatalf("未建立单聊身份时不应有私聊 openid，实际 %q", targets[0].C2COpenID)
+	// openid 跨场景同值：没建立单聊映射也能直接私聊。
+	// 这是"群认领的 owner 收不到启动通知"的修复点。
+	if targets[0].C2COpenID != "member-A" {
+		t.Fatalf("应按同值 openid 直接私聊，实际 %q", targets[0].C2COpenID)
 	}
 
-	// 私聊过之后应能解析出单聊 openid
+	// 私聊过之后，identities 里的映射更权威，优先使用它
 	if err := db.LinkIdentity(ctx, "c2c-A", "union-A", "c2c", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -259,5 +263,47 @@ func TestUpsertAdminKeepsNoteAndUnion(t *testing.T) {
 	}
 	if len(list) != 1 || list[0].Note != "运维" || list[0].UnionID != "union-1" {
 		t.Fatalf("空字段不应覆盖已有值: %+v", list)
+	}
+}
+
+// 回归：在单聊里 /claim 的 owner，进群后必须仍是 owner。
+// 根因是 AdminRole 曾把 openid 匹配限定在 scene 内，而群/单聊的 openid 是同值。
+func TestAdminRoleOwnerFromC2CWorksInGroup(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if err := db.UpsertAdmin(ctx, Admin{OpenID: "u1", Scene: "c2c", Role: RoleOwner, GrantedBy: "claim"}); err != nil {
+		t.Fatal(err)
+	}
+	// 平台未下发 union_openid，只能靠同值 openid
+	role, _, ok, err := db.AdminRole(ctx, "u1", "", "group", "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || role != RoleOwner {
+		t.Fatalf("单聊认领的 owner 在群里应仍为 owner: role=%q ok=%v", role, ok)
+	}
+	// 群里认领、私聊使用同样成立
+	if err := db.UpsertAdmin(ctx, Admin{OpenID: "u2", Scene: "group", Role: RoleOwner}); err != nil {
+		t.Fatal(err)
+	}
+	if role, _, ok, _ := db.AdminRole(ctx, "u2", "", "c2c", "u2"); !ok || role != RoleOwner {
+		t.Fatalf("群内认领的 owner 在私聊应仍为 owner: role=%q ok=%v", role, ok)
+	}
+}
+
+// 群内委托（peer_scope 非空）不得越界到别的群。
+func TestAdminRoleGroupDelegationIsScoped(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if err := db.UpsertAdmin(ctx, Admin{OpenID: "a1", Scene: "group", PeerScope: "g1", Role: RoleAdmin}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := db.AdminRole(ctx, "a1", "", "group", "g1"); !ok {
+		t.Fatal("应在授权群生效")
+	}
+	if _, _, ok, _ := db.AdminRole(ctx, "a1", "", "group", "g2"); ok {
+		t.Fatal("不应在未授权群生效")
 	}
 }

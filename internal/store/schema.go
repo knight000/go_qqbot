@@ -65,10 +65,9 @@ var schema = []string{
 		PRIMARY KEY (openid, scene, peer_scope)
 	)`,
 
-	// identities 记录「同一个人在不同场景下的 openid」。
-	// 平台不给 QQ 号，群 member_openid 与单聊 user_openid 也不通用；
-	// union_openid 是平台给出的跨场景唯一标识，用它把两种身份连起来，
-	// 才能让在群里认领的 owner 收到单聊通知、并在私聊里继续管理。
+	// identities 记录「同一个人在各场景下的身份」。
+	// openid 本身跨场景同值（author.id），所以鉴权不依赖这张表；
+	// 它用于解析主动消息的投递地址，并在平台回传 union_openid 时提供兜底匹配。
 	`CREATE TABLE IF NOT EXISTS identities (
 		openid       TEXT NOT NULL,
 		scene        TEXT NOT NULL,

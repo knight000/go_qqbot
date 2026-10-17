@@ -9,11 +9,12 @@ import (
 	"github.com/knight000/qqbot/internal/host"
 )
 
-// 真实的群消息事件体（字段取自官方文档示例，另加 union_openid 与 mentions）。
+// 真实的群消息事件体（字段取自官方文档示例：id 与 member_openid 同值，
+// 另加 union_openid 与 mentions）。
 const groupMessagePayload = `{
   "id": "ROBOT1.0_abc",
   "author": {
-    "id": "A1",
+    "id": "M1",
     "member_openid": "M1",
     "member_role": "member",
     "username": "小明",
@@ -70,6 +71,13 @@ func TestDecodeGroupMessageFields(t *testing.T) {
 		}
 		if ev.SenderID != "M1" || ev.UnionID != "U1" {
 			t.Fatalf("发送者/union 错误: %q/%q", ev.SenderID, ev.UnionID)
+		}
+		// 群内角色必须原样带进权限视图：这是"群主/群管"权限的唯一来源。
+		if ev.Actor.GroupRole != host.GroupRoleMember {
+			t.Fatalf("GroupRole 应为 member，实际 %q", ev.Actor.GroupRole)
+		}
+		if ev.Actor.OpenID != ev.SenderID || ev.Actor.PeerID != ev.PeerID {
+			t.Fatalf("Actor 身份字段应与事件一致: %+v", ev.Actor)
 		}
 		if ev.Content != "你好" {
 			t.Fatalf("content 应去除首尾空白，实际 %q", ev.Content)
@@ -186,5 +194,43 @@ func TestDecodeNoticeStableID(t *testing.T) {
 	}
 	if !strings.HasPrefix(ev.ID, platGroupDelRobot) {
 		t.Fatalf("稳定 ID 应带事件名前缀: %q", ev.ID)
+	}
+}
+
+// 平台文档把 author.id 定义为"用户唯一标识"，member_openid / user_openid 是场景字段。
+// 两者不一致时以 id 为准——这决定了 admins 表里的授权会不会随场景漂移。
+func TestDecodeGroupMessagePrefersAuthorIDAndKeepsRole(t *testing.T) {
+	const raw = `{
+	  "id": "MSG1",
+	  "author": {"id":"U-SAME","member_openid":"M-GROUP","member_role":"owner","username":"小红"},
+	  "content": "hi",
+	  "group_openid": "G1",
+	  "message_type": 0,
+	  "timestamp": "2026-07-21T09:30:00+08:00"
+	}`
+	ev, err := Decode(platGroupMessageAll, json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	if ev.SenderID != "U-SAME" {
+		t.Fatalf("SenderID 应优先取 author.id，实际 %q", ev.SenderID)
+	}
+	if ev.Actor.GroupRole != host.GroupRoleOwner {
+		t.Fatalf("群主应解出 owner，实际 %q", ev.Actor.GroupRole)
+	}
+}
+
+// 单聊载荷没有 member_role：群内角色必须保持未知，不能让私聊用户凭空获得群管身份。
+func TestDecodeC2CHasNoGroupRole(t *testing.T) {
+	const raw = `{"id":"MSG2","author":{"id":"U1","user_openid":"U1"},"content":"hi","message_type":0,"timestamp":"2026-07-21T08:00:00+08:00"}`
+	ev, err := Decode(platC2CMessage, json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	if ev.Scene != host.SceneC2C || ev.SenderID != "U1" {
+		t.Fatalf("单聊字段错误: scene=%q sender=%q", ev.Scene, ev.SenderID)
+	}
+	if ev.Actor.GroupRole != host.GroupRoleUnknown {
+		t.Fatalf("单聊不应有群内角色，实际 %q", ev.Actor.GroupRole)
 	}
 }

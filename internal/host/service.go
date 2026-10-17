@@ -118,8 +118,11 @@ func (s *Service) HTTP() HTTP           { return s.http }
 func (s *Service) Scheduler() Scheduler { return s.sched }
 func (s *Service) Log() *slog.Logger    { return s.log }
 
-// IsAdmin 查询管理员身份。查不到就是 false（fail-closed）——
+// IsAdmin 查询 Bot 管理员身份。查不到就是 false（fail-closed）——
 // 权限判定失败绝不能放行。只有后端故障才返回错误，让调用方决定是否静默。
+//
+// 新插件请优先用声明式权限（Manifest/Command.Permission）：核心在路由阶段拦截，
+// 插件里不会出现判权分支。这个方法保留给"需要在回调或定时任务里再确认一次"的场景。
 func (s *Service) IsAdmin(ctx context.Context, id Identity) (bool, error) {
 	if s.admin == nil {
 		return false, fmt.Errorf("管理员后端未初始化")

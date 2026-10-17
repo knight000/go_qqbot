@@ -21,6 +21,9 @@ type Dispatcher struct {
 	log     *slog.Logger
 	handler time.Duration
 	trace   *Trace
+	// denyReply 为 false 时，权限不足一律静默（默认）。
+	// 拒绝语由插件 Manifest/Command 提供，是否发出由全局配置决定。
+	denyReply bool
 
 	sem chan struct{}
 
@@ -112,13 +115,38 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 		return
 	}
 
-	top := matches[0]
-	chosen := matches[:1]
+	// 权限先于优先级：高优先级但无权执行的插件，不应挡住后面能处理这条消息的插件。
+	// 典型场景是"管理员专用插件"与"公开插件"同时订阅 message。
+	first := -1
+	var denied []Match
+	for i, m := range matches {
+		if m.Perm.Admits(ev.Actor) {
+			first = i
+			break
+		}
+		denied = append(denied, m)
+	}
+	for _, m := range denied {
+		d.trace.Denied(m, ev)
+	}
+	if first < 0 {
+		// 全部候选都无权限：最多回一条拒绝语（插件声明的），绝不逐条回。
+		if len(denied) > 0 {
+			d.replyDenied(ctx, ev, denied[0])
+		}
+		return
+	}
+
+	top := matches[first]
+	chosen := matches[first : first+1]
 	if top.Manifest.Broadcast {
-		chosen = chosen[:0]
-		for _, m := range matches {
+		for _, m := range matches[first+1:] {
 			if m.Priority != top.Priority {
 				break
+			}
+			if !m.Perm.Admits(ev.Actor) {
+				d.trace.Denied(m, ev)
+				continue
 			}
 			chosen = append(chosen, m)
 		}
@@ -128,6 +156,23 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 		d.trace.Hit(m, ev)
 		d.run(ctx, m, ev)
 	}
+}
+
+// replyDenied 发出插件声明的拒绝语。空串表示静默（默认），
+// 避免在群里主动暴露"存在一条你看不到的指令"。
+func (d *Dispatcher) replyDenied(ctx context.Context, ev *host.Event, m Match) {
+	if !d.denyReply || m.DenyReply == "" {
+		return
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := d.sender.Reply(rctx, ev, host.Reply{Content: m.DenyReply}); err != nil {
+		d.log.Warn("权限拒绝回复失败", "plugin", m.Manifest.Name, "event", ev.ID, "err", err)
+		return
+	}
+	d.log.Debug("权限不足，已回复拒绝语",
+		"plugin", m.Manifest.Name, "scene", ev.Scene, "peer", ev.PeerID,
+		"role", ev.Actor.Role, "group_role", ev.Actor.GroupRole)
 }
 
 func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {

@@ -7,8 +7,8 @@
 //   - 同一进程只在启动后发一次，失败最多重试一次；
 //   - 距上次启动不足 min_interval 时整轮跳过，避免崩溃重启刷屏。
 //
-// 收件人来自 Host.Admins()：只知道群身份的管理员无法被私聊，
-// 会跳过并在日志里说明，等他在私聊里说过话（平台回传 union_openid）后自动补上。
+// 收件人来自 Host.Admins()：openid 跨场景同值，群里的管理员也能直接私聊；
+// 若某条授权连 openid 都解析不出来，跳过并在日志里说明。
 package bootnotice
 
 import (
@@ -102,7 +102,7 @@ func (p *Plugin) run(ctx context.Context) {
 	if len(reachable) == 0 {
 		p.log.Info("没有可私聊的管理员，跳过启动通知",
 			"admins", len(targets),
-			"原因", "群身份没有单聊 openid；管理员私聊机器人一次即可建立映射")
+			"原因", "管理员列表为空，或授权里没有可用的 openid")
 		return
 	}
 	// /reload 是管理员显式要求重启，此时必须发——否则"重启后确认更新是否生效"

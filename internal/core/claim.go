@@ -16,6 +16,10 @@ import (
 // 认领机制（§8.2）：openid 是相对机器人加密的，注册前不可预知，
 // 因此不能在配置里硬编码首个管理员。启动时若 admins 为空，
 // 生成一次性令牌打印到 journald，由第一个 /claim 的用户成为 owner。
+//
+// owner 是唯一且全局的：openid 跨场景同值，在单聊里认领的人进群后同样是 owner
+// （store.AdminRole 不再按 scene 限定 openid）。首个认领同时关闭入口——
+// /admin 没有任何"再造一个 owner"的路径。
 const claimTTL = 10 * time.Minute
 
 func (c *Core) ensureOwner(ctx context.Context) error {
@@ -71,7 +75,7 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		return true
 	case "/grant", "/revoke":
 		c.trace.CoreCommand(cmd)
-		c.replyText(ctx, ev, "已改为 /admin add <openid> 与 /admin rm <openid>（仅 owner）。")
+		c.replyText(ctx, ev, "已改为 /admin add <openid> 与 /admin rm <openid>（仅 Bot 所有者）。")
 		return true
 	}
 	return false

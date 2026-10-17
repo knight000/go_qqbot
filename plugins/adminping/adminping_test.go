@@ -2,7 +2,6 @@ package adminping
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -11,37 +10,29 @@ import (
 	"github.com/knight000/qqbot/internal/host"
 )
 
-type fakeHost struct {
-	admin bool
-	err   error
-	cfg   host.Params
-}
+// fakeHost 只填本插件用到的能力（日志与配置）；鉴权已不在插件里，IsAdmin 不参与。
+type fakeHost struct{ cfg host.Params }
 
-func (f *fakeHost) Plugin() string            { return "adminping" }
-func (f *fakeHost) Config() host.Params       { return f.cfg }
-func (f *fakeHost) Sender() host.Sender       { return nil }
-func (f *fakeHost) KV() host.KV               { return nil }
-func (f *fakeHost) Query() host.QueryStore    { return nil }
-func (f *fakeHost) HTTP() host.HTTP           { return nil }
-func (f *fakeHost) Scheduler() host.Scheduler { return nil }
+func (f *fakeHost) Plugin() string              { return "adminping" }
+func (f *fakeHost) Config() host.Params         { return f.cfg }
+func (f *fakeHost) Sender() host.Sender         { return nil }
+func (f *fakeHost) KV() host.KV                 { return nil }
+func (f *fakeHost) Query() host.QueryStore      { return nil }
+func (f *fakeHost) HTTP() host.HTTP             { return nil }
+func (f *fakeHost) Scheduler() host.Scheduler   { return nil }
+func (f *fakeHost) Admins() host.AdminDirectory { return nil }
+func (f *fakeHost) IsAdmin(context.Context, host.Identity) (bool, error) {
+	return false, nil
+}
 func (f *fakeHost) Log() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func (f *fakeHost) IsAdmin(ctx context.Context, id host.Identity) (bool, error) {
-	return f.admin, f.err
-}
-
-func (f *fakeHost) Admins() host.AdminDirectory { return nil }
-
-func newPlugin(t *testing.T, admin bool, err error, cfg host.Params) *Plugin {
+func newPlugin(t *testing.T) *Plugin {
 	t.Helper()
-	if cfg == nil {
-		cfg = host.Params{}
-	}
 	p := &Plugin{}
-	if e := p.Init(context.Background(), &fakeHost{admin: admin, err: err, cfg: cfg}); e != nil {
-		t.Fatalf("Init: %v", e)
+	if err := p.Init(context.Background(), &fakeHost{cfg: host.Params{}}); err != nil {
+		t.Fatalf("Init: %v", err)
 	}
 	return p
 }
@@ -56,6 +47,10 @@ func ev(content string) *host.Event {
 		SenderID: "user-1",
 		MsgID:    "m1",
 		Content:  content,
+		Actor: host.Principal{
+			OpenID: "user-1", Scene: host.SceneGroup, PeerID: "group-1",
+			Role: host.RoleAdmin, GroupRole: host.GroupRoleMember,
+		},
 	}
 }
 
@@ -79,69 +74,36 @@ func TestIsPing(t *testing.T) {
 	}
 }
 
-func TestNonAdminGetsNoReply(t *testing.T) {
-	// 默认配置（未声明 silent）必须是完全静默
-	p := newPlugin(t, false, nil, nil)
-	reply, err := p.Handle(context.Background(), ev("/ping"))
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
+// 鉴权必须是声明式的：插件不判权，能力边界写进 Manifest。
+func TestManifestRequiresBotAdmin(t *testing.T) {
+	m := (&Plugin{}).Manifest()
+	if len(m.Commands) != 1 {
+		t.Fatalf("Commands = %+v, want 单个 /ping", m.Commands)
 	}
-	if reply != nil {
-		t.Fatalf("非管理员不应收到回复，得到: %q", reply.Content)
+	cmd := m.Commands[0]
+	if cmd.Permission != host.PermBotAdmin {
+		t.Fatalf("Permission = %s, want bot-admin", cmd.Permission)
 	}
-	if !p.silent {
-		t.Fatal("默认 silent 应为 true")
+	if cmd.DenyReply == "" {
+		t.Fatal("DenyReply 不应为空：全局开关打开时要有话可说")
 	}
-}
-
-// 关掉静默后，非管理员只拿到一句拒绝，拿不到任何指标。
-func TestNonAdminGetsDenyWhenNotSilent(t *testing.T) {
-	p := newPlugin(t, false, nil, host.Params{"silent": "false"})
-	reply, err := p.Handle(context.Background(), ev("/ping"))
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
+	if !cmd.Permission.Admits(host.Principal{Role: host.RoleAdmin}) {
+		t.Fatal("Bot 管理员应被允许")
 	}
-	if reply == nil {
-		t.Fatal("silent=false 时应回复")
+	if !cmd.Permission.Admits(host.Principal{Role: host.RoleOwner}) {
+		t.Fatal("Bot 所有者应被允许")
 	}
-	if !strings.Contains(reply.Content, "管理员") {
-		t.Errorf("拒绝语不对: %q", reply.Content)
+	if cmd.Permission.Admits(host.Principal{Role: host.RoleUser}) {
+		t.Fatal("普通用户不应被允许")
 	}
-	for _, leak := range []string{"CPU", "内存", "磁盘", "目录"} {
-		if strings.Contains(reply.Content, leak) {
-			t.Errorf("拒绝语泄露了指标 %q: %q", leak, reply.Content)
-		}
-	}
-}
-
-// 权限后端故障时必须 fail-closed：静默模式不回任何内容，避免把主机信息漏给陌生人。
-func TestAdminCheckErrorIsSilent(t *testing.T) {
-	p := newPlugin(t, true, errors.New("db down"), nil)
-	reply, err := p.Handle(context.Background(), ev("/ping"))
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if reply != nil {
-		t.Fatalf("鉴权失败不应回复，得到: %q", reply.Content)
-	}
-}
-
-func TestAdminCheckErrorNotSilent(t *testing.T) {
-	p := newPlugin(t, true, errors.New("db down"), host.Params{"silent": false})
-	reply, err := p.Handle(context.Background(), ev("/ping"))
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if reply == nil || !strings.Contains(reply.Content, "权限") {
-		t.Fatalf("应回复权限查询失败，得到: %+v", reply)
-	}
-	if strings.Contains(reply.Content, "CPU") {
-		t.Errorf("鉴权失败不应带指标: %q", reply.Content)
+	// 平台群主不是 Bot 管理员：群主身份不满足 bot-admin
+	if cmd.Permission.Admits(host.Principal{Role: host.RoleUser, GroupRole: host.GroupRoleOwner, Scene: host.SceneGroup}) {
+		t.Fatal("平台群主不应满足 bot-admin")
 	}
 }
 
 func TestOtherCommandsIgnored(t *testing.T) {
-	p := newPlugin(t, true, nil, nil)
+	p := newPlugin(t)
 	for _, c := range []string{"hello", "/reset", "/pingpong"} {
 		reply, err := p.Handle(context.Background(), ev(c))
 		if err != nil {
@@ -154,7 +116,7 @@ func TestOtherCommandsIgnored(t *testing.T) {
 }
 
 func TestAdminGetsFullReport(t *testing.T) {
-	p := newPlugin(t, true, nil, host.Params{"silent": true})
+	p := newPlugin(t)
 	reply, err := p.Handle(context.Background(), ev("/ping"))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
