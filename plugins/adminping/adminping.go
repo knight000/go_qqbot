@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/knight000/qqbot/internal/buildinfo"
 	"github.com/knight000/qqbot/internal/host"
 	"github.com/knight000/qqbot/internal/sysinfo"
 )
@@ -114,6 +115,10 @@ func (p *Plugin) report(ctx context.Context) (string, error) {
 
 	var b strings.Builder
 	b.WriteString("/pong\n")
+
+	// 0. 版本：重启/升级后用它确认跑的是不是新二进制（+dirty 表示工作区有未提交改动）
+	bi := buildinfo.Get()
+	fmt.Fprintf(&b, "版本 %s｜%s\n", bi.String(), strings.TrimPrefix(bi.GoVer, "go"))
 
 	// 1. 连续运行时长
 	up := time.Since(sysinfo.StartTime)

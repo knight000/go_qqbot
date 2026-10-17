@@ -46,6 +46,11 @@ type Core struct {
 	claimMu    sync.Mutex
 	claimToken string
 	claimExp   time.Time
+
+	startedAt time.Time
+	// restart 只缓冲一条：重复的 /reload 直接返回 ErrRestartPending，
+	// 避免同一个进程被多条请求推着反复重启。
+	restart chan RestartRequest
 }
 
 func New(o Options) (*Core, error) {
@@ -71,16 +76,18 @@ func New(o Options) (*Core, error) {
 	dispatch.trace = trace
 
 	return &Core{
-		store:    o.Store,
-		cfg:      o.Config,
-		http:     o.HTTP,
-		log:      logger,
-		plugins:  o.Plugins,
-		trace:    trace,
-		sender:   sender,
-		router:   router,
-		dispatch: dispatch,
-		sched:    sched,
+		store:     o.Store,
+		cfg:       o.Config,
+		http:      o.HTTP,
+		log:       logger,
+		plugins:   o.Plugins,
+		trace:     trace,
+		sender:    sender,
+		router:    router,
+		dispatch:  dispatch,
+		sched:     sched,
+		startedAt: time.Now(),
+		restart:   make(chan RestartRequest, 1),
 	}, nil
 }
 
