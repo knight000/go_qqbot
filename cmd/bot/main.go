@@ -17,6 +17,7 @@ import (
 	_ "time/tzdata"
 
 	"github.com/knight000/qqbot/internal/api"
+	"github.com/knight000/qqbot/internal/buildinfo"
 	"github.com/knight000/qqbot/internal/config"
 	"github.com/knight000/qqbot/internal/core"
 	"github.com/knight000/qqbot/internal/gateway"
@@ -31,20 +32,37 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	req, err := run()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "启动失败:", err)
+		os.Exit(1)
+	}
+	if req == nil {
+		return
+	}
+
+	// 走到这里时 run 已经返回：网关断开、session 落盘、数据库关闭。
+	// 此时再做进程替换，新进程不会和旧进程抢同一个 gateway session 与 SQLite 连接。
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "重启失败：定位可执行文件:", err)
+		os.Exit(1)
+	}
+	if err := restartSelf(exe); err != nil {
+		fmt.Fprintln(os.Stderr, "重启失败:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+// run 正常退出时返回 nil；返回非 nil 表示需要由 main 重新执行自身（/reload）。
+func run() (*core.RestartRequest, error) {
 	cfgPath := flag.String("c", "config/config.local.toml", "配置文件路径")
 	debugMode := flag.Bool("debug", false, "调试模式：打印收到的事件、命中的插件与回复内容（等同 [debug].enabled=true）")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// 命令行参数优先于配置文件：临时排查不必改文件，也不会漏提交。
 	if *debugMode {
@@ -61,12 +79,12 @@ func run() error {
 
 	db, err := store.Open(cfg.Store.Path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer db.Close()
 
 	if err := db.Migrate(context.Background()); err != nil {
-		return err
+		return nil, err
 	}
 
 	hc := httpx.New(httpx.Options{
@@ -93,14 +111,14 @@ func run() error {
 		Plugins: host.Registered(),
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if err := coreImpl.Start(ctx); err != nil {
-		return err
+		return nil, err
 	}
 
 	gw := gateway.New(gateway.Options{
@@ -121,20 +139,39 @@ func run() error {
 		gw.Run(ctx)
 	}()
 
+	bi := buildinfo.Get()
 	log.Info("qqbot 启动完成",
 		"config", *cfgPath,
 		"db", db.Path(),
 		"sandbox", cfg.App.Sandbox,
 		"debug", cfg.Debug.Enabled,
+		"version", bi.String(),
+		"platform", bi.Platform,
+		"go", bi.GoVer,
+		"restarted", buildinfo.RestartedByReload(),
 		"plugins", len(host.Registered()))
+	if buildinfo.RestartedByReload() {
+		log.Info("本次启动由 /reload 触发", "version", bi.String())
+	}
 	if cfg.Debug.Enabled {
 		log.Info("调试模式已开启：收到的每条事件、插件命中与回复内容都会打印到控制台",
 			"raw", cfg.Debug.Raw)
 	}
 
-	<-ctx.Done()
+	var req *core.RestartRequest
+	select {
+	case <-ctx.Done():
+	case r := <-coreImpl.RestartRequests():
+		req = &r
+	}
 	stop()
-	log.Info("收到退出信号，开始关闭")
+
+	if req != nil {
+		log.Warn("收到重启请求，开始关闭",
+			"by", req.By, "role", req.Role, "reason", req.Reason)
+	} else {
+		log.Info("收到退出信号，开始关闭")
+	}
 
 	// 先停接入层：让它把 session_id / seq 落盘，下次启动就能 Resume
 	select {
@@ -147,8 +184,12 @@ func run() error {
 	defer cancel()
 	coreImpl.Shutdown(shutdownCtx)
 
-	log.Info("已退出")
-	return nil
+	if req != nil {
+		log.Info("已关闭，准备重新执行自身", "version", bi.String())
+	} else {
+		log.Info("已退出")
+	}
+	return req, nil
 }
 
 // rawDumpFunc 只在 [debug].enabled 与 [debug].raw 同时为真时，

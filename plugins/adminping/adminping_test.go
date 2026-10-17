@@ -161,7 +161,7 @@ func TestAdminGetsFullReport(t *testing.T) {
 	if reply == nil {
 		t.Fatal("管理员应收到回复")
 	}
-	for _, want := range []string{"/pong", "运行", "CPU", "内存", "磁盘", "目录"} {
+	for _, want := range []string{"/pong", "版本", "运行", "CPU", "内存", "磁盘", "目录"} {
 		if !strings.Contains(reply.Content, want) {
 			t.Errorf("报告缺少 %q:\n%s", want, reply.Content)
 		}

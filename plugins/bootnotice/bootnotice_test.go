@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knight000/qqbot/internal/buildinfo"
 	"github.com/knight000/qqbot/internal/host"
 )
 
@@ -178,6 +179,27 @@ func TestNotifyRetriesOnce(t *testing.T) {
 	p.run(context.Background())
 	if len(h.sender.msgs) != 1 {
 		t.Fatalf("重试应成功，实际 %d 条", len(h.sender.msgs))
+	}
+}
+
+// /reload 是管理员显式重启，必须发通知：否则"重启后确认更新是否生效"没有回执。
+func TestNotifyIgnoresIntervalAfterReload(t *testing.T) {
+	t.Setenv(buildinfo.RestartEnv, "1")
+	p, h := newPlugin(t, nil, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
+	p.delay = 0
+	// 落在 min_interval 窗口内
+	h.kv.m[keyLastStart] = []byte(time.Now().Add(-time.Minute).Format(time.RFC3339))
+
+	p.run(context.Background())
+
+	if len(h.sender.msgs) != 1 {
+		t.Fatalf("/reload 重启应无视 min_interval，实际 %d 条", len(h.sender.msgs))
+	}
+	if !strings.Contains(h.sender.msgs[0].text, "/reload 重启") {
+		t.Errorf("正文应标注 /reload 重启:\n%s", h.sender.msgs[0].text)
+	}
+	if !strings.Contains(h.sender.msgs[0].text, "版本") {
+		t.Errorf("正文应带版本，便于确认是否换成了新构建:\n%s", h.sender.msgs[0].text)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/knight000/qqbot/internal/buildinfo"
 	"github.com/knight000/qqbot/internal/host"
 	"github.com/knight000/qqbot/internal/sysinfo"
 )
@@ -104,7 +105,9 @@ func (p *Plugin) run(ctx context.Context) {
 			"原因", "群身份没有单聊 openid；管理员私聊机器人一次即可建立映射")
 		return
 	}
-	if hasPrev && p.minInterval > 0 && time.Since(prev) < p.minInterval {
+	// /reload 是管理员显式要求重启，此时必须发——否则"重启后确认更新是否生效"
+	// 会被崩溃抑制窗口吞掉，变成一次没有回执的操作。
+	if hasPrev && p.minInterval > 0 && time.Since(prev) < p.minInterval && !buildinfo.RestartedByReload() {
 		p.log.Info("距上次启动不足 min_interval，跳过通知",
 			"last", prev.Format(time.RFC3339), "min_interval", p.minInterval.String())
 		return
@@ -164,6 +167,12 @@ const keyLastStart = "last_start"
 func compose(start, prev time.Time, hasPrev bool) string {
 	var b strings.Builder
 	b.WriteString("机器人已上线\n")
+	bi := buildinfo.Get()
+	fmt.Fprintf(&b, "版本 %s", bi.String())
+	if buildinfo.RestartedByReload() {
+		b.WriteString("（/reload 重启）")
+	}
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "启动 %s｜%s/%s\n", start.Format("01-02 15:04:05"), runtime.GOOS, runtime.GOARCH)
 	if hasPrev {
 		fmt.Fprintf(&b, "上次启动 %s（%s前）\n",

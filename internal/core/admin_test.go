@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/knight000/qqbot/internal/host"
 	"github.com/knight000/qqbot/internal/store"
@@ -25,9 +26,11 @@ func newAdminCore(t *testing.T) (*Core, *fakeAPI) {
 	}
 	f := &fakeAPI{}
 	c := &Core{
-		store:  db,
-		log:    slog.New(slog.DiscardHandler),
-		sender: NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}),
+		store:     db,
+		log:       slog.New(slog.DiscardHandler),
+		sender:    NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}),
+		startedAt: time.Now(),
+		restart:   make(chan RestartRequest, 1),
 	}
 	return c, f
 }

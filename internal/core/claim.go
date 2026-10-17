@@ -60,6 +60,10 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		c.trace.CoreCommand(cmd)
 		c.handleAdmin(ctx, ev)
 		return true
+	case "/reload", "/restart":
+		c.trace.CoreCommand(cmd)
+		c.handleReload(ctx, ev)
+		return true
 	case "/reset":
 		// 分级重置由核心独占，插件不得声明；具体逻辑属于下一步实现。
 		c.trace.CoreCommand(cmd)

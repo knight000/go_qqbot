@@ -11,8 +11,10 @@ import (
 
 // reservedPrefixes 是核心保留指令。插件若声明相同前缀，启动即拒绝加载，
 // 否则第三方插件可以劫持 /reset 之类的不可逆操作（§3.4），
-// 或者用 /admin 给自己提权。
-var reservedPrefixes = []string{"/claim", "/admin", "/reset", "/grant", "/revoke"}
+// 或者用 /admin 给自己提权、用 /reload 让机器人反复下线。
+var reservedPrefixes = []string{
+	"/claim", "/admin", "/reset", "/grant", "/revoke", "/reload", "/restart",
+}
 
 type compiledCommand struct {
 	prefix   string

@@ -10,7 +10,8 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | `internal/httpx` | 统一出站：https 强制、域名白名单、令牌桶、重试与全抖动退避 |
 | `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息 |
 | `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避 |
-| `internal/core` | 事件去重、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC |
+| `internal/core` | 事件去重、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC、`/reload` 自重启 |
+| `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
 | `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 收件人目录 / 日志） |
 | `internal/sysinfo` | 跨平台资源采集：CPU、内存、进程 RSS、分区容量、目录占用（无 cgo） |
@@ -91,6 +92,7 @@ raw = false      # 额外打印平台原始 JSON（排查"某字段平台给没�
 | `/admin add <openid> [备注]` | 仅 owner | 新增 admin；备注可写 QQ 号，方便人眼识别 |
 | `/admin rm <openid>` | 仅 owner | 删除 admin 的所有授权；owner 本身不可删 |
 | `/admin whoami` | **所有人** | 只回自己的 openid / union / 角色，用于把标识报给 owner |
+| `/reload [说明]` | owner / admin | 重启进程加载磁盘上的新二进制，见下节 |
 
 群聊里需 @ 机器人后发送，单聊直接发。
 
@@ -150,6 +152,56 @@ min_interval = "10m"
 retry_delay = "30s"
 ```
 
+
+## `/reload`：重启进程验证更新
+
+Go 插件是编译期静态链接的，改动无法热替换；`/reload` 的做法是**重新执行磁盘上的二进制**，用来回答"新构建到底部署上没有"。
+
+```
+/reload              重启
+/reload 上线 v0.2     重启，备注写进日志
+/reload help         只看用法，不重启
+/restart             同 /reload
+```
+
+执行顺序（每一步都有原因，不能颠倒）：
+
+1. **先回一条消息**——被动回复窗口只在收到消息时存在，重启后这条就发不出去了；
+2. 网关断开并把 `session_id` / `seq` 落盘，下次启动直接 Resume；
+3. 关闭 SQLite，避免新进程与旧进程抢写锁；
+4. 重新执行自身：
+   - Linux / macOS：`execve` 原地替换进程映像，**PID 不变**，systemd 的 cgroup、日志句柄与控制台都沿用原来的；
+   - Windows：没有 `execve`，拉起新进程后旧进程退出；此时网关与数据库都已关闭，不会出现两个实例抢同一个 session。
+
+重启后 `bootnotice` 会私聊「机器人已上线（/reload 重启）」，`/ping` 首行显示版本，两边对比就能确认：
+
+```
+版本 dev 3f2a1c9d｜go1.26.1
+运行 8秒（启动于 10-17 15:40:02）
+```
+
+版本串带 `+dirty` 表示构建时工作区有未提交改动——部署的不是干净构建时一眼能看出来。
+
+### 部署更新的完整步骤
+
+```bash
+# 1. 构建
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o qqbot ./cmd/bot
+# 2. 覆盖服务器上的二进制（Linux 允许替换正在运行的文件，不需要先停服务）
+scp qqbot server:/opt/qqbot/bin/qqbot.new
+ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
+# 3. 在 QQ 里发
+/reload 上线 v0.2
+```
+
+约 1 分钟内应收到上线私聊。**没收到就查 journalctl** —— 重启失败时进程已经退出，只能从日志里找原因。
+
+### 几个边界
+
+- `go run ./cmd/bot` 下 `/reload` 只会重启同一份临时构建，**不会重新编译**；回复里会明确提示这一点。
+- 同一进程只接受一条重启请求，重复发只回「已有重启请求」。
+- `/reload` 与 `/reset` 无关：前者重启进程，后者（分级重置数据）尚未实现。
+- 插件不能声明 `/reload` / `/restart` 前缀，否则启动即拒绝加载。
 
 ## `/ping`（仅管理员）
 
