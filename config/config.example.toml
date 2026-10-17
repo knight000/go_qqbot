@@ -65,8 +65,12 @@ format = "text"   # 生产建议 json，对接 journald
 # 调试模式：把收到的每条事件、命中的插件与回复正文打印到控制台。
 # 也可用命令行 -debug 临时打开（会同时把 log.level 降到 debug）。
 enabled = false
+# 轨迹详细程度：
+#   full   —— 收到每条事件（含事件 ID、union）+ 插件命中 + 发送结果（默认）
+#   plugin —— 只打印触发插件的内容与真正发出的回复正文
+level = "full"
 # 额外打印平台原始 JSON，用于排查"某个字段平台到底下发没有"；
-# 输出较啰嗦，只在需要时打开。
+# 输出较啰嗦，只在需要时打开，且要求 level = "full"。
 raw = false
 
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取

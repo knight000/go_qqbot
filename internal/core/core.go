@@ -67,7 +67,7 @@ func New(o Options) (*Core, error) {
 	}
 	trace := o.Trace
 	if trace == nil && o.Config.Debug.Enabled {
-		trace = NewTrace(os.Stdout)
+		trace = NewTrace(os.Stdout, Level(o.Config.Debug.Level))
 	}
 	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config))
 	sender.trace = trace
