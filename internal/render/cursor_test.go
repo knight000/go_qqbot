@@ -198,3 +198,30 @@ func leftmostInk(m image.Image, y0, y1 float64) int {
 	}
 	return best
 }
+
+// mixedMarkerSample 把无序符号与任务复选框混在同一个列表里：两者宽度不同，
+// 左缘不可能相等，能对齐的只有右缘。
+const mixedMarkerSample = "- 普通项一\n" +
+	"- [ ] 待办项\n" +
+	"- [x] 已完成项\n" +
+	"- 普通项二\n"
+
+// 混排列表的标记必须收在同一条右缘上：复选框比项目符号宽 20px，若各按各的
+// 左缘画，同一列表里的标记会一跳一跳（实测差 26px）。
+func TestMixedTaskAndBulletMarkersShareRightEdge(t *testing.T) {
+	items := traceListItems(t, mixedMarkerSample)
+	if len(items) != 4 {
+		t.Fatalf("列表项 = %d，期望 4", len(items))
+	}
+
+	for i := 1; i < len(items); i++ {
+		if got, want := items[i].markerRight, items[0].markerRight; got != want {
+			t.Errorf("第 %d 项的标记右缘 = %v，期望 %v（与第一项相同）", i+1, got, want)
+		}
+	}
+
+	// 前提校验：复选框确实比符号宽，否则这条用例证明不了"按右缘对齐"。
+	if items[1].markerRight-items[1].markerX <= items[0].markerRight-items[0].markerX {
+		t.Fatalf("前提不成立：复选框宽度没有超过项目符号宽度")
+	}
+}
