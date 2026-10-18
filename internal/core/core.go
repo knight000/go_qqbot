@@ -85,6 +85,17 @@ func New(o Options) (*Core, error) {
 	}
 	if trace != nil {
 		trace.SetUnknownPayload(o.Config.Debug.UnknownEvents)
+		// 群名读本地登记：调试轨迹里的"群"行要显示名字而不是一串 openid。
+		// 只在打印群聊事件时调用一次（关闭态没有任何查询）。
+		if o.Store != nil {
+			trace.SetGroupNames(func(ctx context.Context, openid string) string {
+				g, ok, err := o.Store.GetGroup(ctx, openid)
+				if err != nil || !ok {
+					return ""
+				}
+				return g.Name
+			})
+		}
 	}
 	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config))
 	sender.trace = trace
@@ -195,7 +206,7 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		return
 	}
 	// 先打轨迹再去重：调试模式下"收到的每一条"都要看见，包括重复投递的那条。
-	c.trace.Received(ev)
+	c.trace.Received(ctx, ev)
 	if ev.ID == "" {
 		c.log.Warn("丢弃缺少事件 ID 的事件", "name", ev.Name)
 		return

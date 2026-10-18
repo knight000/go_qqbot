@@ -63,6 +63,9 @@ type Event struct {
 	Notice   Notice // 仅 Kind=notice 且有核心语义时非空；插件可读但无需关心
 	PeerID   string // 群 openid 或用户 openid
 	SenderID string // 发送者 openid（跨场景同值，平台不另给 QQ 号）
+	// Username 是平台给的发送者显示名，只用于展示与排障，**不是身份**：
+	// 可改、可重复、单聊载荷里通常根本没有。判权一律用 SenderID / Actor。
+	Username string
 	UnionID  string // 平台给的跨场景标识，可能为空
 	MsgID    string // 被动回复必须携带
 	Content  string
