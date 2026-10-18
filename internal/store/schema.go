@@ -130,8 +130,31 @@ var schema = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_reset_audit_ts ON reset_audit(created_at)`,
 
-	`CREATE TABLE IF NOT EXISTS jobs (
-		id                   TEXT PRIMARY KEY,
+	jobTableDDL,
+	`CREATE INDEX IF NOT EXISTS idx_jobs_next ON jobs(enabled, next_run_at)`,
+
+	// job_runs 带 peer，R2 才清得掉「某个群的执行历史」。
+	// 这个列不加就只能在 jobs 上做 join，而 jobs 的 per-peer 行将来可能被清理。
+	//
+	// 注意：peer 列由 jobRunsTableDDL 保证，已在旧库上补列；
+	// idx_job_runs_peer 不能写在这里——schema 先于补列执行，
+	// 旧库此时还没有 peer 列，建索引会直接失败（reset_audit 踩过同一个坑）。
+	jobRunsTableDDL,
+	`CREATE INDEX IF NOT EXISTS idx_job_runs ON job_runs(job_id, started_at)`,
+}
+
+// jobTableDDL 单独提出来：旧库要把 jobs 从 id 主键重建成 (id, peer) 复合主键。
+//
+// peer 是任务的会话维度：
+//   - 空串 = 全局任务，只跑一次（插件自己决定推给谁）；
+//   - 非空 = 该会话的实例，RunJob 时 Host 把 Peer 填成它。
+//
+// per-peer 实例的启停**不额外记状态**：DueJobs 会 join qq_groups 要求
+// left_at = 0。退群即停、入群即恢复由群登记表这一个事实源表达，
+// 而不是再放一份会与熔断、未注册等停用原因互相覆盖的开关。
+const jobTableDDL = `CREATE TABLE IF NOT EXISTS jobs (
+		id                   TEXT NOT NULL,
+		peer                 TEXT NOT NULL DEFAULT '',
 		plugin               TEXT NOT NULL,
 		spec                 TEXT NOT NULL,
 		timezone             TEXT NOT NULL DEFAULT 'Asia/Shanghai',
@@ -140,17 +163,16 @@ var schema = []string{
 		last_run_at          INTEGER,
 		last_status          TEXT,
 		consecutive_failures INTEGER NOT NULL DEFAULT 0,
-		payload              TEXT
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_jobs_next ON jobs(enabled, next_run_at)`,
+		payload              TEXT,
+		PRIMARY KEY (id, peer)
+	)`
 
-	`CREATE TABLE IF NOT EXISTS job_runs (
+const jobRunsTableDDL = `CREATE TABLE IF NOT EXISTS job_runs (
 		id          INTEGER PRIMARY KEY AUTOINCREMENT,
 		job_id      TEXT NOT NULL,
+		peer        TEXT NOT NULL DEFAULT '',
 		started_at  INTEGER NOT NULL,
 		finished_at INTEGER,
 		status      TEXT,
 		error       TEXT
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_job_runs ON job_runs(job_id, started_at)`,
-}
+	)`

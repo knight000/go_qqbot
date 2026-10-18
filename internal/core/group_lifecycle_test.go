@@ -116,6 +116,12 @@ func TestBotLeftGroupMarksExited(t *testing.T) {
 	if err := c.store.SetGroupName(ctx, "g1", "读书分享会", "manual"); err != nil {
 		t.Fatal(err)
 	}
+	// 退群要按 R1 语义清掉该群的会话状态，但绝不能波及别的群。
+	for _, peer := range []string{"g1", "g2"} {
+		if err := c.store.KVSet(ctx, "echo", peer, "state", []byte("v"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	c.Handle(ctx, lifecycleEvent(host.NoticeBotLeftGroup, "g1", "op-1"))
 	waitCalls(t, f, 1)
@@ -129,6 +135,12 @@ func TestBotLeftGroupMarksExited(t *testing.T) {
 	}
 	if g.Mode != store.GroupModeAllow || g.Name != "读书分享会" {
 		t.Fatalf("退群不应清掉名单与名称: %+v", g)
+	}
+	if _, ok, _ := c.store.KVGet(ctx, "echo", "g1", "state"); ok {
+		t.Fatal("退群应清掉该群的会话状态")
+	}
+	if _, ok, _ := c.store.KVGet(ctx, "echo", "g2", "state"); !ok {
+		t.Fatal("退群不应影响别的群")
 	}
 	mustContain(t, lastReply(t, f), "已退出", "读书分享会", "名单仍保留")
 }

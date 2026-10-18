@@ -178,10 +178,10 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 |---|---|---|
 | `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq` | 走频控；超出被动窗口直接失败并告警 |
 | `Sender.SendActive` | 主动消息 | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启 |
-| `Store.KV` | 按插件命名空间隔离的 KV，支持 TTL | 只能读写自己的命名空间 |
+| `KV` / `PeerKV(peer)` | 按插件命名空间隔离的 KV，支持 TTL；`PeerKV` 多一层会话维度 | 只能读写自己的命名空间；`/reset session` 只清 `PeerKV` 写入的部分 |
 | `Store.Query` | 只读、参数化、行数上限 1000 | 不允许 DDL/写操作 |
 | `HTTP.GetJSON` / `PostJSON` | 域名白名单 + 超时 + 重试 + 自动降级 | 未声明域名一律拒绝 |
-| `Scheduler.Register` | 注册 Job（cron 表达式 + 超时） | 仅启动期可注册 |
+| `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
 | `Log` | 结构化日志，自动带 plugin 字段 | 敏感字段脱敏 |
 
 **插件不直接持有 SQLite 连接、不直接持有 WS 连接、不读环境变量取密钥。** 这条边界决定了：插件可单测（Host 用 fake）、可复用（换核心只改 Host 适配层）、可审计（能力清单即权限清单）。
@@ -351,8 +351,10 @@ CREATE TABLE reset_audit (
 CREATE INDEX idx_reset_audit_ts ON reset_audit(created_at);
 
 -- 定时任务（R5）
+-- peer='' 是全局任务；peer=<group_openid> 是该群的 per-peer 实例（§5.1）
 CREATE TABLE jobs (
-  id                   TEXT PRIMARY KEY,   -- <plugin>:<name>
+  id                   TEXT NOT NULL,      -- <plugin>:<name>，不含 peer
+  peer                 TEXT NOT NULL DEFAULT '',
   plugin               TEXT NOT NULL,
   spec                 TEXT NOT NULL,      -- cron
   timezone             TEXT NOT NULL DEFAULT 'Asia/Shanghai',
@@ -361,19 +363,24 @@ CREATE TABLE jobs (
   last_run_at          INTEGER,
   last_status          TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  payload              TEXT
+  payload              TEXT,
+  PRIMARY KEY (id, peer)
 );
 CREATE INDEX idx_jobs_next ON jobs(enabled, next_run_at);
 
+-- peer 让 R2 能清掉「某个群的执行历史」；只靠 job_id join jobs 不够，
+-- 因为 jobs 的实例行将来可能被清理，而历史先于它消失才是对的。
 CREATE TABLE job_runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id      TEXT NOT NULL,
+  peer        TEXT NOT NULL DEFAULT '',
   started_at  INTEGER NOT NULL,
   finished_at INTEGER,
   status      TEXT,                        -- ok | error | timeout | skipped
   error       TEXT
 );
-CREATE INDEX idx_job_runs ON job_runs(job_id, started_at);
+CREATE INDEX idx_job_runs      ON job_runs(job_id, started_at);
+CREATE INDEX idx_job_runs_peer ON job_runs(peer, started_at);
 ```
 
 ### 4.2 7 天留存的实现要点
@@ -426,9 +433,26 @@ PRAGMA wal_autocheckpoint = 1000;   -- 约 4 MB，WAL 不会无限长
 
 ### 5.1 调度模型
 
-- **库表驱动 + 周期扫描**：每 30 s 扫 `jobs WHERE enabled=1 AND next_run_at <= now`。不采用“每任务一个 timer”，原因是设备休眠/时钟跳变时 timer 会漂移，而扫描式每轮都按绝对时间重算，天然自愈。
+- **库表驱动 + 周期扫描**：每 30 s 扫 `jobs WHERE enabled=1 AND next_run_at <= now`（per-peer 行另要求目标群 `left_at=0`，见下）。不采用“每任务一个 timer”，原因是设备休眠/时钟跳变时 timer 会漂移，而扫描式每轮都按绝对时间重算，天然自愈。
 - 单实例假设：由 systemd 保证只有一个进程。**不要在同一台机上起两个实例**，否则任务会双跑（若将来要多实例，需引入 `jobs.locked_by/locked_until` 行锁，当前不实现）。
 - 任务注册来自插件的 `Scheduler.Register`，启动时 upsert 到 `jobs`；插件删除后对应行置 `enabled=0`，不物理删除（保留执行历史）。
+
+**会话维度**（`JobSpec.PerPeer`）。任务有两种形态：
+
+| 形态 | 行 | 执行 | 适用 |
+|---|---|---|---|
+| 全局（默认） | `peer=''`，一行 | 只跑一次，插件自己决定推给谁 | 汇总、巡检、只给管理员发的东西 |
+| per-peer | 每个在群一行 | 每个群各跑一次，`JobSpec.Peer` 填目标群 | “每个群单独推送”的播报、签到提醒 |
+
+per-peer 的行是谁建的？插件拿不到群列表（也不该拿），所以**由核心展开**：
+
+- `Register` 时遍历 `qq_groups WHERE left_at=0` 建行；
+- 入群事件（`GROUP_ADD_ROBOT`）时补建；
+- 首次见到某个群的消息、或它从“已退出”恢复时补建（事件丢失的自愈路径）。
+
+补建用 `InsertJobIfMissing`（`ON CONFLICT DO NOTHING`），不能用 `UpsertJob`：后者会把 `next_run_at` 重算成“下一个 cron 时刻”，群消息越密集，任务越永远轮不到。
+
+**退群不需要写任何 `jobs` 行**。`DueJobs` 对 per-peer 行加一个 `EXISTS (qq_groups.left_at = 0)`，所以停用与恢复完全由群登记表这一个事实源决定。这是刻意的：如果退群也写 `enabled=0`，入群时就分不清该行是“因为退群停的”还是“因为连续失败熔断停的”，恢复动作会顺手把熔断状态清掉。
 
 ### 5.2 错过执行与重启
 
@@ -513,7 +537,7 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 |---|---|---|---|---|
 | R0 重连 `/reset reconnect` | 断开当前 WSS 后**立即**重连（保留 session，走 Resume） | 无 | owner | 60 s |
 | R1 会话 `/reset session` | 清该 peer 的 `plugin_kv`（`peer` 非空的行） | 该群/该用户需重新开始对话 | Bot 管理员 | 10 min |
-| R2 数据 `/reset data` | 清该 peer 的 `messages` + `media`（先删文件后删行） | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
+| R2 数据 `/reset data` | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
 | R3 全量 `/reset all` | 清 `messages` / `media` / `processed_events` / `plugin_kv` / `job_runs` / `identities` | 全库业务数据不可恢复 | 仅 owner + 二次确认 + 短语 | 24 h |
 
 **四条硬约定**（每条都对应一类"重置完机器人就废了"的故障）：
@@ -525,7 +549,7 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 
 **冷却按 `(level, peer)` 计**。R1/R2 换个群不受上一个群的影响——连清两个群是正常运维动作；R0/R3 是全局操作，`peer` 记为 `*`，因此全局冷却。冷却起点取 `reset_audit.finished_at`，只认 `status=done` 的行。
 
-**R2 不碰 `job_runs`**：`jobs` 只有 plugin 维度、没有 peer 列，"某个群的 job_runs"在当前 schema 下无法表达（§8.5 同一个坑）。等 `jobs` 加上 peer 维度后再补。
+**R2 清 `job_runs` 但保留 `jobs`**：执行历史是该群的业务数据，任务定义（含 per-peer 实例行）是配置。这与“R2 不动 `qq_groups`”是同一条边界的两个方向。
 
 ### 8.4 二次确认
 
@@ -550,15 +574,24 @@ R3 在确认码之外还要**短语**：`/reset all <code> 确认`。确认码�
 
 | 事件 | 处理 |
 |---|---|
-| `GROUP_DEL_ROBOT` | 按 **R1 语义**清会话，**不删消息**（可能是管理员误操作或临时调整，7 天到期自然清理）；同时把该群 `jobs` 置 `enabled=0`，避免向已不在的群推送 |
-| `GROUP_ADD_ROBOT` | 恢复该群 `jobs`，并回一条欢迎语（带 `event_id`，属被动回复，不消耗主动额度） |
+| `GROUP_DEL_ROBOT` | 打 `left_at`；按 **R1 语义**清该群的 `plugin_kv`（**不删消息**——可能是管理员误操作或临时调整，7 天到期自然清理）；私聊提醒 |
+| `GROUP_ADD_ROBOT` | 清 `left_at`、重新取群名、补建 per-peer 任务实例、私聊提醒 |
 
-> 兜底：若平台未下发 `GROUP_DEL_ROBOT`（或机器人被静默移除），由两条机制补偿——该群 `jobs` 连续失败触发熔断后自动禁用；消息在 7 天后按期清空。**不要**假设事件一定到达，这是所有基于推送的清理逻辑的共同前提。
+**该群的定时任务不需要单独处理**：`DueJobs` 对 per-peer 行要求 `qq_groups.left_at = 0`，
+所以打标记即停、清标记即恢复。这比在退群时写 `jobs.enabled=0` 更可靠——
+后者会让“因退群停用”与“因连续失败熔断停用”共用一个开关，
+重新入群时恢复任务就会顺手把熔断状态清掉（§5.1）。
 
-**当前实现状态**（2026-10-18）：只做到「退群打 `left_at`、入群清标记并重新取群名、两边都私聊提醒所有者」。
-上表的 R1 会话清理、`jobs` 开关，以及入群的欢迎语**都还没有接**。其中 `jobs` 开关有个结构性问题：
-`jobs` 表只有 `plugin` 维度、没有 peer 维度，所以「该群 jobs」在当前 schema 下无法表达——
-要么加 `peer` 列，要么把语义改成「某插件在某群的推送整体停用」。
+**没有入群欢迎语**：`GROUP_ADD_ROBOT` 的载荷只有 `group_openid` / `op_member_openid` / `timestamp`，
+没有 `msg_id`，无法走被动回复；要发只能走主动消息，会消耗日预算。
+欢迎语不是必要功能，当前不做——所有者收到的私聊提醒已经覆盖了“机器人进了哪个群”。
+
+> 兜底：若平台未下发 `GROUP_DEL_ROBOT`（或机器人被静默移除），由两条机制补偿——
+> 该群 per-peer 任务随熔断自动停用（连续失败 5 次），消息在 7 天后按期清空。
+> 反向也有一条：退群事件丢失后机器人重新说话，`ObserveGroup` 会清掉 `left_at`
+> 并补建任务实例，状态自愈。**不要**假设事件一定到达，这是所有基于推送的清理逻辑的共同前提。
+
+**当前实现状态**（2026-10-18）：表格中的行为已全部接上。唯一没做的是欢迎语，理由见上。
 
 ### 8.6 状态机
 

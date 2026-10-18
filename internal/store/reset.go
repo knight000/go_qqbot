@@ -110,7 +110,7 @@ func scanPaths(rows interface {
 // --- 分级清理 ---
 
 // ClearPeerSession 是 R1：只删该会话私有的插件 KV。
-// 插件级全局键（peer=”）不在此列——它们不属于任何一个会话。
+// 插件级全局键（peer 为空串）不在此列——它们不属于任何一个会话。
 func (db *DB) ClearPeerSession(ctx context.Context, peer string) (int64, error) {
 	if peer == "" {
 		return 0, fmt.Errorf("清理会话状态需要 peer")
@@ -123,8 +123,11 @@ func (db *DB) ClearPeerSession(ctx context.Context, peer string) (int64, error) 
 	return n, nil
 }
 
-// ClearPeerData 是 R2：删该会话的消息与媒体行。
+// ClearPeerData 是 R2：删该会话的消息、媒体行与任务执行历史。
 // 文件由调用方在调用本函数之前删除（先文件、后行）。
+//
+// job_runs 按 peer 删：jobs 的实例行保留（那是任务定义，§8.3 的硬约定），
+// 但"这个群历史上跑过什么"属于该群的业务数据，重置就该一起清掉。
 func (db *DB) ClearPeerData(ctx context.Context, peer string) (ResetCounts, error) {
 	if peer == "" {
 		return ResetCounts{}, fmt.Errorf("清理会话数据需要 peer")
@@ -150,6 +153,12 @@ func (db *DB) ClearPeerData(ctx context.Context, peer string) (ResetCounts, erro
 		return c, fmt.Errorf("清理消息: %w", err)
 	}
 	c.Messages, _ = res.RowsAffected()
+
+	res, err = tx.ExecContext(ctx, `DELETE FROM job_runs WHERE peer = ?`, peer)
+	if err != nil {
+		return c, fmt.Errorf("清理任务记录: %w", err)
+	}
+	c.JobRuns, _ = res.RowsAffected()
 
 	if err := tx.Commit(); err != nil {
 		return c, fmt.Errorf("提交清理事务: %w", err)
@@ -221,6 +230,10 @@ func (db *DB) PeerStats(ctx context.Context, peer string) (ResetCounts, error) {
 		`SELECT COUNT(*) FROM media WHERE message_id IN (SELECT id FROM messages WHERE peer_openid = ?)`,
 		peer).Scan(&c.MediaRows); err != nil {
 		return c, fmt.Errorf("统计 peer 媒体: %w", err)
+	}
+	if err := db.r.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM job_runs WHERE peer = ?`, peer).Scan(&c.JobRuns); err != nil {
+		return c, fmt.Errorf("统计 peer 任务记录: %w", err)
 	}
 	return c, nil
 }

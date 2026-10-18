@@ -149,13 +149,20 @@ func TestResetDataRequiresConfirm(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// 任务执行历史也属于该群的业务数据，预览与执行都必须算进去。
+	for _, ts := range []int64{1, 2} {
+		if err := c.store.RecordJobRun(ctx, "digest:daily", "g1", ts, ts+1, "ok", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	got := resetCall(t, c, f, ctx, "/reset data", "admin-1", host.SceneGroup, "g1")
-	if !strings.Contains(got, "当前消息 2 条") || !strings.Contains(got, "确认") {
+	if !strings.Contains(got, "当前消息 2 条") || !strings.Contains(got, "任务记录 2 条") ||
+		!strings.Contains(got, "确认") {
 		t.Fatalf("预览应给出数量与确认提示，实际: %q", got)
 	}
-	if stats, _ := c.store.PeerStats(ctx, "g1"); stats.Messages != 2 {
-		t.Fatalf("预览阶段不得删除任何数据，实际剩 %d", stats.Messages)
+	if stats, _ := c.store.PeerStats(ctx, "g1"); stats.Messages != 2 || stats.JobRuns != 2 {
+		t.Fatalf("预览阶段不得删除任何数据，实际剩 消息=%d 任务记录=%d", stats.Messages, stats.JobRuns)
 	}
 
 	rec, ok, err := c.store.PendingReset(ctx, "admin-1", "g1", store.ResetLevelData)
@@ -164,11 +171,12 @@ func TestResetDataRequiresConfirm(t *testing.T) {
 	}
 
 	got = resetCall(t, c, f, ctx, "/reset data "+rec.Code, "admin-1", host.SceneGroup, "g1")
-	if !strings.Contains(got, "已清空本会话数据") {
+	if !strings.Contains(got, "已清空本会话数据") || !strings.Contains(got, "任务记录 2 条") {
 		t.Fatalf("确认后应执行，实际: %q", got)
 	}
-	if stats, _ := c.store.PeerStats(ctx, "g1"); stats.Messages != 0 {
-		t.Fatalf("确认后消息应清空，实际剩 %d", stats.Messages)
+	if stats, _ := c.store.PeerStats(ctx, "g1"); stats.Messages != 0 || stats.JobRuns != 0 {
+		t.Fatalf("确认后消息与任务记录应清空，实际剩 消息=%d 任务记录=%d",
+			stats.Messages, stats.JobRuns)
 	}
 
 	// 同一个码不能再用一次。

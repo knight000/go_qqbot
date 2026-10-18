@@ -76,7 +76,11 @@ func scanGroup(sc rowScanner) (Group, error) {
 	return g, nil
 }
 
-// ObserveGroup 登记一次群事件，返回当前登记项以及是否首次见到该群。
+// ObserveGroup 登记一次群事件，返回当前登记项以及状态是否发生了变化。
+//
+// changed = 首次见到该群，或它刚从"已退出"恢复成"在群"。两个时机都需要
+// 调用方做一次性的补建动作（取群名、展开 per-peer 任务实例），
+// 而普通的"又来了一条消息"不应该触发任何额外写入。
 //
 // 只更新 last_seen_at，不碰名称与名单：名称由首次取群名或 /group name 写入，
 // 名单只能由管理员显式修改——收到消息绝不能顺带把群加进白名单。
@@ -97,8 +101,16 @@ func (db *DB) ObserveGroup(ctx context.Context, openid string) (Group, bool, err
 		return Group{}, false, fmt.Errorf("登记群: %w", err)
 	}
 	n, _ := res.RowsAffected()
-	isNew := n > 0
-	if !isNew {
+	changed := n > 0
+	if !changed {
+		// 先看退出标记再更新：更新之后 left_at 已归零，就看不出它曾经是退出的。
+		var wasLeft int64
+		if err := db.r.QueryRowContext(ctx,
+			`SELECT left_at FROM qq_groups WHERE group_openid = ?`, openid).Scan(&wasLeft); err != nil {
+			return Group{}, false, fmt.Errorf("读取群退出标记: %w", err)
+		}
+		changed = wasLeft != 0
+
 		// 活跃时间按分钟粒度更新即可：群消息可能很密集，没必要每条都写一次。
 		// 但 left_at 的清零不受粒度限制——那是个状态修正，写一次就够。
 		if _, err := db.w.ExecContext(ctx,
@@ -118,7 +130,7 @@ func (db *DB) ObserveGroup(ctx context.Context, openid string) (Group, bool, err
 	if !ok {
 		return Group{}, false, fmt.Errorf("群 %s 登记后读取失败", openid)
 	}
-	return g, isNew, nil
+	return g, changed, nil
 }
 
 // GetGroup 读取一个群的登记项。

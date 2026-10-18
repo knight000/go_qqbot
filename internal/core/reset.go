@@ -306,7 +306,8 @@ func (c *Core) runReset(ctx context.Context, spec resetSpec, peer string) (strin
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("消息 %d 条、媒体 %d 个（文件 %d）", counts.Messages, counts.MediaRows, files), nil
+		return fmt.Sprintf("消息 %d 条、媒体 %d 个（文件 %d）、任务记录 %d 条",
+			counts.Messages, counts.MediaRows, files, counts.JobRuns), nil
 
 	case store.ResetLevelAll:
 		counts, files, err := c.clearAllData(ctx)
@@ -390,8 +391,8 @@ func (c *Core) resetPreview(ctx context.Context, spec resetSpec, peer string) (s
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("将清空该会话的消息与媒体文件：当前消息 %d 条、媒体 %d 个",
-			counts.Messages, counts.MediaRows), nil
+		return fmt.Sprintf("将清空该会话的消息、媒体文件与任务记录：当前消息 %d 条、媒体 %d 个、任务记录 %d 条",
+			counts.Messages, counts.MediaRows, counts.JobRuns), nil
 	case store.ResetLevelAll:
 		counts, err := c.store.DataStats(ctx)
 		if err != nil {

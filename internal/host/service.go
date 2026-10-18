@@ -90,7 +90,7 @@ type Service struct {
 	kvBackend KVBackend
 	query     *queryStore
 	http      *httpClient
-	sched     Scheduler
+	sched     *pluginSched
 	log       *slog.Logger
 	sender    Sender
 	admin     AdminBackend
@@ -108,7 +108,7 @@ func NewService(o Options) *Service {
 		kvBackend: o.KV,
 		query:     &queryStore{db: o.DB},
 		http:      &httpClient{raw: o.HTTP, domains: o.Domains},
-		sched:     o.Sched,
+		sched:     &pluginSched{name: o.Name, inner: o.Sched},
 		log:       logger.With("plugin", o.Name),
 		sender:    o.Sender,
 		admin:     o.Admin,
@@ -246,4 +246,23 @@ func (h *httpClient) PostJSON(ctx context.Context, url string, in, out any) erro
 		return err
 	}
 	return c.PostJSON(ctx, url, in, out)
+}
+
+// pluginSched 替插件把 JobSpec.Plugin 填上。
+//
+// 契约写的是"Plugin 字段由 Host 填充"，但此前 Host 只是把核心的
+// Scheduler 原样透传，插件不填就会在注册时被拒。per-peer 任务尤其不能
+// 依赖插件自觉：任务 id 是 <plugin>:<name>，填错会让 DisableJobsExcept
+// 误停用别人的任务。
+type pluginSched struct {
+	name  string
+	inner Scheduler
+}
+
+func (p *pluginSched) Register(spec JobSpec) error {
+	if p.inner == nil {
+		return fmt.Errorf("调度器未初始化")
+	}
+	spec.Plugin = p.name
+	return p.inner.Register(spec)
 }

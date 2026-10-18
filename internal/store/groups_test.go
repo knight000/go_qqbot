@@ -159,7 +159,10 @@ func TestMarkGroupLeftKeepsRecord(t *testing.T) {
 
 // 收到群消息说明机器人在群里——这比任何事件通知都可信。
 // 断线期间丢掉的 GROUP_ADD_ROBOT 就靠这条自愈，否则该群永远算"已退出"，
-// 表现为 /group refresh 永远跳过它。
+// 表现为 /group refresh 永远跳过它、per-peer 任务再也不触发。
+//
+// 恢复必须报告 changed=true：这是一次状态变化，调用方要借这个时机
+// 补建任务实例（新群与恢复群缺的是同一批行）。
 func TestObserveGroupClearsLeftMark(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -170,12 +173,16 @@ func TestObserveGroupClearsLeftMark(t *testing.T) {
 	if err := db.MarkGroupLeft(ctx, "g1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, isNew, err := db.ObserveGroup(ctx, "g1"); err != nil || isNew {
-		t.Fatalf("再次观察不应算新群: isNew=%v err=%v", isNew, err)
+	if _, changed, err := db.ObserveGroup(ctx, "g1"); err != nil || !changed {
+		t.Fatalf("从已退出恢复应报告状态变化: changed=%v err=%v", changed, err)
 	}
 	g, _, _ := db.GetGroup(ctx, "g1")
 	if g.Left() {
 		t.Fatalf("收到消息后应清掉退出标记: %+v", g)
+	}
+	// 第三次观察状态没变，不应再报告变化（否则每条群消息都会触发补建）。
+	if _, changed, err := db.ObserveGroup(ctx, "g1"); err != nil || changed {
+		t.Fatalf("状态未变不应报告变化: changed=%v err=%v", changed, err)
 	}
 }
 

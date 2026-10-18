@@ -13,9 +13,9 @@ import (
 
 // APIVersion 是核心与插件之间的契约版本，不匹配直接拒绝加载。
 //
-// 版本 3：新增全局权限模型（Event.Actor、Command.Permission / DenyReply、
-// Manifest.Permission），事件载荷新增群内角色。
-const APIVersion = "3"
+// 版本 4：任务支持会话维度（JobSpec.PerPeer / JobSpec.Peer），
+// JobRunner 可能收到非空的 Peer。
+const APIVersion = "4"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -146,6 +146,17 @@ type JobSpec struct {
 	Cron    string
 	Timeout time.Duration
 	Payload string
+
+	// PerPeer 让任务按会话展开：核心为每个「机器人当前所在的群」各建一条实例，
+	// 执行时 Peer 填目标群。零值 = 全局任务，只注册一行、只执行一次。
+	//
+	// 展开时机是插件无法自己完成的：它拿不到群列表（也不该拿），
+	// 所以由核心在启动、入群、以及首次见到某个群时补建实例。
+	PerPeer bool
+
+	// Peer 由核心在执行前填好，插件注册时不要设置它：
+	// per-peer 任务指向目标群，全局任务为空。
+	Peer string
 }
 
 // ID 返回 <plugin>:<name>，与 jobs 表主键一致。
