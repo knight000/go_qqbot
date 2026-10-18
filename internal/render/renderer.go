@@ -79,6 +79,10 @@ func (r *Renderer) Markdown(ctx context.Context, src string) (host.Image, error)
 		return host.Image{}, errors.New("render: 字体集未初始化")
 	}
 
+	// 归一化必须在解析**之前**，并且落到 src 本身：下面的布局按 src 的字节
+	// 偏移切源码片段，解析的是哪份文本、切片的就必须是哪份。
+	src = normalizeNewlines(src)
+
 	start := time.Now()
 	doc := markdown.Parser().Parse(text.NewReader([]byte(src)))
 
@@ -117,6 +121,21 @@ func (r *Renderer) Markdown(ctx context.Context, src string) (host.Image, error)
 		"width", int(imgWidth), "height", height,
 		"bytes", buf.Len(), "cost", time.Since(start))
 	return host.ImageFromBytes(buf.Bytes()), nil
+}
+
+// normalizeNewlines 把 CRLF 与单独的 CR 统一成 LF。
+//
+// CommonMark 把 `\n`、`\r\n`、`\r` 都算行结束符，但 goldmark 只认前两种：
+// 单独一个 CR 仍属于同一行。于是 "# 标题\r## 二级标题" 会被当成**一个** ATX
+// 标题，整段落成一行（实测 166 px，而正常多行是 466 px）。QQ 群消息恰好就是
+// 单独 CR（2026-10-19 用 raw 轨迹取证），网关已先归一化过一层，这里再兜一层：
+// Renderer 是 host 能力，也可能被喂 Windows 换行的文件内容。
+func normalizeNewlines(s string) string {
+	if !strings.ContainsRune(s, '\r') {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
 }
 
 func acquireRenderSlot(ctx context.Context) error {
