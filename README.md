@@ -59,14 +59,14 @@ level = "full"   # full（默认）｜plugin
 raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 ```
 
-`-debug` 会顺带把 `log.level` 降到 `debug`，两边细节保持一致。轨迹走 stdout，时间戳在终端里是蓝色；同一套判定也用在日志上（`WARN` 黄、`ERROR` 红），一旦重定向到文件就全部退回纯文本，落盘的内容可以直接 grep。
+`-debug` 会顺带把 `log.level` 降到 `debug`，两边细节保持一致。轨迹走 stdout，时间戳在终端里是青蓝色；同一套判定也用在日志上（`WARN` 黄、`ERROR` 红），一旦重定向到文件就全部退回纯文本，落盘的内容可以直接 grep。
 
 ### `level = "full"`（默认）
 
 ```
 [15:24:01] 收到 群聊消息 · GROUP_AT_MESSAGE_CREATE
 群    ：摸鱼办事处(1ABC...)
-发送者：小明(EF9A...)[admin]
+发送者：[user]小明(EF9A...)[admin]
 peer  ：1ABC...
 事件  ：ROBOT1.0_...
 内容  ：!ping
@@ -76,7 +76,13 @@ peer  ：1ABC...
 内容  ：pong
 ```
 
-`群` 行是 `群名(group_openid)`：名字取自本地 `qq_groups`（平台接口对普通机器人返回 `11253`，多数群没有名字，此时只剩括号里的 openid）；`发送者` 是 `昵称(openid)[群内角色]`，单聊没有昵称与群角色，只显示 `(openid)`。
+`群` 行是 `群名(group_openid)`：名字取自本地 `qq_groups`（平台接口对普通机器人返回 `11253`，多数群没有名字，此时只剩括号里的 openid）。
+
+`发送者` 是 `[Bot 角色]昵称(openid)[群内角色]`：
+
+- 第一个方括号是 `admins` 表里的 Bot 角色（`owner` / `admin` / `user`），全局有效，且在去重与群闸门之前就解析好——被闸门丢掉的消息也看得出是谁发的；
+- 第二个方括号是平台给的群内角色，只有群聊、且载荷里确实带 `member_role` 时才追加；
+- 单聊不下发昵称（`author.username` 实测恒为空串），也没有群角色，所以只剩 `[user](openid)`。
 
 ### `level = "plugin"`
 

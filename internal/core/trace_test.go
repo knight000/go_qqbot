@@ -87,8 +87,8 @@ func TestTraceEndToEnd(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"收到 群聊消息 · GROUP_AT_MESSAGE_CREATE",
-		"群    ：(g1)", // 本地没登记过名字，只留 openid
-		"发送者：小明(u1)[owner]",
+		"群    ：(g1)",              // 本地没登记过名字，只留 openid
+		"发送者：[user]小明(u1)[owner]", // admins 表为空，Bot 角色回落 user
 		"peer  ：g1",
 		"内容  ：!ping",
 		`命中插件 echo · 命令 "!ping" · 优先级 100`,
@@ -276,7 +276,7 @@ func TestTraceReceivedGroupFormat(t *testing.T) {
 	got := out.String()
 	want := "收到 群聊消息 · GROUP_MESSAGE_CREATE\n" +
 		"群    ：测试群(G1)\n" +
-		"发送者：小明(U1)[admin]\n" +
+		"发送者：[user]小明(U1)[admin]\n" +
 		"peer  ：G1\n" +
 		"事件  ：E1\n" +
 		"内容  ：第一行\n        第二行\n"
@@ -304,7 +304,7 @@ func TestTraceReceivedC2CFormat(t *testing.T) {
 
 	got := out.String()
 	want := "收到 单聊消息 · C2C_MESSAGE_CREATE\n" +
-		"发送者：(U1)\n" + // 单聊载荷通常不带昵称，也没有 member_role
+		"发送者：[user](U1)\n" + // 单聊不下发昵称，也没有 member_role
 		"peer  ：U1\n" +
 		"事件  ：E2\n" +
 		"内容  ：你好\n"
@@ -313,6 +313,55 @@ func TestTraceReceivedC2CFormat(t *testing.T) {
 	}
 	if strings.Contains(got, "群    ：") {
 		t.Fatalf("单聊不应出现群名行:\n%s", got)
+	}
+}
+
+// Bot 角色必须出现在"收到"块里：它由 resolveActor 查 admins 表，
+// 而"收到"打印在去重与群闸门之前。回归点——若这次提前解析被挪回去，
+// 管理员的消息会显示成 [user]。
+func TestTraceReceivedShowsBotRole(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out, LevelFull)
+	log := slog.New(slog.DiscardHandler)
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "trace-role.db"))
+	if err != nil {
+		t.Fatalf("打开测试库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+	if err := db.UpsertAdmin(context.Background(), store.Admin{
+		OpenID: "ADMIN-1", Role: string(host.RoleAdmin), SourceScene: "group",
+	}); err != nil {
+		t.Fatalf("写入管理员: %v", err)
+	}
+
+	router, err := NewRouter([]host.Plugin{&replyPlugin{fakePlugin{m: manifest("echo", 100, "!ping")}}})
+	if err != nil {
+		t.Fatalf("装配路由: %v", err)
+	}
+	sender := NewSender(&fakeAPI{}, log, ActivePolicy{})
+	disp := NewDispatcher(router, sender, log, time.Second)
+	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
+
+	c.Handle(context.Background(), &host.Event{
+		ID:       "E-ROLE",
+		Kind:     host.KindMessage,
+		Name:     "GROUP_MESSAGE_CREATE",
+		Scene:    host.SceneGroup,
+		PeerID:   "G1",
+		SenderID: "ADMIN-1",
+		Username: "管理员",
+		MsgID:    "E-ROLE",
+		Content:  "普通文本，不命中任何指令",
+	})
+
+	got := out.String()
+	// 这条消息没有 member_role，所以只该有 Bot 角色，不该出现空的 [—]。
+	if want := "发送者：[admin]管理员(ADMIN-1)\n"; !strings.Contains(got, want) {
+		t.Fatalf("发送者应带 Bot 角色，期望包含 %q，实际:\n%s", want, got)
 	}
 }
 

@@ -31,7 +31,7 @@ const (
 //
 // 与 slog 的分工：slog 面向机器（可检索、可接 journald），Trace 面向人。
 // 只在 [debug].enabled=true 或命令行 -debug 时启用；格式固定，
-// 唯一的上色是时间戳（蓝色），且只写给人看的终端：
+// 唯一的上色是时间戳（青蓝色），且只写给人看的终端：
 // 重定向到文件时输出纯文本，落盘的轨迹里不会混进 ANSI 码。
 // nil 的 Trace 表示关闭，所有方法可安全调用。
 type Trace struct {
@@ -70,7 +70,7 @@ func (t *Trace) emit(s string) {
 	_, _ = io.WriteString(t.w, s)
 }
 
-// stamp 生成行首时间戳 [HH:MM:SS]；终端里整段（含方括号）显示为蓝色。
+// stamp 生成行首时间戳 [HH:MM:SS]；终端里整段（含方括号）显示为青蓝色。
 //
 // 不走 slog 的 time 格式：轨迹是给人扫的，"秒"足够，毫秒在这个粒度上只添噪声。
 func (t *Trace) stamp() string {
@@ -78,7 +78,7 @@ func (t *Trace) stamp() string {
 	if !t.color {
 		return s
 	}
-	return termcolor.Wrap(termcolor.Blue, s)
+	return termcolor.Wrap(termcolor.Cyan, s)
 }
 
 // 固定宽度的字段标签：冒号落在第 6 列（3 个汉字 / 6 个半角），
@@ -134,16 +134,21 @@ func (t *Trace) groupLabel(ctx context.Context, openid string) string {
 	return name + "(" + openid + ")"
 }
 
-// senderLabel 生成 `昵称(member_openid)[群内角色]`。
+// senderLabel 生成 `[Bot 角色]昵称(openid)[群内角色]`。
+//
+// Bot 角色是全局的（admins 表：owner / admin / user），核心会在打印"收到"
+// 之前解析好；零值按 user 显示——没登记过的 openid 本来就没有角色。
 //
 // 括号里是发送者 openid：平台在 author.id / member_openid / user_openid
 // 三处给的是同一个值，Event 已归一为 SenderID，这里直接用它。
 // 昵称与群内角色都可能缺失（单聊没有群角色，且平台在单聊载荷里把
-// author.username 给成空串），缺了就空着，不编造。
+// author.username 给成空串），缺了就空着，不编造；群内角色只在群聊追加。
 func senderLabel(ev *host.Event) string {
-	s := ev.Username + "(" + dash(ev.SenderID) + ")"
-	if ev.Scene == host.SceneGroup {
-		s += "[" + dash(string(ev.Actor.GroupRole)) + "]"
+	s := "[" + ev.Actor.Role.String() + "]" + ev.Username + "(" + dash(ev.SenderID) + ")"
+	// 群内角色只在群聊、且平台确实给了的时候追加：
+	// 单聊没有群，通知类事件也没有 member_role，这两种都不显示这段。
+	if ev.Scene == host.SceneGroup && ev.Actor.GroupRole != host.GroupRoleUnknown {
+		s += "[" + string(ev.Actor.GroupRole) + "]"
 	}
 	return s
 }

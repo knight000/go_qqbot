@@ -11,10 +11,10 @@ import (
 )
 
 // 固定色码。只给日志里"需要一眼看到"的少数位置上色：
-// 轨迹时间戳（蓝）、WARN（黄）、ERROR（红）。不做主题，不做开关。
+// 轨迹时间戳（青蓝）、WARN（黄）、ERROR（红）。不做主题，不做开关。
 const (
 	Reset  = "\x1b[0m"
-	Blue   = "\x1b[34m"
+	Cyan   = "\x1b[36m"
 	Yellow = "\x1b[33m"
 	Red    = "\x1b[31m"
 )
