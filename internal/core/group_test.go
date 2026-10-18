@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // probePlugin 记录自己被路由了多少次；群准入测试只关心"插件有没有收到"。

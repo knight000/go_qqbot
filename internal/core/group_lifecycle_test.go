@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // newLifecycleCore 在最小 Core 上装一个能返回群名的 fakeAPI，

@@ -1,4 +1,4 @@
-module github.com/knight000/qqbot
+module github.com/knight000/go_qqbot
 
 go 1.26.0
 

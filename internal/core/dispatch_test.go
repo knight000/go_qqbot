@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 // stubPlugin 记录被真正调用的次数——权限不足时核心不应该调用它。

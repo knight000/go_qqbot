@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knight000/qqbot/internal/api"
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/api"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // 群准入闸门（ARCHITECTURE.md §8.8）。

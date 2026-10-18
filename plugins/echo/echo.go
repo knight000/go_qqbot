@@ -13,7 +13,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 func init() { host.Register(&Plugin{}) }

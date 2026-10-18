@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 // fakeHost 只填本插件用到的能力（日志与配置）；鉴权已不在插件里，IsAdmin 不参与。

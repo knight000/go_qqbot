@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 const (

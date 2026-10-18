@@ -12,11 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/knight000/qqbot/internal/api"
-	"github.com/knight000/qqbot/internal/config"
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/httpx"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/api"
+	"github.com/knight000/go_qqbot/internal/config"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/httpx"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 type Options struct {
