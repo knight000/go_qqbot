@@ -31,6 +31,7 @@ import (
 	_ "github.com/knight000/go_qqbot/plugins/adminping"
 	_ "github.com/knight000/go_qqbot/plugins/bootnotice"
 	_ "github.com/knight000/go_qqbot/plugins/echo"
+	_ "github.com/knight000/go_qqbot/plugins/md"
 )
 
 func main() {
