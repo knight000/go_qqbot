@@ -26,6 +26,9 @@ type Options struct {
 	Log     *slog.Logger
 	Config  *config.Config
 	Plugins []host.Plugin
+	// Renderer 是插件可见的渲染能力。Core 只认 host.Renderer 接口，
+	// 不 import 任何渲染实现，测试才能注入 fake、不依赖真字体。
+	Renderer host.Renderer
 	// Trace 为 nil 且配置里打开了 debug 时，自动输出到 stdout。
 	// 显式传入只给测试用（可写进 buffer）。
 	Trace *Trace
@@ -39,6 +42,7 @@ type Core struct {
 	log     *slog.Logger
 	plugins []host.Plugin
 	trace   *Trace
+	render  host.Renderer
 
 	sender   *Sender
 	router   *Router
@@ -104,6 +108,7 @@ func New(o Options) (*Core, error) {
 		log:       logger,
 		plugins:   o.Plugins,
 		trace:     trace,
+		render:    o.Renderer,
 		sender:    sender,
 		router:    router,
 		dispatch:  dispatch,
@@ -122,16 +127,17 @@ func (c *Core) Start(ctx context.Context) error {
 	for _, p := range c.plugins {
 		m := p.Manifest()
 		svc := host.NewService(host.Options{
-			Name:    m.Name,
-			Config:  host.Params(c.cfg.Plugin(m.Name)),
-			Sender:  c.sender.ForPlugin(m.Name),
-			KV:      c.store,
-			DB:      c.store,
-			Admin:   adminStore{c.store},
-			HTTP:    c.httpClient(),
-			Sched:   c.sched,
-			Log:     c.log,
-			Domains: m.AllowedDomains,
+			Name:     m.Name,
+			Config:   host.Params(c.cfg.Plugin(m.Name)),
+			Sender:   c.sender.ForPlugin(m.Name),
+			KV:       c.store,
+			DB:       c.store,
+			Admin:    adminStore{c.store},
+			HTTP:     c.httpClient(),
+			Sched:    c.sched,
+			Log:      c.log,
+			Domains:  m.AllowedDomains,
+			Renderer: c.render,
 		})
 		if err := p.Init(ctx, svc); err != nil {
 			return fmt.Errorf("初始化插件 %s: %w", m.Name, err)
