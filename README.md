@@ -10,7 +10,7 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | `internal/httpx` | 统一出站：https 强制、域名白名单、令牌桶、重试与全抖动退避 |
 | `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息 |
 | `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避 |
-| `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC、`/reload` 自重启 |
+| `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC、`/reload` 自重启、`/reset` 分级重置 |
 | `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
 | `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 收件人目录 / 日志） |
@@ -290,8 +290,42 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 
 - `go run ./cmd/bot` 下 `/reload` 只会重启同一份临时构建，**不会重新编译**；回复里会明确提示这一点。
 - 同一进程只接受一条重启请求，重复发只回「已有重启请求」。
-- `/reload` 与 `/reset` 无关：前者重启进程，后者（分级重置数据）尚未实现。
+- `/reload` 与 `/reset` 无关：前者重启进程并重读配置，后者按级别清数据（见下一节）。
 - 插件不能声明 `/reload` / `/restart` 前缀，否则启动即拒绝加载。
+
+## `/reset`：分级重置
+
+四个级别，越往下清得越多、身份要求越高、冷却越长：
+
+| 指令 | 清什么 | 身份 | 冷却 |
+|---|---|---|---|
+| `/reset reconnect`（`r0`） | 不动数据，断开并立即重连（保留 session，走 Resume） | owner | 60 s |
+| `/reset session`（`r1`） | 本会话的插件状态（`plugin_kv` 里 `peer` 非空的行） | Bot 管理员 | 10 min |
+| `/reset data`（`r2`） | 本会话的消息与媒体文件 | Bot 管理员 + 确认码 | 1 h |
+| `/reset all`（`r3`） | 全部业务数据 | owner + 确认码 + 短语 | 24 h |
+| `/reset status` | 各档冷却与最近 5 条记录 | Bot 管理员 | — |
+
+群聊里作用于当前群，私聊里作用于你自己；也可以显式指定 `/reset data <group_openid>`。
+
+```
+管理员：/reset data
+bot   ：将清空该会话的消息与媒体文件：消息 128 条、媒体 6 个，不可恢复。
+        保留：管理员、群名单、网关凭证、任务定义。
+        60 秒内回复 /reset data 481902 确认。
+管理员：/reset data 481902
+bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）。
+        同类重置的冷却到 13:05。
+```
+
+几条容易踩的：
+
+- **预览不删任何东西**。数字取自库（不是估算），确认码绑定发起者 + 目标会话 + 级别：换个会话用不了，换个人代答不了，换个级别也不行。重复发起会顶掉旧码并发新的。
+- **R3 要短语**：`/reset all <code> 确认`。确认码防误触，短语防"看都没看就按了两次"。
+- **任何级别都不动**：`admins`（删了就永久锁在门外）、`bot_state`（token / session / seq）、`qq_groups`（群名单，清掉等于对所有群静默拉黑）。
+- **R2 不碰 `job_runs`**：`jobs` 只有插件维度、没有 peer 列，"某个群的 job_runs"当前表达不出来。
+- **媒体先删文件再删行**；配了 `[media].dir` 时只删该目录内的路径，库里的 `path` 若被写坏，不会变成一次任意文件删除。
+- 冷却按 `(级别, 会话)` 计：连清两个群互不影响；R0/R3 是全局冷却。
+- 每次尝试都进 `reset_audit`，包括失败与未确认就过期的那些。
 
 ## 单实例：同一份数据只能跑一个进程
 
@@ -389,11 +423,11 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 
 ## 尚未实现（下一步）
 
-- 分级重置：`/reset R0–R3`、二次确认码、冷却、`reset_audit` 的完整流程（`/reset` 仍是占位回复；`/grant`、`/revoke` 已由 `/admin add|rm` 取代）；
-- §8.5 的入退群**联动清理**：退群只打 `left_at` 并私聊提醒，没有清 `plugin_kv`、也没有停该群的定时任务；入群没有恢复任务与欢迎语。而且 `jobs` 表只有插件维度、没有群维度，「该群 jobs 置 `enabled=0`」在当前 schema 下表达不出来；
+- §8.5 的入退群**联动清理**：退群只打 `left_at` 并私聊提醒，没有清 `plugin_kv`、也没有停该群的定时任务；入群没有恢复任务与欢迎语。而且 `jobs` 表只有插件维度、没有群维度，「该群 jobs 置 `enabled=0`」在当前 schema 下表达不出来（`/reset data` 也因此不碰 `job_runs`）；
 - 媒体下载与配额淘汰（表结构与 GC 已就位，`media.enabled=false` 时只记 `has_media`）；
 - `plugins/torn`：业务插件与 Torn 限流/缓存分层；
 - 多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
+- `/grant` / `/revoke` 只剩一句重定向回复，功能已被 `/admin add|rm` 取代。
 
 ## 目录
 

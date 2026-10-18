@@ -14,6 +14,21 @@ const adminTableDDL = `CREATE TABLE IF NOT EXISTS admins (
 		created_at   INTEGER NOT NULL
 	)`
 
+// kvTableDDL 同样单独提出来：R1 需要"按 peer 清会话"，
+// 所以主键必须是 (plugin, peer, k)，旧库升级时要重建表。
+//
+// peer 空串 = 插件级全局键（跨会话共享，R1 不动它）；
+// peer 非空 = 该会话私有的键（R1 只删这些）。
+const kvTableDDL = `CREATE TABLE IF NOT EXISTS plugin_kv (
+		plugin     TEXT NOT NULL,
+		peer       TEXT NOT NULL DEFAULT '',
+		k          TEXT NOT NULL,
+		v          BLOB NOT NULL,
+		expires_at INTEGER,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (plugin, peer, k)
+	)`
+
 // schema 与 ARCHITECTURE.md §4.1 完全一致。
 // 迁移采用「幂等 DDL 列表」而非版本号：当前是脚手架，表结构变更时
 // 追加新的 ALTER 语句并留下注释；正式上线后建议切换到版本化迁移。
@@ -58,14 +73,7 @@ var schema = []string{
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_media_sha     ON media(sha256)`,
 	`CREATE INDEX        IF NOT EXISTS idx_media_created ON media(created_at)`,
 
-	`CREATE TABLE IF NOT EXISTS plugin_kv (
-		plugin     TEXT NOT NULL,
-		k          TEXT NOT NULL,
-		v          BLOB NOT NULL,
-		expires_at INTEGER,
-		updated_at INTEGER NOT NULL,
-		PRIMARY KEY (plugin, k)
-	)`,
+	kvTableDDL,
 
 	adminTableDDL,
 
@@ -101,13 +109,24 @@ var schema = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_identities_union ON identities(union_openid)`,
 
+	// reset_audit 记录每一次重置尝试（§8.3）。不可逆操作必须能事后回答
+	// "谁在什么时候按的、按到了哪一级"。
+	//
+	// status: pending（等确认码）/ done / cancelled（被新的同目标请求顶掉）/ expired。
+	// 二次确认走这张表而不是内存 map：进程重启后 pending 仍可核对，
+	// 也不会出现"审计里只有 done、看不到曾有人尝试过"的盲区。
+	// expires_at 只对 pending 有意义（确认码 60 秒）。
 	`CREATE TABLE IF NOT EXISTS reset_audit (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		actor      TEXT NOT NULL,
-		peer       TEXT,
-		level      TEXT NOT NULL,
-		detail     TEXT,
-		created_at INTEGER NOT NULL
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		actor       TEXT NOT NULL,
+		peer        TEXT NOT NULL DEFAULT '',
+		level       TEXT NOT NULL,
+		status      TEXT NOT NULL DEFAULT 'done',
+		code        TEXT NOT NULL DEFAULT '',
+		detail      TEXT,
+		created_at  INTEGER NOT NULL,
+		expires_at  INTEGER NOT NULL DEFAULT 0,
+		finished_at INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_reset_audit_ts ON reset_audit(created_at)`,
 

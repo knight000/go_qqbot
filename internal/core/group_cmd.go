@@ -31,10 +31,11 @@ const groupUsage = `用法：
 func (c *Core) handleGroup(ctx context.Context, ev *host.Event) {
 	fields := strings.Fields(strings.TrimSpace(ev.Content))
 	sub := ""
+	args := []string(nil)
 	if len(fields) > 1 {
 		sub = strings.ToLower(fields[1])
+		args = argsAfter(fields, 2)
 	}
-	args := fields[2:]
 
 	if !c.authorize(ctx, ev).IsBotAdmin() {
 		// 与 /admin 保持一致：明确拒绝比静默更好排障。

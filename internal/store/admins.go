@@ -198,14 +198,5 @@ func (db *DB) AdminTargets(ctx context.Context) ([]AdminTarget, error) {
 	return out, nil
 }
 
-// --- 重置审计 ---
-
-// AuditReset 记录重置尝试。重置不可逆，审计表不可省略（§8.3）。
-func (db *DB) AuditReset(ctx context.Context, actor, peer, level, detail string) error {
-	if _, err := db.w.ExecContext(ctx,
-		`INSERT INTO reset_audit(actor, peer, level, detail, created_at) VALUES(?, ?, ?, ?, ?)`,
-		actor, peer, level, detail, nowUnix()); err != nil {
-		return fmt.Errorf("写入重置审计: %w", err)
-	}
-	return nil
-}
+// 重置审计在 reset.go：那条路径要区分 pending / done，
+// 不能用一个"写完就算数"的 AuditReset 表达。

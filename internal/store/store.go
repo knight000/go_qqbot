@@ -101,6 +101,12 @@ var columnMigrations = []struct {
 	{"admins", "union_openid", "TEXT NOT NULL DEFAULT ''"},
 	// 旧库没有"退出"这个概念，一律补 0（在群），与实际状态一致。
 	{"qq_groups", "left_at", "INTEGER NOT NULL DEFAULT 0"},
+	// 旧 reset_audit 只有 actor/peer/level/detail/created_at：
+	// 旧行都是"已执行"，所以 status 的默认值取 done 而不是 pending。
+	{"reset_audit", "status", "TEXT NOT NULL DEFAULT 'done'"},
+	{"reset_audit", "code", "TEXT NOT NULL DEFAULT ''"},
+	{"reset_audit", "expires_at", "INTEGER NOT NULL DEFAULT 0"},
+	{"reset_audit", "finished_at", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // Migrate 幂等建表并补齐新增列。
@@ -123,6 +129,11 @@ func (db *DB) Migrate(ctx context.Context) error {
 	}
 	// 必须放在补列之后：旧库可能还缺 note / union_openid，先补齐才能完整搬运。
 	if err := migrateLegacyAdmins(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	// 同理：plugin_kv 的主键要从 (plugin,k) 换成 (plugin,peer,k)。
+	if err := migrateLegacyPluginKV(ctx, tx); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -175,6 +186,46 @@ func migrateLegacyAdmins(ctx context.Context, tx *sql.Tx) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE admins_legacy`); err != nil {
 		return fmt.Errorf("删除旧 admins 表: %w", err)
+	}
+	return nil
+}
+
+// migrateLegacyPluginKV 把 plugin_kv 从 (plugin, k) 主键换成 (plugin, peer, k)。
+//
+// 旧键没有 peer 维度，一律搬进 peer=”（插件级全局键）——语义不变：
+// 它们本来就是跨会话共享的。R1 只删 peer 非空的键，所以旧数据不会被误清。
+//
+// SQLite 不支持改主键，只能重建。整个过程一个事务，失败回滚到旧表。
+func migrateLegacyPluginKV(ctx context.Context, tx *sql.Tx) error {
+	// schema 里的 CREATE TABLE IF NOT EXISTS 已经跑过，表一定存在；
+	// 这里仍做一次判断，避免将来有人调整 Migrate 顺序后踩到空表。
+	exists, err := tableExists(ctx, tx, "plugin_kv")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	hasPeer, err := hasColumn(ctx, tx, "plugin_kv", "peer")
+	if err != nil {
+		return err
+	}
+	if hasPeer {
+		return nil // 新库或已迁移
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE plugin_kv RENAME TO plugin_kv_legacy`); err != nil {
+		return fmt.Errorf("重命名旧 plugin_kv 表: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, kvTableDDL); err != nil {
+		return fmt.Errorf("重建 plugin_kv 表: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO plugin_kv(plugin, peer, k, v, expires_at, updated_at)
+		SELECT plugin, '', k, v, expires_at, updated_at FROM plugin_kv_legacy`); err != nil {
+		return fmt.Errorf("搬运旧插件 KV: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE plugin_kv_legacy`); err != nil {
+		return fmt.Errorf("删除旧 plugin_kv 表: %w", err)
 	}
 	return nil
 }

@@ -38,6 +38,13 @@ type Options struct {
 	RawDump func(typ string, raw []byte)
 }
 
+// ErrNotConnected 表示当前没有活着的连接可断——通常是网关正在退避重连。
+var ErrNotConnected = errors.New("网关当前未连接")
+
+// errManualReconnect 是内部信号：这次断开是 /reset reconnect 要求的，
+// 不是链路故障，所以 Run 不该等退避。
+var errManualReconnect = errors.New("手动断开连接")
+
 type Client struct {
 	o  Options
 	lg *slog.Logger
@@ -46,6 +53,9 @@ type Client struct {
 	sessionID string
 	seq       int64
 	lastSave  time.Time
+	conn      *websocket.Conn
+	// manual 由 Reconnect 置位、由读循环消费：连接是被我们自己关掉的。
+	manual bool
 }
 
 func New(o Options) *Client {
@@ -78,6 +88,16 @@ func (c *Client) Run(ctx context.Context) {
 		if ready {
 			backoff = time.Second
 		}
+		// 手动重连（/reset reconnect）：链路本身可能就是好的，
+		// 等退避纯属白等，而且会让"我按了重置但十秒没反应"变成用户困惑。
+		if errors.Is(err, errManualReconnect) {
+			c.lg.Info("已断开当前连接，立即重连（保留 session，走 Resume）")
+			backoff = time.Second
+			if !sleep(ctx, 100*time.Millisecond) {
+				return
+			}
+			continue
+		}
 		c.lg.Warn("连接断开，准备重连", "err", err, "backoff", backoff.String())
 		if !sleep(ctx, jitter(backoff)) {
 			return
@@ -87,6 +107,36 @@ func (c *Client) Run(ctx context.Context) {
 			backoff = 60 * time.Second
 		}
 	}
+}
+
+// Reconnect 主动断开当前连接，由 Run 立刻重连。
+//
+// 它**不动** session_id / seq，所以重连走 Resume，事件不会丢——这是 R0
+// 与 /reload 的分界线：R0 不重启进程、不重读配置，只换一条连接。
+// 没有连接时返回 ErrNotConnected，让调用方能把"网关正在退避"说清楚。
+func (c *Client) Reconnect() error {
+	c.mu.Lock()
+	ws := c.conn
+	if ws == nil {
+		c.mu.Unlock()
+		return ErrNotConnected
+	}
+	c.manual = true
+	c.mu.Unlock()
+
+	// 关闭会让阻塞中的 ws.Read 立刻返回错误，读循环据此退出。
+	_ = ws.Close(websocket.StatusGoingAway, "manual reconnect")
+	return nil
+}
+
+// takeManual 消费"本次断开是手动触发的"标记。每次断开都要消费一次，
+// 否则上一轮的标记会把之后一次真实的链路故障误报成手动重连。
+func (c *Client) takeManual() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.manual
+	c.manual = false
+	return m
 }
 
 func (c *Client) connectOnce(ctx context.Context) (bool, error) {
@@ -109,7 +159,17 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 	}
 	ws.SetReadLimit(1 << 20)
 
+	// 登记当前连接：Reconnect 要能把它关掉。
+	// 同时清掉上一轮残留的手动标记——否则一次真实故障会被误报成"手动重连"。
+	c.mu.Lock()
+	c.conn = ws
+	c.manual = false
+	c.mu.Unlock()
+
 	defer func() {
+		c.mu.Lock()
+		c.conn = nil
+		c.mu.Unlock()
 		_ = ws.Close(websocket.StatusNormalClosure, "")
 		c.saveState(context.Background(), true)
 	}()
@@ -152,6 +212,9 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 	for {
 		typ, data, err := ws.Read(ctx)
 		if err != nil {
+			if c.takeManual() {
+				return ready, errManualReconnect
+			}
 			return ready, c.closeReason(err)
 		}
 		if typ != websocket.MessageText {

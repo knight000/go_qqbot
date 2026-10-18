@@ -74,19 +74,19 @@ func TestKVTTLAndAdmin(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	if err := db.KVSet(ctx, "echo", "k", []byte("v"), 0); err != nil {
+	if err := db.KVSet(ctx, "echo", "", "k", []byte("v"), 0); err != nil {
 		t.Fatal(err)
 	}
-	v, ok, err := db.KVGet(ctx, "echo", "k")
+	v, ok, err := db.KVGet(ctx, "echo", "", "k")
 	if err != nil || !ok || string(v) != "v" {
 		t.Fatalf("KV 读取失败: v=%q ok=%v err=%v", v, ok, err)
 	}
 
-	if err := db.KVSet(ctx, "echo", "exp", []byte("v"), time.Nanosecond); err != nil {
+	if err := db.KVSet(ctx, "echo", "", "exp", []byte("v"), time.Nanosecond); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	if _, ok, _ := db.KVGet(ctx, "echo", "exp"); ok {
+	if _, ok, _ := db.KVGet(ctx, "echo", "", "exp"); ok {
 		t.Fatal("过期 KV 应视为不存在")
 	}
 

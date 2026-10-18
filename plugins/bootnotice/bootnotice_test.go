@@ -67,6 +67,7 @@ func (f *fakeHost) Plugin() string              { return "bootnotice" }
 func (f *fakeHost) Config() host.Params         { return f.cfg }
 func (f *fakeHost) Sender() host.Sender         { return f.sender }
 func (f *fakeHost) KV() host.KV                 { return f.kv }
+func (f *fakeHost) PeerKV(string) host.KV       { return f.kv }
 func (f *fakeHost) Query() host.QueryStore      { return nil }
 func (f *fakeHost) HTTP() host.HTTP             { return nil }
 func (f *fakeHost) Scheduler() host.Scheduler   { return nil }

@@ -17,6 +17,7 @@ func (f *fakeHost) Plugin() string              { return "adminping" }
 func (f *fakeHost) Config() host.Params         { return f.cfg }
 func (f *fakeHost) Sender() host.Sender         { return nil }
 func (f *fakeHost) KV() host.KV                 { return nil }
+func (f *fakeHost) PeerKV(string) host.KV       { return nil }
 func (f *fakeHost) Query() host.QueryStore      { return nil }
 func (f *fakeHost) HTTP() host.HTTP             { return nil }
 func (f *fakeHost) Scheduler() host.Scheduler   { return nil }
