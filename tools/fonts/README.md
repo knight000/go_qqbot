@@ -8,16 +8,48 @@
 
 | 文件 | 体积 | 字重 | 来源 |
 | --- | --- | --- | --- |
-| `NotoSans-400.ttf` | 556 KB | Regular | Google Fonts · Noto Sans 静态实例 |
-| `NotoSans-700.ttf` | 558 KB | Bold | 同上 |
-| `NotoSansSC-400.ttf` | 2.16 MB | Regular | 本机 `NotoSansSC-VF.ttf` 钉在 `wght=400` 后按 GB2312 子集 |
-| `NotoSansSC-700.ttf` | 2.16 MB | Bold | 同上，`wght=700` |
-| `NotoSansMono-400.ttf` | 380 KB | Regular | Google Fonts · Noto Sans Mono 静态实例 |
-| `NotoSansMono-700.ttf` | 379 KB | Bold | 同上 |
-| `OFL.txt` | 4.3 KB | — | SIL Open Font License 1.1 全文（OFL 要求随字体分发） |
+| `NotoSans-400.ttf` | 543 KiB | Regular | Google Fonts · Noto Sans 静态实例 |
+| `NotoSans-700.ttf` | 545 KiB | Bold | 同上 |
+| `NotoSansSC-400.ttf` | 2.16 MiB | Regular | 本机 `NotoSansSC-VF.ttf` 钉在 `wght=400` 后按 GB2312 子集 |
+| `NotoSansSC-700.ttf` | 2.16 MiB | Bold | 同上，`wght=700` |
+| `NotoSansMono-400.ttf` | 380 KiB | Regular | Google Fonts · Noto Sans Mono 静态实例 |
+| `NotoSansMono-700.ttf` | 379 KiB | Bold | 同上 |
+| `OFL.txt` | 4.3 KiB | — | SIL Open Font License 1.1 全文（OFL 要求随字体分发） |
 
-合计 **6.12 MB**，落在 6–8 MB 的目标内。实测二进制体积 17.08 MB → 23.52 MB
-（+6.44 MB，含 `x/image/font/opentype` 的解析器代码约 0.3 MB）。
+合计 **6,415,488 字节 = 6.12 MiB**（十进制 6.42 MB），落在 6–8 MiB 的目标内。
+体积口径统一用 **KiB/MiB = 1024**：
+
+```bash
+# 字体负载（六个 ttf，不含 OFL.txt）
+du -cb internal/render/fonts/*.ttf | tail -1     # 6415488
+```
+
+### 二进制体积怎么量
+
+**口径必须带 `-trimpath -ldflags "-s -w"`**，否则量到的是带调试符号的默认构建，
+两者差约 5.7 MiB，混着比会得出"字体让二进制涨了 6.4 MB 还是 7 MB"这种对不上的数。
+
+```bash
+# “字体落地之前”的基线：0520d98（字体提交）的父提交，此时 internal/render 还不存在
+git worktree add --detach /tmp/rv-base 3710a56
+cd /tmp/rv-base && go build -trimpath -ldflags "-s -w" -o /tmp/bot-base.exe ./cmd/bot
+
+# 当前分支
+go build -trimpath -ldflags "-s -w" -o /tmp/bot.exe ./cmd/bot
+ls -l /tmp/bot-base.exe /tmp/bot.exe
+```
+
+windows/amd64 实测（2026-10-18）：
+
+| 构建口径 | `3710a56`（字体落地前） | 当前分支 | 增量 |
+| --- | --- | --- | --- |
+| `-trimpath -ldflags "-s -w"` | 12,346,368 B（11.77 MiB） | 19,216,896 B（18.33 MiB） | +6.55 MiB |
+| `go build`（默认，未剥离） | 17,905,664 B（17.08 MiB） | 24,931,840 B（23.78 MiB） | +6.70 MiB |
+
+增量比字体负载多出的约 0.4 MiB 是 `x/image/font/opentype` 的解析器代码与
+`internal/render` 本身。旧版文档里的 17.08 → 23.52 MB 是**默认构建**量出来的
+（未剥离，且当时 `internal/render` 还只有骨架），同一口径现在读数是 23.78 MiB，
+所以正文改用上表的可复现数字。
 
 ## 三条前提
 
@@ -81,8 +113,12 @@ python tools/fonts/gen_fonts.py --check    # 只校验已入库产物并打印�
 | `✓` | ✗ | ✓ | ✗ |
 | `✔ ✗ ✘` | ✗ | ✗ | ✗ |
 
-渲染器按 `Sans → SC → Mono` 回退，所以表格里前两行是可用的；`✔ ✗ ✘` 三个
-装饰性符号 Noto 三族都没有，会画成方框（与「生僻字画方框 + warn」同一条策略）。
+渲染器**逐字符**选字形，不是按码位选一族：先试首选族（CJK → SC，其余 → Sans，
+行内代码与代码块 → Mono），再沿 `Sans → SC → Mono` 的回退链接着试（代码路径以
+`Mono` 打头），取第一个**真有该字形**的 face，推进量也取自那个 face。表格前两行
+的符号不在拉丁族的 cmap 里，正是靠这条链才画得出字形而不是方框；代码块里的
+`→ ●` 同理。`✔ ✗ ✘` 三个装饰性符号 Noto 三族都没有，会画成方框（与「生僻字
+画方框 + warn」同一条策略）。
 
 ## 许可
 
