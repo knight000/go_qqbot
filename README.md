@@ -389,8 +389,8 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 
 ## 尚未实现（下一步）
 
-- 第 8 章分级重置：`/reset R0–R3`、二次确认码、冷却、`reset_audit` 的完整流程（`/reset` 仍是占位回复；`/grant`、`/revoke` 已由 `/admin add|rm` 取代）；
-- `GROUP_ADD_ROBOT` / `GROUP_DEL_ROBOT` 的异步清理（§8.5）：事件已解码并入库，尚未接业务动作；
+- 分级重置：`/reset R0–R3`、二次确认码、冷却、`reset_audit` 的完整流程（`/reset` 仍是占位回复；`/grant`、`/revoke` 已由 `/admin add|rm` 取代）；
+- §8.5 的入退群**联动清理**：退群只打 `left_at` 并私聊提醒，没有清 `plugin_kv`、也没有停该群的定时任务；入群没有恢复任务与欢迎语。而且 `jobs` 表只有插件维度、没有群维度，「该群 jobs 置 `enabled=0`」在当前 schema 下表达不出来；
 - 媒体下载与配额淘汰（表结构与 GC 已就位，`media.enabled=false` 时只记 `has_media`）；
 - `plugins/torn`：业务插件与 Torn 限流/缓存分层；
 - 多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
