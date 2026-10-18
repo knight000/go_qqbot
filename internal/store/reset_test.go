@@ -9,7 +9,7 @@ import (
 
 // --- plugin_kv 的 peer 维度 ---
 
-// 同一个 key 在两个 peer 下互不干扰，插件级全局键（peer=”）也不受影响。
+// 同一个 key 在两个 peer 下互不干扰，插件级全局键（peer 为空串）也不受影响。
 // 这条隔离是 R1 能"只清一个会话"的全部前提。
 func TestKVPeerIsolation(t *testing.T) {
 	db := openTestDB(t)
@@ -51,7 +51,7 @@ func TestKVPeerIsolation(t *testing.T) {
 	}
 }
 
-// 旧库的 plugin_kv 主键是 (plugin, k)。Migrate 要重建表并把旧键搬进 peer=”，
+// 旧库的 plugin_kv 主键是 (plugin, k)。Migrate 要重建表并把旧键搬进空 peer，
 // 否则升级后 R1 会把历史全局键当成会话键删掉。
 func TestMigrateLegacyPluginKV(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oldkv.db")
@@ -274,7 +274,7 @@ func TestClearAllDataKeepsConfig(t *testing.T) {
 	if err := db.KVSet(ctx, "echo", "g1", "k", []byte("v"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordJobRun(ctx, "echo:tick", 1, 2, "ok", ""); err != nil {
+	if err := db.RecordJobRun(ctx, "echo:tick", "", 1, 2, "ok", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.MarkEventSeen(ctx, "e1"); err != nil {

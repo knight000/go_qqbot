@@ -30,17 +30,22 @@ func (c *Core) groupAccess(ctx context.Context, ev *host.Event) (bool, store.Gro
 		return true, store.Group{}, ""
 	}
 
-	g, isNew, err := c.store.ObserveGroup(ctx, ev.PeerID)
+	g, changed, err := c.store.ObserveGroup(ctx, ev.PeerID)
 	if err != nil {
 		// 准入判定依赖本地库：读不到就按未放行处理（fail-closed），
 		// 与去重表故障时的策略一致——宁可这条消息不处理。
 		c.log.Error("登记群失败，按未放行处理", "peer", ev.PeerID, "err", err)
 		return false, store.Group{}, "群登记失败"
 	}
-	if isNew && c.cfg.GroupNameFetchEnabled() {
-		// 异步取群名：群信息接口可能很慢，不能挡住第一条消息的路由。
-		// 失败只影响显示名，不影响准入判定。
-		go c.fetchGroupName(ev.PeerID)
+	if changed {
+		// 首次见到该群，或它刚从"已退出"恢复：两个时机都只发生一次，
+		// 正好用来补建 per-peer 任务的群实例。退群事件丢失时这是自愈路径。
+		c.expandPeerJobs(ctx, ev.PeerID)
+		if c.cfg.GroupNameFetchEnabled() {
+			// 异步取群名：群信息接口可能很慢，不能挡住第一条消息的路由。
+			// 失败只影响显示名，不影响准入判定。
+			go c.fetchGroupName(ev.PeerID)
+		}
 	}
 
 	allowed, reason := c.evaluateGroup(g)

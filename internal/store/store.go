@@ -107,6 +107,8 @@ var columnMigrations = []struct {
 	{"reset_audit", "code", "TEXT NOT NULL DEFAULT ''"},
 	{"reset_audit", "expires_at", "INTEGER NOT NULL DEFAULT 0"},
 	{"reset_audit", "finished_at", "INTEGER NOT NULL DEFAULT 0"},
+	// 旧 job_runs 没有会话维度：旧行全部来自全局任务，补 '' 与语义一致。
+	{"job_runs", "peer", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // Migrate 幂等建表并补齐新增列。
@@ -134,6 +136,12 @@ func (db *DB) Migrate(ctx context.Context) error {
 	}
 	// 同理：plugin_kv 的主键要从 (plugin,k) 换成 (plugin,peer,k)。
 	if err := migrateLegacyPluginKV(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	// jobs 的主键要从 id 换成 (id, peer)。必须排在补列之后：
+	// job_runs 的 peer 列与本函数末尾的索引都依赖它。
+	if err := migrateLegacyJobs(ctx, tx); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -192,7 +200,7 @@ func migrateLegacyAdmins(ctx context.Context, tx *sql.Tx) error {
 
 // migrateLegacyPluginKV 把 plugin_kv 从 (plugin, k) 主键换成 (plugin, peer, k)。
 //
-// 旧键没有 peer 维度，一律搬进 peer=”（插件级全局键）——语义不变：
+// 旧键没有 peer 维度，一律搬进空 peer（插件级全局键）——语义不变：
 // 它们本来就是跨会话共享的。R1 只删 peer 非空的键，所以旧数据不会被误清。
 //
 // SQLite 不支持改主键，只能重建。整个过程一个事务，失败回滚到旧表。
@@ -226,6 +234,57 @@ func migrateLegacyPluginKV(ctx context.Context, tx *sql.Tx) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE plugin_kv_legacy`); err != nil {
 		return fmt.Errorf("删除旧 plugin_kv 表: %w", err)
+	}
+	return nil
+}
+
+// migrateLegacyJobs 把 jobs 从 id 单主键重建成 (id, peer) 复合主键，
+// 并补上 job_runs.peer 与它依赖的索引。
+//
+// 旧行没有会话维度，一律搬成空 peer（全局任务）——语义不变：
+// 它们本来就是一个任务只跑一次、由插件自己决定推给谁。
+//
+// 重建表会让原表上的索引随旧表一起消失（SQLite 把索引算作表的一部分），
+// 所以末尾必须把 idx_jobs_next 重新建一遍，否则扫描会退化成全表扫。
+func migrateLegacyJobs(ctx context.Context, tx *sql.Tx) error {
+	exists, err := tableExists(ctx, tx, "jobs")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	hasPeer, err := hasColumn(ctx, tx, "jobs", "peer")
+	if err != nil {
+		return err
+	}
+	if !hasPeer {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE jobs RENAME TO jobs_legacy`); err != nil {
+			return fmt.Errorf("重命名旧 jobs 表: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, jobTableDDL); err != nil {
+			return fmt.Errorf("重建 jobs 表: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO jobs(id, peer, plugin, spec, timezone, enabled, next_run_at,
+			                           last_run_at, last_status, consecutive_failures, payload)
+			SELECT id, '', plugin, spec, timezone, enabled, next_run_at,
+			       last_run_at, last_status, consecutive_failures, payload
+			  FROM jobs_legacy`); err != nil {
+			return fmt.Errorf("搬运旧任务: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE jobs_legacy`); err != nil {
+			return fmt.Errorf("删除旧 jobs 表: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_next ON jobs(enabled, next_run_at)`); err != nil {
+		return fmt.Errorf("重建任务扫描索引: %w", err)
+	}
+	// job_runs.peer 由 columnMigrations 补齐，这里只建它上面的索引。
+	if _, err := tx.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_job_runs_peer ON job_runs(peer, started_at)`); err != nil {
+		return fmt.Errorf("建任务历史 peer 索引: %w", err)
 	}
 	return nil
 }

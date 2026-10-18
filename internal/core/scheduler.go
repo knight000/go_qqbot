@@ -59,6 +59,9 @@ func (s *Scheduler) Bind(plugin string, p host.Plugin) {
 }
 
 // Register 仅启动期可用；之后返回错误，避免运行中动态改表。
+//
+// per-peer 任务在注册时就要给"当前所有在群"各建一行：之后新进来的群
+// 由 ExpandPeer 补，退群的群由 DueJobs 的 left_at 过滤自动停掉。
 func (s *Scheduler) Register(spec host.JobSpec) error {
 	if spec.Plugin == "" || spec.Name == "" {
 		return fmt.Errorf("任务必须有 plugin 与 name")
@@ -73,6 +76,7 @@ func (s *Scheduler) Register(spec host.JobSpec) error {
 	if spec.Timeout <= 0 {
 		spec.Timeout = 60 * time.Second
 	}
+	spec.Peer = ""
 
 	s.mu.Lock()
 	if s.started {
@@ -82,9 +86,30 @@ func (s *Scheduler) Register(spec host.JobSpec) error {
 	s.specs[spec.ID()] = spec
 	s.mu.Unlock()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	next := sched.Next(time.Now().In(s.tz)).Unix()
-	return s.db.UpsertJob(context.Background(), store.Job{
+	if !spec.PerPeer {
+		return s.upsert(ctx, spec, "", next)
+	}
+	// 一个群都没有不是错误：任务照样注册在内存里，新群入群时会补行。
+	groups, err := s.db.ListGroupsInUse(ctx)
+	if err != nil {
+		return fmt.Errorf("展开任务 %s 的群实例: %w", spec.Name, err)
+	}
+	for _, g := range groups {
+		if err := s.upsert(ctx, spec, g.OpenID, next); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Scheduler) upsert(ctx context.Context, spec host.JobSpec, peer string, next int64) error {
+	return s.db.UpsertJob(ctx, store.Job{
 		ID:        spec.ID(),
+		Peer:      peer,
 		Plugin:    spec.Plugin,
 		Spec:      spec.Cron,
 		Timezone:  s.tz.String(),
@@ -93,12 +118,56 @@ func (s *Scheduler) Register(spec host.JobSpec) error {
 	})
 }
 
+// ExpandPeer 给某个群补齐所有 per-peer 任务的实例行，幂等。
+//
+// 调用时机：机器人入群、以及第一次见到某个群的消息（事件丢失时的自愈）。
+// 用的是"只插缺失行"，不会把已跑过任务的 next_run_at 推回下一个 cron 时刻。
+func (s *Scheduler) ExpandPeer(ctx context.Context, peer string) error {
+	if peer == "" {
+		return nil
+	}
+	now := time.Now()
+	s.mu.Lock()
+	specs := make([]host.JobSpec, 0, 4)
+	for _, sp := range s.specs {
+		if sp.PerPeer {
+			specs = append(specs, sp)
+		}
+	}
+	s.mu.Unlock()
+	if len(specs) == 0 {
+		return nil
+	}
+
+	for _, sp := range specs {
+		// 与 Register 用同一个"下一次"算法，保证新入群的群与本批重启后的
+		// 其他群落在同一批时刻上，不会有某个群永远偏移半分钟。
+		next := s.next(sp.Cron, now)
+		if _, err := s.db.InsertJobIfMissing(ctx, store.Job{
+			ID:        sp.ID(),
+			Peer:      peer,
+			Plugin:    sp.Plugin,
+			Spec:      sp.Cron,
+			Timezone:  s.tz.String(),
+			NextRunAt: next,
+			Payload:   sp.Payload,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Scheduler) Start(ctx context.Context) error {
 	s.mu.Lock()
 	s.started = true
 	keep := make([]string, 0, len(s.specs))
-	for id := range s.specs {
+	perPeer := 0
+	for id, sp := range s.specs {
 		keep = append(keep, id)
+		if sp.PerPeer {
+			perPeer++
+		}
 	}
 	s.mu.Unlock()
 
@@ -106,6 +175,9 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	if err := s.db.DisableJobsExcept(ctx, keep); err != nil {
 		return err
 	}
+	// per-peer 数量必须单独打出来：只有一个群都没进时它是 0，
+	// 而"任务已注册"与"任务正跑在 0 个群上"在日志里长得一模一样。
+	s.log.Info("调度器启动", "任务", len(keep), "per_peer", perPeer)
 	go s.loop(ctx)
 	return nil
 }
@@ -143,11 +215,13 @@ func (s *Scheduler) runDue(ctx context.Context) {
 func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 	spec, ok := s.spec(j.ID)
 	if !ok {
-		s.log.Warn("任务已无插件注册，停用", "job", j.ID)
+		s.log.Warn("任务已无插件注册，停用", "job", j.ID, "peer", j.Peer)
 		j.Enabled = false
 		_ = s.db.UpdateJob(ctx, j)
 		return
 	}
+	// per-peer 实例的目标群在注册时并不存在，只能由核心在执行前注入。
+	spec.Peer = j.Peer
 
 	// 停机错过：标记 skipped 并推进，不补跑（避免重启雪崩）
 	if now.Sub(time.Unix(j.NextRunAt, 0)) > missGrace {
@@ -156,14 +230,14 @@ func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 		j.LastStatus = "skipped"
 		j.NextRunAt = next
 		_ = s.db.UpdateJob(ctx, j)
-		_ = s.db.RecordJobRun(ctx, j.ID, now.Unix(), now.Unix(), "skipped", "错过执行窗口")
-		s.log.Warn("任务错过执行窗口，跳过", "job", j.ID)
+		_ = s.db.RecordJobRun(ctx, j.ID, j.Peer, now.Unix(), now.Unix(), "skipped", "错过执行窗口")
+		s.log.Warn("任务错过执行窗口，跳过", "job", j.ID, "peer", j.Peer)
 		return
 	}
 
 	runner := s.runner(j.Plugin)
 	if runner == nil {
-		s.log.Error("插件未实现 JobRunner，停用任务", "job", j.ID)
+		s.log.Error("插件未实现 JobRunner，停用任务", "job", j.ID, "peer", j.Peer)
 		j.Enabled = false
 		_ = s.db.UpdateJob(ctx, j)
 		return
@@ -207,16 +281,16 @@ func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 	if err := s.db.UpdateJob(ctx, j); err != nil {
 		s.log.Error("更新任务状态失败", "job", j.ID, "err", err)
 	}
-	_ = s.db.RecordJobRun(ctx, j.ID, started.Unix(), finished.Unix(), status, errMsg)
+	_ = s.db.RecordJobRun(ctx, j.ID, j.Peer, started.Unix(), finished.Unix(), status, errMsg)
 
 	if err != nil {
-		s.log.Error("任务执行失败", "job", j.ID, "status", status, "failures", failures, "err", err)
+		s.log.Error("任务执行失败", "job", j.ID, "peer", j.Peer, "status", status, "failures", failures, "err", err)
 		if !enabled {
-			s.log.Error("任务连续失败 5 次，已自动停用", "job", j.ID)
+			s.log.Error("任务连续失败 5 次，已自动停用", "job", j.ID, "peer", j.Peer)
 		}
 		return
 	}
-	s.log.Info("任务执行成功", "job", j.ID, "cost", finished.Sub(started).String())
+	s.log.Info("任务执行成功", "job", j.ID, "peer", j.Peer, "cost", finished.Sub(started).String())
 }
 
 func (s *Scheduler) call(ctx context.Context, runner host.JobRunner, spec host.JobSpec) (err error) {
