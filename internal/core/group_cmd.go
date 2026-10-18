@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // /group 是群准入的管理入口，和 /admin 一样属于核心保留指令：

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/knight000/qqbot/internal/api"
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/api"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 // fakeAPI 记录每一次出站，并实现 groupInfoSource。

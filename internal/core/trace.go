@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 // Level 是调试轨迹的详细程度。

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 // Dispatcher 的实现要点（§2.1）：

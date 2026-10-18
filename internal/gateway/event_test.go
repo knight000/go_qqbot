@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knight000/qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/host"
 )
 
 // 真实的群消息事件体（字段取自官方文档示例：id 与 member_openid 同值，

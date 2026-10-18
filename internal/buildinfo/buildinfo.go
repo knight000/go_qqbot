@@ -6,7 +6,7 @@
 //
 // 版本号可用 -ldflags 注入：
 //
-//	go build -ldflags "-X github.com/knight000/qqbot/internal/buildinfo.Version=v1.2.3"
+//	go build -ldflags "-X github.com/knight000/go_qqbot/internal/buildinfo.Version=v1.2.3"
 package buildinfo
 
 import (

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knight000/qqbot/internal/httpx"
+	"github.com/knight000/go_qqbot/internal/httpx"
 )
 
 // StateStore 是 token / session 的持久化接口，由 store.DB 实现。

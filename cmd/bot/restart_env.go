@@ -3,7 +3,7 @@ package main
 import (
 	"strings"
 
-	"github.com/knight000/qqbot/internal/buildinfo"
+	"github.com/knight000/go_qqbot/internal/buildinfo"
 )
 
 // withRestartEnv 复制一份环境变量并写入 QQBOT_RESTARTED=1。

@@ -16,20 +16,20 @@ import (
 	// 不嵌的话 time.LoadLocation("Asia/Shanghai") 会失败并回退 UTC，cron 时间整体偏移 8 小时。
 	_ "time/tzdata"
 
-	"github.com/knight000/qqbot/internal/api"
-	"github.com/knight000/qqbot/internal/buildinfo"
-	"github.com/knight000/qqbot/internal/config"
-	"github.com/knight000/qqbot/internal/core"
-	"github.com/knight000/qqbot/internal/gateway"
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/httpx"
-	"github.com/knight000/qqbot/internal/instance"
-	"github.com/knight000/qqbot/internal/logx"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/api"
+	"github.com/knight000/go_qqbot/internal/buildinfo"
+	"github.com/knight000/go_qqbot/internal/config"
+	"github.com/knight000/go_qqbot/internal/core"
+	"github.com/knight000/go_qqbot/internal/gateway"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/httpx"
+	"github.com/knight000/go_qqbot/internal/instance"
+	"github.com/knight000/go_qqbot/internal/logx"
+	"github.com/knight000/go_qqbot/internal/store"
 
-	_ "github.com/knight000/qqbot/plugins/adminping"
-	_ "github.com/knight000/qqbot/plugins/bootnotice"
-	_ "github.com/knight000/qqbot/plugins/echo"
+	_ "github.com/knight000/go_qqbot/plugins/adminping"
+	_ "github.com/knight000/go_qqbot/plugins/bootnotice"
+	_ "github.com/knight000/go_qqbot/plugins/echo"
 )
 
 func main() {

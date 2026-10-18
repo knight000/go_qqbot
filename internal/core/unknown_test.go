@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 type countingPlugin struct {

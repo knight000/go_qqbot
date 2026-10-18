@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // syncBuffer 让测试在读输出时不必担心调度协程正在写。

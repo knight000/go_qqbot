@@ -24,9 +24,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knight000/qqbot/internal/buildinfo"
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/sysinfo"
+	"github.com/knight000/go_qqbot/internal/buildinfo"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/sysinfo"
 )
 
 func init() { host.Register(&Plugin{}) }

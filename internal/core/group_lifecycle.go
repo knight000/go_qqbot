@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knight000/qqbot/internal/config"
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/config"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // 群生命周期：机器人被拉进群、被移出群。

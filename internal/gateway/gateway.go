@@ -20,9 +20,9 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/knight000/qqbot/internal/api"
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/api"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 type Options struct {

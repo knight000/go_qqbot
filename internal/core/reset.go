@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // /reset 是分级重置（§8.3 / §8.4）。它不是"清空一切"的按钮，

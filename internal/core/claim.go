@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knight000/qqbot/internal/host"
-	"github.com/knight000/qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 // 认领机制（§8.2）：openid 是相对机器人加密的，注册前不可预知，
