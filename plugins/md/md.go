@@ -9,6 +9,12 @@
 //     那时 Handle 已经返回，插件拿不到"渲染失败"，所以"发送时再渲染"这条路不通。
 //  2. 渲染成功就不要再带文本。Reply 同时有 Content 与 Image 时核心会拆成两条消息，
 //     消耗两格被动配额（群 5 次/5 分钟），纯属浪费。
+//
+// 平台事实（2026-10-19 实测）：群消息里的换行到不了插件，平台/客户端在送达前
+// 就把 `\n` 压成了空格。同一段内容两种形态的出图高度是 466 px（换行健在）对
+// 166 px（压成一行），后者整段被当成一个 ATX 标题。这不是渲染器的毛病，
+// 也无法在插件里还原——信息在到达之前就没了。所以在单行里写 `\n`，
+// 由 unescape 还原成真换行。
 package md
 
 import (
@@ -24,7 +30,7 @@ import (
 
 func init() { host.Register(&Plugin{}) }
 
-const usage = "用法：/md <markdown 内容>，例如 /md # 标题"
+const usage = `用法：/md <markdown>，多行用 \n 分隔；例：/md # 标题\n- 一\n- 二`
 
 type Plugin struct {
 	host host.Host
@@ -62,6 +68,10 @@ func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error
 	if src == "" {
 		return &host.Reply{Content: usage}, nil
 	}
+	src = unescape(src)
+	// 平台会吃掉换行，只靠出图高度很难判断"是没换行还是没渲染"。
+	// 这行是排查这类问题的唯一凭据，别删。
+	p.log.Debug("渲染请求", "bytes", len(src), "lines", strings.Count(src, "\n")+1)
 
 	img, err := p.host.Renderer().Markdown(ctx, src)
 	switch {
@@ -103,4 +113,38 @@ func parse(content string) (src string, ok bool) {
 		return "", false
 	}
 	return strings.TrimSpace(rest), true
+}
+
+// unescape 把单行里写的 `\n`、`\t`、`\\` 还原成真字符。
+//
+// 存在的唯一理由就是上面那条平台事实：换行送不进来，多行 markdown 只能在
+// 一行里写 `\n`。代价是 `C:\new` 这类路径会被当成换行——要写反斜杠就打 `\\`。
+// 只认这三个序列，其余 `\x`（`\d`、`\S` 之类正则片段）原样保留：宁可少猜，
+// 也不要把用户正则里的反斜杠吃掉。
+func unescape(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		// UTF-8 的续字节都 ≥ 0x80，不可能等于 '\\'，所以按字节扫不会切坏中文。
+		if s[i] != '\\' || i+1 == len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		switch s[i+1] {
+		case 'n':
+			b.WriteByte('\n')
+		case 't':
+			b.WriteByte('\t')
+		case '\\':
+			b.WriteByte('\\')
+		default:
+			b.WriteByte('\\') // 未知转义：留着，下一轮按普通字符处理
+			continue
+		}
+		i++
+	}
+	return b.String()
 }

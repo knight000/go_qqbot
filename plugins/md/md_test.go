@@ -184,6 +184,41 @@ func TestHandleErrors(t *testing.T) {
 	}
 }
 
+// 平台把换行压成空格之后，多行只能写成 \n。这条测试锁住还原规则，
+// 尤其是"别把正则里的 \d 吃掉"——猜多了比不猜更糟。
+func TestUnescape(t *testing.T) {
+	cases := []struct{ in, want, note string }{
+		{"# 标题", "# 标题", "无反斜杠原样返回"},
+		{`# 标题\n## 二级`, "# 标题\n## 二级", ""},
+		{`a\tb`, "a\tb", ""},
+		{`a\\nb`, `a\nb`, `\\ 是反斜杠，后面那个 n 不是换行`},
+		{`\d+\S`, `\d+\S`, "正则片段不受影响"},
+		{`中文\n换行`, "中文\n换行", "多字节字符不被切坏"},
+		{`尾反斜杠\`, `尾反斜杠\`, "结尾单反斜杠安全"},
+	}
+	for _, c := range cases {
+		if got := unescape(c.in); got != c.want {
+			t.Fatalf("unescape(%q)=%q, want %q（%s）", c.in, got, c.want, c.note)
+		}
+	}
+}
+
+// 端到端：单行里写 \n 必须变成真换行再交给渲染器。
+func TestHandleUnescapesToRealNewlines(t *testing.T) {
+	const fence = "```"
+	var got string
+	p, _ := newPlugin(t, &stubRenderer{img: host.ImageFromBytes([]byte("png")), got: &got})
+
+	in := `/md # 标题\n## 二级标题\n` + fence + `\nimport os\nreturn\n` + fence
+	want := "# 标题\n## 二级标题\n" + fence + "\nimport os\nreturn\n" + fence
+	if _, err := p.Handle(context.Background(), msg(in)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got != want {
+		t.Fatalf("渲染器收到的源码应为多行，实际 %q", got)
+	}
+}
+
 // Manifest 写错会在启动装配期直接拒绝加载（正则编不过、Prefix 与 Pattern 同时为空
 // 或同时非空）。这条测试把"启动才能发现的错"提前到 go test。
 func TestManifestIsLoadable(t *testing.T) {
