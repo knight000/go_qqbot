@@ -245,9 +245,53 @@ Go 项目的长期维护成本几乎全部来自依赖链，而不是自己的�
 | Markdown 解析 | `yuin/goldmark` | 纯 Go、GFM 语义完整（表格/任务列表/删除线）；`go.mod` 只有两行、零 require，是一棵没有分叉的叶子 |
 | 字体光栅 | `golang.org/x/image` | TrueType/OpenType 解析、字形光栅与 `font.Drawer` 都在这里，自写光栅器不现实；间接引入 `x/text` |
 
-后两项服务于**渲染**能力（设计进行中，专节待补）：落地前 `go.mod` 里不会出现它们。
+后两项服务于**渲染**能力（见 §3.8）：落地前 `go.mod` 里不会出现它们。
 
 不上依赖的部分：HTTP 用标准库 `net/http`（连接复用、超时、退避自己写，约 100 行）；测试用标准 `testing` + fake Host，不引 testify。目标 Go 版本 1.22+（`slog` 与循环变量语义修复）。
+
+---
+
+### 3.8 渲染能力（定稿 2026-10-18，ADR-0002）
+
+**定位**：核心提供的通用原语——把一段**文档源**画成**图片**。没有配置开关、没有插件白名单：
+用不用由插件代码决定。渲染失败以错误返回调用方，核心不做降级——降级方式（发原文、拆图、放弃）
+属于插件的内容判断，核心不猜。
+
+**接口**（`host.Renderer`，经 `Host.Renderer()` 获取）：
+
+```go
+type Renderer interface {
+	Markdown(ctx context.Context, src string) (Image, error)
+}
+```
+
+只有一个入口：纯文本就是"没有任何标记的 markdown"。不设 `Text` 方法、不设样式参数——
+将来要扩就加 `MarkdownWith(ctx, src, Style)`，不破坏既有签名。
+
+**管道**：`goldmark`（GFM）→ AST → 自研布局器 → `x/image/font/opentype` 光栅 → PNG → `ImageFromBytes`。
+真正的工作量在布局器：行内折行（含 CJK 禁则）、`margin collapsing`（相邻块取最大而不是相加）、
+按 `font.Metrics` 的 ascent/descent 定位基线、表格两趟列宽分配。
+
+**视觉基线**：GitHub markdown 的 **2× 换算**。颜色取 Primer light token
+（`#f6f8fa` 代码块底、`#d0d7de` 表格与分隔线、`#d8dee4` 标题下划线、`#0969da` 链接、
+`rgba(175,184,193,.2)` 行内代码底）。字号阶梯：正文 32px / 行高 48px、H1 64px、H2 48px、
+H3 40px、代码 27px / 行高 39px。完整数值落在 `internal/render/style.go`，本文不复制一份以免漂移。
+
+**尺寸与并发**：宽 1080 固定（"统一"的前提是所有图同宽）、高上限 4000px、渲染并发 2。
+账：1080×4000 的 RGBA = 17.3 MB，2 并发约 35 MB，加编码缓冲约 50 MB，与 15–40 MB 的基线相加
+仍在 `MemoryMax=256M` 之内；不设限时 16 个 worker 峰值 277 MB，会被内核直接杀掉。
+
+**字体**：`go:embed` 内嵌 `Noto Sans`（拉丁）、`Noto Sans SC`（中文，GB2312 6763 字子集）、
+`Noto Sans Mono`（代码），均取 Regular + Bold 的**静态实例**，随附 OFL 许可文本。
+可变字体用不了——`opentype` 没有 variation axis。
+
+**错误语义**：`ErrTooLarge`（超 4000px，附实际高度，插件可拆图重试）、`ErrTimeout`（ctx 到期）、
+其余错误原样包装返回。缺字**不是错误**：画方框 + warn 日志。
+
+**明确不做**：HTML（需要浏览器内核）、图片 / 内嵌 HTML / 公式 / 脚注 / 语法高亮 / 彩色 emoji
+（未识别语法按纯文本原样输出，不报错）、缓存、页脚时间戳、深色主题、自动分页。
+
+**已知妥协**：代码块内出现中文时列不对齐——等宽与全角不同族，`1 汉字 ≠ 2 半角`。
 
 ---
 
