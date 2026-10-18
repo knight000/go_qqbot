@@ -138,7 +138,8 @@ func (t *Trace) groupLabel(ctx context.Context, openid string) string {
 //
 // 括号里是发送者 openid：平台在 author.id / member_openid / user_openid
 // 三处给的是同一个值，Event 已归一为 SenderID，这里直接用它。
-// 昵称与群内角色都可能缺失（单聊没有群角色），缺了就空着，不编造。
+// 昵称与群内角色都可能缺失（单聊没有群角色，且平台在单聊载荷里把
+// author.username 给成空串），缺了就空着，不编造。
 func senderLabel(ev *host.Event) string {
 	s := ev.Username + "(" + dash(ev.SenderID) + ")"
 	if ev.Scene == host.SceneGroup {
