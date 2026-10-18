@@ -11,6 +11,18 @@ import (
 
 // ---- 列表 ----
 
+// listItemGeom 是一个列表项的块级几何，只用于测试断言缩进不漂移。
+//
+// x 是项起始（标记列的左基准），markerX 是标记实际的绘制起点，y 是项首行
+// 的行盒顶端。兄弟项之间 x 与 markerX 必须完全相等：任何"把行内推进量写回
+// 块级游标"的错误都会让后面的项整体平移。
+type listItemGeom struct {
+	depth   int
+	x       float64
+	markerX float64
+	y       float64
+}
+
 // list 画有序/无序列表。标记单独占一列，内容整体右移 listIndent：这样嵌套
 // 列表只要再右移一次就自然对齐，不需要为每层算一套位置。
 func (l *layout) list(n *ast.List) error {
@@ -35,55 +47,73 @@ func (l *layout) list(n *ast.List) error {
 		if !ok {
 			continue
 		}
-		l.gap(0) // 项间用 liGap，靠 margin collapsing 取较大值
-
 		marker := "•"
 		if n.IsOrdered() {
 			marker = fmt.Sprintf("%d.", idx)
 			idx++
 		}
 		task, checked := itemTask(li)
-		l.drawMarker(marker, task, checked)
-
-		oldX, oldRight := l.x, l.right
-		l.x += listIndent
-
-		for c := li.FirstChild(); c != nil; c = c.NextSibling() {
-			switch v := c.(type) {
-			case *ast.Paragraph:
-				if err := l.textBlock(collectSpans(v, l.src), WeightRegular, fsBody, lhBody); err != nil {
-					return err
-				}
-			case *ast.TextBlock:
-				if err := l.textBlock(collectSpans(v, l.src), WeightRegular, fsBody, lhBody); err != nil {
-					return err
-				}
-			default:
-				if err := l.block(c); err != nil {
-					return err
-				}
-			}
+		if err := l.listItem(li, marker, task, checked); err != nil {
+			return err
 		}
-
-		l.x, l.right = oldX, oldRight
-		l.bottom(liGap)
 	}
 	l.bottom(mbPara)
 	return nil
 }
 
-// drawMarker 在列表内容列之前画标记。有序列表右对齐，数字位数变化时正文
-// 起点不动。
-func (l *layout) drawMarker(marker string, task, checked bool) {
+// listItem 画一个列表项。
+//
+// 缩进的状态边界在这里：进入时记下项起始的块级游标，退出时**无条件**恢复
+// （用 defer，错误提前返回也恢复）。项内的所有推进——标记列、续行悬挂缩进、
+// 嵌套列表再右移一层——都以这个起始值为基准，谁都不许改动块级 x 的"所有权"。
+func (l *layout) listItem(li *ast.ListItem, marker string, task, checked bool) error {
+	l.gap(0) // 项间用 liGap，靠 margin collapsing 取较大值
+	markerX := l.drawMarker(marker, task, checked)
+	if l.items != nil {
+		*l.items = append(*l.items, listItemGeom{
+			depth: l.nested, x: l.x, markerX: markerX, y: l.y,
+		})
+	}
+
+	startX, startRight := l.x, l.right
+	defer func() { l.x, l.right = startX, startRight }()
+
+	l.x += listIndent
+
+	for c := li.FirstChild(); c != nil; c = c.NextSibling() {
+		switch v := c.(type) {
+		case *ast.Paragraph:
+			if err := l.textBlock(collectSpans(v, l.src), WeightRegular, fsBody, lhBody); err != nil {
+				return err
+			}
+		case *ast.TextBlock:
+			if err := l.textBlock(collectSpans(v, l.src), WeightRegular, fsBody, lhBody); err != nil {
+				return err
+			}
+		default:
+			if err := l.block(c); err != nil {
+				return err
+			}
+		}
+	}
+
+	l.bottom(liGap)
+	return nil
+}
+
+// drawMarker 在列表内容列之前画标记，返回标记的绘制起点。有序列表右对齐，
+// 数字位数变化时正文起点不动。
+func (l *layout) drawMarker(marker string, task, checked bool) float64 {
 	mf, err := l.faces.face(FontSans, WeightRegular, fsBody)
 	if err != nil {
-		return
+		return l.x
 	}
 	baseline := baselineOf(mf, l.y, lhBody)
 
 	if task {
-		l.checkbox(l.x+listCheckX, l.y+(lhBody-checkSize)/2, checked)
-		return
+		x := l.x + listCheckX
+		l.checkbox(x, l.y+(lhBody-checkSize)/2, checked)
+		return x
 	}
 
 	w := measureString(mf, marker)
@@ -91,7 +121,9 @@ func (l *layout) drawMarker(marker string, task, checked bool) {
 	if l.muted {
 		col = colMuted
 	}
-	l.text(marker, mf, col, l.x+listIndent-listMarkerGap-w, baseline)
+	x := l.x + listIndent - listMarkerGap - w
+	l.text(marker, mf, col, x, baseline)
+	return x
 }
 
 // itemTask 判断列表项是否是任务项：GFM 把复选框插在第一个段落的最前面。
@@ -150,8 +182,11 @@ func (l *layout) blockquote(n ast.Node) error {
 	l.gap(mbPara)
 	top := l.y
 
-	oldX, oldRight := l.x, l.right
-	l.x += quoteBar + quotePad
+	// 与列表项同样的所有权规则：引用的缩进只属于引用自己的子块，退出时
+	// 无条件还给调用方（错误路径也一样）。
+	startX, startRight := l.x, l.right
+	defer func() { l.x, l.right = startX, startRight }()
+	l.x = startX + quoteBar + quotePad
 
 	// 恢复而不是置 false：嵌套引用退出内层时，外层仍然应当是 muted。
 	prevMuted := l.muted
@@ -166,8 +201,7 @@ func (l *layout) blockquote(n ast.Node) error {
 
 	// 只取内容底部：子块设置的 prevBottom 不能算进竖线。
 	bottom := l.y
-	l.x, l.right = oldX, oldRight
-	l.fillRect(l.x, top, quoteBar, bottom-top, colBorder)
+	l.fillRect(startX, top, quoteBar, bottom-top, colBorder)
 
 	l.bottom(mbPara)
 	return nil
