@@ -158,6 +158,9 @@ func run() (*core.RestartRequest, error) {
 		Handler:    coreImpl.Handle,
 		RawDump:    rawDumpFunc(cfg, coreImpl),
 	})
+	// 先接线再起协程：Handle 里读这个字段与这里写它之间靠 goroutine 启动建立顺序，
+	// 反过来（先起 gw.Run 再 SetReconnector）就是数据竞争。
+	coreImpl.SetReconnector(gw)
 
 	gwDone := make(chan struct{})
 	go func() {

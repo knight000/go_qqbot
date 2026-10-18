@@ -44,6 +44,12 @@ func (c *Core) runGC(ctx context.Context) {
 	if err != nil {
 		c.log.Warn("清理过期 KV 失败", "err", err)
 	}
+	// 未确认的重置请求留在审计表里，但状态要如实变成 expired——
+	// 否则 /reset status 会把一条 60 秒前的请求显示成"待确认"。
+	expN, err := c.store.ExpirePendingResets(ctx)
+	if err != nil {
+		c.log.Warn("过期待确认重置失败", "err", err)
+	}
 
 	if msgN+evtN+runN+mediaN+kvN > 0 {
 		if err := c.store.IncrementalVacuum(ctx); err != nil {
@@ -51,6 +57,9 @@ func (c *Core) runGC(ctx context.Context) {
 		}
 		c.log.Info("GC 完成",
 			"messages", msgN, "events", evtN, "job_runs", runN, "media", mediaN, "kv", kvN)
+	}
+	if expN > 0 {
+		c.log.Debug("已把过期的待确认重置标记为 expired", "count", expN)
 	}
 }
 

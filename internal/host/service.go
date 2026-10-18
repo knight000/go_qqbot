@@ -47,10 +47,12 @@ func Registered() []Plugin {
 
 // KVBackend / QueryBackend 由 store.DB 实现。
 // 用窄接口而不是直接依赖 *store.DB，是为了让 host 可单测、也避免插件间接受影响。
+//
+// peer 为空串表示插件级全局键；非空表示该会话私有的键。
 type KVBackend interface {
-	KVGet(ctx context.Context, plugin, key string) ([]byte, bool, error)
-	KVSet(ctx context.Context, plugin, key string, val []byte, ttl time.Duration) error
-	KVDelete(ctx context.Context, plugin, key string) error
+	KVGet(ctx context.Context, plugin, peer, key string) ([]byte, bool, error)
+	KVSet(ctx context.Context, plugin, peer, key string, val []byte, ttl time.Duration) error
+	KVDelete(ctx context.Context, plugin, peer, key string) error
 }
 
 type QueryBackend interface {
@@ -82,15 +84,16 @@ type Options struct {
 
 // Service 是 Host 的实现，每个插件一份。
 type Service struct {
-	name   string
-	cfg    Params
-	kv     *kvStore
-	query  *queryStore
-	http   *httpClient
-	sched  Scheduler
-	log    *slog.Logger
-	sender Sender
-	admin  AdminBackend
+	name      string
+	cfg       Params
+	kv        *kvStore
+	kvBackend KVBackend
+	query     *queryStore
+	http      *httpClient
+	sched     Scheduler
+	log       *slog.Logger
+	sender    Sender
+	admin     AdminBackend
 }
 
 func NewService(o Options) *Service {
@@ -99,15 +102,16 @@ func NewService(o Options) *Service {
 		logger = slog.Default()
 	}
 	return &Service{
-		name:   o.Name,
-		cfg:    o.Config,
-		kv:     &kvStore{db: o.KV, plugin: o.Name},
-		query:  &queryStore{db: o.DB},
-		http:   &httpClient{raw: o.HTTP, domains: o.Domains},
-		sched:  o.Sched,
-		log:    logger.With("plugin", o.Name),
-		sender: o.Sender,
-		admin:  o.Admin,
+		name:      o.Name,
+		cfg:       o.Config,
+		kv:        &kvStore{db: o.KV, plugin: o.Name},
+		kvBackend: o.KV,
+		query:     &queryStore{db: o.DB},
+		http:      &httpClient{raw: o.HTTP, domains: o.Domains},
+		sched:     o.Sched,
+		log:       logger.With("plugin", o.Name),
+		sender:    o.Sender,
+		admin:     o.Admin,
 	}
 }
 
@@ -119,6 +123,15 @@ func (s *Service) Query() QueryStore    { return s.query }
 func (s *Service) HTTP() HTTP           { return s.http }
 func (s *Service) Scheduler() Scheduler { return s.sched }
 func (s *Service) Log() *slog.Logger    { return s.log }
+
+// PeerKV 返回该会话私有的 KV 命名空间。
+//
+// 与 KV() 的唯一区别是多了 peer 维度：`/reset session` 只清这一部分，
+// 插件级全局键（KV()）不受影响。会话状态请一律写在这里——
+// 写在 KV() 里就等于宣布"重置永远清不掉它"。
+func (s *Service) PeerKV(peer string) KV {
+	return &kvStore{db: s.kvBackend, plugin: s.name, peer: peer}
+}
 
 // IsAdmin 查询 Bot 管理员身份。查不到就是 false（fail-closed）——
 // 权限判定失败绝不能放行。只有后端故障才返回错误，让调用方决定是否静默。
@@ -154,27 +167,28 @@ func (d adminDir) Targets(ctx context.Context) ([]AdminTarget, error) {
 type kvStore struct {
 	db     KVBackend
 	plugin string
+	peer   string
 }
 
 func (k *kvStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if k.db == nil {
 		return nil, false, fmt.Errorf("KV 后端未初始化")
 	}
-	return k.db.KVGet(ctx, k.plugin, key)
+	return k.db.KVGet(ctx, k.plugin, k.peer, key)
 }
 
 func (k *kvStore) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
 	if k.db == nil {
 		return fmt.Errorf("KV 后端未初始化")
 	}
-	return k.db.KVSet(ctx, k.plugin, key, val, ttl)
+	return k.db.KVSet(ctx, k.plugin, k.peer, key, val, ttl)
 }
 
 func (k *kvStore) Delete(ctx context.Context, key string) error {
 	if k.db == nil {
 		return fmt.Errorf("KV 后端未初始化")
 	}
-	return k.db.KVDelete(ctx, k.plugin, key)
+	return k.db.KVDelete(ctx, k.plugin, k.peer, key)
 }
 
 type queryStore struct{ db QueryBackend }

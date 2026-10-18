@@ -57,6 +57,10 @@ type Core struct {
 	// refreshing 保证同一时刻只有一个批量刷新群名的任务：
 	// 两个并发刷新会互相打满 30 QPM 的接口配额，还会把同一批群名写两遍。
 	refreshing atomic.Bool
+
+	// reconnect 是网关的主动重连入口（R0）。由 main 在起网关协程之前注入，
+	// 因此 Handle 读取它与 main 赋值之间天然有 happens-before。
+	reconnect Reconnector
 }
 
 func New(o Options) (*Core, error) {

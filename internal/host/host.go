@@ -168,6 +168,9 @@ type Host interface {
 	Config() Params
 	Sender() Sender
 	KV() KV
+	// PeerKV 返回该会话私有的 KV 命名空间。会话状态写这里，
+	// `/reset session`（R1）才清得掉；写在 KV() 里等于宣布"重置永远清不掉它"。
+	PeerKV(peer string) KV
 	Query() QueryStore
 	HTTP() HTTP
 	Scheduler() Scheduler

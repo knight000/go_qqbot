@@ -73,9 +73,9 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		c.handleReload(ctx, ev)
 		return true
 	case "/reset":
-		// 分级重置由核心独占，插件不得声明；具体逻辑属于下一步实现。
+		// 分级重置由核心独占，插件不得声明（§8.3）。
 		c.trace.CoreCommand(cmd)
-		c.replyText(ctx, ev, "该指令属于核心保留区，当前脚手架版本尚未启用。")
+		c.handleReset(ctx, ev)
 		return true
 	case "/grant", "/revoke":
 		c.trace.CoreCommand(cmd)

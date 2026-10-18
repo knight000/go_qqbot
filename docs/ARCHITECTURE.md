@@ -292,13 +292,17 @@ CREATE UNIQUE INDEX idx_media_sha     ON media(sha256);
 CREATE INDEX        idx_media_created ON media(created_at);
 
 -- 插件 KV（同时充当 Torn 查询缓存，带 TTL）
+-- peer='' 是插件级全局键（跨会话共享）；peer 非空是该会话私有的键。
+-- 分两列而不是靠"键名前缀约定"，是因为约定无法强制：插件漏写一次前缀，
+-- R1 就会静默漏清，而这类问题在低量使用里几乎不会自己暴露。
 CREATE TABLE plugin_kv (
   plugin     TEXT NOT NULL,
+  peer       TEXT NOT NULL DEFAULT '',
   k          TEXT NOT NULL,
   v          BLOB NOT NULL,
   expires_at INTEGER,
   updated_at INTEGER NOT NULL,
-  PRIMARY KEY (plugin, k)
+  PRIMARY KEY (plugin, peer, k)
 );
 
 -- 管理员（Bot 角色：平台群角色只描述群内身份，不参与这里的授权）
@@ -330,13 +334,19 @@ CREATE TABLE qq_groups (
 CREATE INDEX idx_qq_groups_mode ON qq_groups(mode, last_seen_at);
 
 -- 重置审计（不可省略：重置是不可逆操作）
+-- status: pending（等确认码）/ done / cancelled（被同目标的新请求顶掉）/ expired
+-- peer='*' 表示全局操作（R0 / R3），不属于任何会话
 CREATE TABLE reset_audit (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  actor      TEXT NOT NULL,
-  peer       TEXT,
-  level      TEXT NOT NULL,                -- R0 | R1 | R2 | R3
-  detail     TEXT,
-  created_at INTEGER NOT NULL
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor       TEXT NOT NULL,
+  peer        TEXT NOT NULL DEFAULT '',
+  level       TEXT NOT NULL,               -- reconnect | session | data | all
+  status      TEXT NOT NULL DEFAULT 'done',
+  code        TEXT NOT NULL DEFAULT '',    -- 6 位确认码，仅 pending 有效
+  detail      TEXT,                        -- 执行摘要（清了多少行）
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL DEFAULT 0,  -- 确认码过期时间
+  finished_at INTEGER NOT NULL DEFAULT 0   -- 冷却以它为起点
 );
 CREATE INDEX idx_reset_audit_ts ON reset_audit(created_at);
 
@@ -501,25 +511,40 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 
 | 级别 | 语义 | 数据影响 | 所需身份 | 冷却 |
 |---|---|---|---|---|
-| R0 重连 | 主动断开 WSS 后重连（先 Resume，失败再 Identify） | 无 | owner | 60 s |
-| R1 会话 | 清该 peer 的 `plugin_kv` 与各插件会话上下文 | 该群/该用户需重新开始对话 | Bot 管理员 | 10 min |
-| R2 数据 | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
-| R3 全量 | 清空全部业务表（**保留 `admins` 与 `bot_state`**） | 全库不可恢复 | 仅 owner + 二次确认 + 短语输入 | 24 h |
+| R0 重连 `/reset reconnect` | 断开当前 WSS 后**立即**重连（保留 session，走 Resume） | 无 | owner | 60 s |
+| R1 会话 `/reset session` | 清该 peer 的 `plugin_kv`（`peer` 非空的行） | 该群/该用户需重新开始对话 | Bot 管理员 | 10 min |
+| R2 数据 `/reset data` | 清该 peer 的 `messages` + `media`（先删文件后删行） | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
+| R3 全量 `/reset all` | 清 `messages` / `media` / `processed_events` / `plugin_kv` / `job_runs` / `identities` | 全库业务数据不可恢复 | 仅 owner + 二次确认 + 短语 | 24 h |
 
-三条硬约定：
+**四条硬约定**（每条都对应一类"重置完机器人就废了"的故障）：
 
-- **任何级别都不重置 `bot_state`**（token / session / seq）。凭证失效是运维问题，一旦与业务重置混在一起，会出现“重置一下把机器人搞成整天连不上”的连锁故障。
-- **任何级别都不删 `admins`**，否则会把自己永久锁在门外。
+- **任何级别都不重置 `bot_state`**（token / session / seq）。凭证失效是运维问题，一旦与业务重置混在一起，会出现"重置一下把机器人搞成整天连不上"的连锁故障。
+- **任何级别都不删 `admins`**，否则会把自己永久锁在门外，而且它是自举的——没有它连重新授权的入口都没有。
+- **任何级别都不删 `qq_groups`**。群名单是访问控制配置而不是业务数据；清掉它，白名单一开就等于对所有群静默拉黑，与删 `admins` 是同一类事故。
 - R2/R3 必须**先删媒体文件、再删行**。反过来会留下无引用的孤儿文件，只能靠扫盘才能发现，而扫盘在低配机上很贵。
+
+**冷却按 `(level, peer)` 计**。R1/R2 换个群不受上一个群的影响——连清两个群是正常运维动作；R0/R3 是全局操作，`peer` 记为 `*`，因此全局冷却。冷却起点取 `reset_audit.finished_at`，只认 `status=done` 的行。
+
+**R2 不碰 `job_runs`**：`jobs` 只有 plugin 维度、没有 peer 列，"某个群的 job_runs"在当前 schema 下无法表达（§8.5 同一个坑）。等 `jobs` 加上 peer 维度后再补。
 
 ### 8.4 二次确认
 
-不可逆操作走两段式，而不是“回复 Y 确认”——`Y` 太容易误触发，也容易被群内他人抢答：
+不可逆操作走两段式，而不是"回复 Y 确认"——`Y` 太容易误触发，也容易被群内他人抢答：
 
-1. `/reset data` → 不执行，生成 6 位一次性确认码，`reset_audit` 记 `pending`，回复“60 秒内回复 `/reset data <code>`”；
-2. 用户回带码指令 → 校验 `(actor, peer, level)` 绑定 + 冷却 → 执行，audit 置 `done`。
+1. `/reset data` → **不执行**，只回"将清空消息 128 条、媒体 6 个"，生成 6 位一次性确认码，`reset_audit` 记 `pending`，回复"60 秒内回复 `/reset data <code>`"；
+2. 用户回带码指令 → 校验 `(actor, peer, level)` 绑定 + 过期 + 冷却 → 执行，audit 置 `done` 并写入执行摘要。
 
-确认码**绑定发起者与目标 peer**，不能在别的会话复用，也不能被他人代答。
+确认码**绑定发起者、目标 peer 与级别**：换个会话用不了，换个人代答不了，换个级别也不行。
+
+R3 在确认码之外还要**短语**：`/reset all <code> 确认`。确认码防误触，短语防"看都没看就按了两次"。
+
+预览阶段的数字取自库（`PeerStats` / `DataStats`），不是估算——回复里说"消息 128 条"，删完就应该是 128 条。
+
+重复发起同一目标的 `/reset data` 会把上一条 `pending` 置为 `cancelled` 再发新码，而不是拒绝：用户很可能只是没收到上一条消息，拒绝只会让他在同一个死胡同里反复试。
+
+**过期由 GC 收尾**：超过 60 秒未确认的 `pending` 在下一轮 GC 里标成 `expired`。读路径不做这件事，否则"尝试过但没确认"在审计里会连痕迹都不剩。
+
+**命名**：级别同时接受语义名与 R 编号（`/reset r2` 等价于 `/reset data`）。两种写法在文档里本来就并存，硬性二选一只会让另一半文档变成错的。
 
 ### 8.5 平台侧移除的处理
 
@@ -538,16 +563,17 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 ### 8.6 状态机
 
 ```
-              /claim <token>                    /reset <level>
+              /claim <token>                    /reset data|all
   (none) ───────────────────► (owner) ──────────────────────► pending
                                 │                               │
-                    /admin add  │                     code 校验 │ 60 s 超时
+                    /admin add  │                   确认码+短语 │ 60 s 未确认
                                 ▼                               ▼
-                             (admin) ──/admin rm──► (none)  executed / discard
+                             (admin) ──/admin rm──► (none)   done / expired
 ```
 
 权限是**叠加**而非层级替换：owner 隐含全部；admin 除增删管理员外与 owner 相同；
-R0 与 R3 恒为 owner 专属。
+R0 与 R3 恒为 owner 专属。冷却对四级一视同仁：R0/R1 在执行前检查，
+R1/R2 在发码时检查一次、真正执行时再检查一次（中间可能已经过了别人的一次重置）。
 
 ### 8.7 权限模型：三级角色 + 会话内身份
 
@@ -758,5 +784,5 @@ WantedBy=multi-user.target
 
 1. **服务器规格**：`free -m` 实测余量，用于确认 `MemoryMax=256M` 是否与 TS3/WebDAV/aria2 共存无冲突。
 2. **媒体配额具体值**：默认 256 MB 是否合适（按实际群规模与图片开启意愿调整）。
-3. **重置指令的命名与入口**：`/reset` 是否与其他插件的命令前缀冲突（路由在启动期静态校验，命名需一次定好）。
+3. **重置指令的命名与入口**：~~`/reset` 是否与其他插件的命令前缀冲突~~ —— 已定：`/reset` 进核心保留前缀（插件声明同前缀会被拒绝加载），级别同时接受语义名与 `R0–R3` 编号。
 4. 是否需要**对外提供 REST 接口**（当前理解：不需要，全部为出站调用）。若需要，需增加 Nginx/Caddy + 鉴权，并在防火墙开一个入站端口。
