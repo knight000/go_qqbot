@@ -167,6 +167,7 @@ func decodeMessage(t string, scene host.Scene, raw json.RawMessage) (*host.Event
 		Kind:      host.KindMessage,
 		Name:      t,
 		Scene:     scene,
+		Username:  d.Author.Username,
 		UnionID:   d.Author.UnionOpenID,
 		MsgID:     d.ID,
 		Content:   normalizeContent(d.Content),

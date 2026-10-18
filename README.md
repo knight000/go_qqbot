@@ -14,6 +14,8 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
 | `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 收件人目录 / 日志） |
+| `internal/logx` | slog 文本/JSON handler；终端里 `WARN` 黄、`ERROR` 红，JSON 永不上色 |
+| `internal/termcolor` | 是否该上色的唯一判定：真终端才上色，落盘与 journald 保持纯文本 |
 | `internal/sysinfo` | 跨平台资源采集：CPU、内存、进程 RSS、分区容量、目录占用（无 cgo） |
 | `plugins/echo` | 最小插件，演示 Manifest、配置读取、`!ping` / `!echo` |
 | `plugins/adminping` | 仅管理员可用的 `/ping`：运行时长 + CPU / 内存 / 磁盘 / 目录占用 |
@@ -57,41 +59,44 @@ level = "full"   # full（默认）｜plugin
 raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 ```
 
-`-debug` 会顺带把 `log.level` 降到 `debug`，两边细节保持一致。轨迹走 stdout、不加颜色，重定向到文件也能直接读。
+`-debug` 会顺带把 `log.level` 降到 `debug`，两边细节保持一致。轨迹走 stdout，时间戳在终端里是蓝色；同一套判定也用在日志上（`WARN` 黄、`ERROR` 红），一旦重定向到文件就全部退回纯文本，落盘的内容可以直接 grep。
 
 ### `level = "full"`（默认）
 
 ```
-[15:24:01.122] 收到 群聊消息 · GROUP_AT_MESSAGE_CREATE
-    发送者：EF9A533C3FB062916F7FEF7E39DD532D
-    union ：—（平台未下发）
-    peer  ：1ABC...
-    事件  ：ROBOT1.0_...
-    内容  ：!ping
-[15:24:01.123] 命中插件 echo v0.1.0 · 命令 "!ping" · 优先级 100
-[15:24:01.124] 插件 echo 返回回复（1.20ms，4 字）
-[15:24:01.140] 已发送（被动回复 群聊 → 1ABC...） seq=1 · 16ms
-    内容  ：pong
+[15:24:01] 收到 群聊消息 · GROUP_AT_MESSAGE_CREATE
+群    ：摸鱼办事处(1ABC...)
+发送者：小明(EF9A...)[admin]
+peer  ：1ABC...
+事件  ：ROBOT1.0_...
+内容  ：!ping
+[15:24:01] 命中插件 echo v0.1.0 · 命令 "!ping" · 优先级 100
+[15:24:01] 插件 echo 返回回复（1.20ms，4 字）
+[15:24:01] 已发送（被动回复 群聊 → 1ABC...） seq=1 · 16ms
+内容  ：pong
 ```
+
+`群` 行是 `群名(group_openid)`：名字取自本地 `qq_groups`（平台接口对普通机器人返回 `11253`，多数群没有名字，此时只剩括号里的 openid）；`发送者` 是 `昵称(openid)[群内角色]`，单聊没有昵称与群角色，只显示 `(openid)`。
 
 ### `level = "plugin"`
 
-群里绝大多数消息与机器人无关，`full` 会把它们全部打出来。`plugin` 只保留"触发了谁、回了什么"，不输出事件 ID、union、发送者与 peer：
+群里绝大多数消息与机器人无关，`full` 会把它们全部打出来。`plugin` 只保留"触发了谁、回了什么"，不输出事件 ID、发送者与 peer：
 
 ```
-[15:55:28.093] 命中插件 echo v0.1.0 · 命令 "!ping"
-    内容  ：!ping
-[15:55:28.093] 被动回复 群聊 · 16ms
-    内容  ：pong
+[15:55:28] 命中插件 echo v0.1.0 · 命令 "!ping"
+内容  ：!ping
+[15:55:28] 被动回复 群聊 · 16ms
+内容  ：pong
 ```
 
 该级别下未命中消息、重复事件、原始 JSON 一律静默；核心指令（`/claim`、`/admin`、`/reload`）只留一行指令名。`raw = true` 与 `level = "plugin"` 同时配置会被启动校验拒绝。
 
-四个刻意的取舍：
+五个刻意的取舍：
 
 - **在去重之前打印**（`full`）：重复投递也会留一行 `重复事件，已跳过`，排查"为什么没回复"时不会误判成插件没命中；
 - **正文只打一次**：插件返回时只报字数，真正发出去时再打全文，同一条内容不会出现两遍；
 - **`raw = true` 才打原始 JSON**：一条事件可能几十行，只在确认平台字段时打开；
+- **群名读本地登记**：不为了显示名字去调接口，读不到就只留 openid；
 - **分级而不是删信息**：默认仍是 `full`，需要安静时切 `plugin`，不动代码也不改日志格式。
 
 生产环境保持 `enabled = false`：轨迹里有消息正文与 openid，不适合进 journald。

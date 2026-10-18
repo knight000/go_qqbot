@@ -5,14 +5,19 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
 )
+
+// timeStampRe 锁住时间戳的粒度：到秒，不带毫秒。
+var timeStampRe = regexp.MustCompile(`^\[\d{2}:\d{2}:\d{2}\] `)
 
 // syncBuffer 让测试在读输出时不必担心调度协程正在写。
 type syncBuffer struct {
@@ -72,15 +77,18 @@ func TestTraceEndToEnd(t *testing.T) {
 		Scene:    host.SceneGroup,
 		PeerID:   "g1",
 		SenderID: "u1",
+		Username: "小明",
 		MsgID:    "e1",
 		Content:  "!ping",
+		Actor:    host.Principal{GroupRole: host.GroupRoleOwner},
 	})
 
 	waitFor(t, out, "已发送")
 	got := out.String()
 	for _, want := range []string{
 		"收到 群聊消息 · GROUP_AT_MESSAGE_CREATE",
-		"发送者：u1",
+		"群    ：(g1)", // 本地没登记过名字，只留 openid
+		"发送者：小明(u1)[owner]",
 		"peer  ：g1",
 		"内容  ：!ping",
 		`命中插件 echo · 命令 "!ping" · 优先级 100`,
@@ -173,7 +181,7 @@ func TestTracePluginLevelSkipsNoise(t *testing.T) {
 		ID: "e1", Kind: host.KindMessage, Name: "C2C_MESSAGE_CREATE", Scene: host.SceneC2C,
 		PeerID: "u1", SenderID: "u1", UnionID: "union-1", Content: "随便聊聊",
 	}
-	tr.Received(ev)
+	tr.Received(context.Background(), ev)
 	tr.Duplicate(ev)
 	tr.NoMatch(ev)
 	tr.Raw("C2C_MESSAGE_CREATE", []byte(`{"union_openid":"union-1"}`))
@@ -186,7 +194,7 @@ func TestTracePluginLevelSkipsNoise(t *testing.T) {
 func TestNilTraceIsSafe(t *testing.T) {
 	var tr *Trace
 	ev := &host.Event{ID: "e", Kind: host.KindMessage, Name: "C2C_MESSAGE_CREATE", Scene: host.SceneC2C}
-	tr.Received(ev)
+	tr.Received(context.Background(), ev)
 	tr.Duplicate(ev)
 	tr.NoMatch(ev)
 	tr.Hit(Match{}, nil)
@@ -245,4 +253,92 @@ func waitFor(t *testing.T, out *syncBuffer, want string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("等待轨迹中的 %q 超时，当前输出:\n%s", want, out.String())
+}
+
+// 群聊的"收到"块：群名取自本地登记，发送者带昵称与群内角色，
+// 多行正文对齐到正文列（标签占 8 列）。
+func TestTraceReceivedGroupFormat(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out, LevelFull)
+	tr.SetGroupNames(func(_ context.Context, openid string) string {
+		if openid == "G1" {
+			return "测试群"
+		}
+		return ""
+	})
+	tr.Received(context.Background(), &host.Event{
+		ID: "E1", Kind: host.KindMessage, Name: "GROUP_MESSAGE_CREATE",
+		Scene: host.SceneGroup, PeerID: "G1", SenderID: "U1",
+		Username: "小明", Content: "第一行\n第二行",
+		Actor: host.Principal{GroupRole: host.GroupRoleAdmin},
+	})
+
+	got := out.String()
+	want := "收到 群聊消息 · GROUP_MESSAGE_CREATE\n" +
+		"群    ：测试群(G1)\n" +
+		"发送者：小明(U1)[admin]\n" +
+		"peer  ：G1\n" +
+		"事件  ：E1\n" +
+		"内容  ：第一行\n        第二行\n"
+	if !strings.Contains(got, want) {
+		t.Fatalf("群聊轨迹格式不符，期望包含:\n%s\n实际:\n%s", want, got)
+	}
+	// 时间戳是 [HH:MM:SS]，不带毫秒
+	if !timeStampRe.MatchString(got) {
+		t.Fatalf("时间戳应形如 [00:30:40]，实际:\n%s", got)
+	}
+	// 测试用的 buffer 不是终端，不能混进转义码
+	if strings.Contains(got, "\x1b") {
+		t.Fatalf("非终端输出不应带 ANSI 转义:\n%q", got)
+	}
+}
+
+// 单聊没有群名与群内角色：这两段应当整行/整段消失，而不是显示空值。
+func TestTraceReceivedC2CFormat(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out, LevelFull)
+	tr.Received(context.Background(), &host.Event{
+		ID: "E2", Kind: host.KindMessage, Name: "C2C_MESSAGE_CREATE",
+		Scene: host.SceneC2C, PeerID: "U1", SenderID: "U1", Content: "你好",
+	})
+
+	got := out.String()
+	want := "收到 单聊消息 · C2C_MESSAGE_CREATE\n" +
+		"发送者：(U1)\n" + // 单聊载荷通常不带昵称，也没有 member_role
+		"peer  ：U1\n" +
+		"事件  ：E2\n" +
+		"内容  ：你好\n"
+	if !strings.Contains(got, want) {
+		t.Fatalf("单聊轨迹格式不符，期望包含:\n%s\n实际:\n%s", want, got)
+	}
+	if strings.Contains(got, "群    ：") {
+		t.Fatalf("单聊不应出现群名行:\n%s", got)
+	}
+}
+
+// 群名必须来自 qq_groups：接线断了的话"群"行会永远只剩 openid。
+func TestNewWiresGroupNamesToTrace(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "trace-group.db"))
+	if err != nil {
+		t.Fatalf("打开测试库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+	if err := db.SetGroupName(ctx, "G1", "记下来的群名", "manual"); err != nil {
+		t.Fatalf("写群名: %v", err)
+	}
+
+	tr := NewTrace(&syncBuffer{}, LevelFull)
+	if _, err := New(Options{Store: db, Config: &config.Config{}, Trace: tr}); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := tr.groupLabel(ctx, "G1"); got != "记下来的群名(G1)" {
+		t.Fatalf("群名未接到轨迹上，实际 %q", got)
+	}
+	if got := tr.groupLabel(ctx, "G2"); got != "(G2)" {
+		t.Fatalf("未登记的群不应编名字，实际 %q", got)
+	}
 }
