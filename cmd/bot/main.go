@@ -25,6 +25,7 @@ import (
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/instance"
 	"github.com/knight000/go_qqbot/internal/logx"
+	"github.com/knight000/go_qqbot/internal/render"
 	"github.com/knight000/go_qqbot/internal/store"
 
 	_ "github.com/knight000/go_qqbot/plugins/adminping"
@@ -77,6 +78,15 @@ func run() (*core.RestartRequest, error) {
 	}
 	log := logx.New(logLevel, cfg.Log.Format)
 	slog.SetDefault(log)
+
+	// 渲染器在启动期同步解析字体（约 300 ms，全部花在 20 MB 字体的字节码扫描上）。
+	// 字体是 go:embed 进来的，解析失败只可能是二进制本身有问题——带病运行会在
+	// 第一次出图时把错误抛给插件，不如现在直接启动失败。
+	fonts, err := render.LoadFonts()
+	if err != nil {
+		return nil, err
+	}
+	renderer := render.New(fonts, log.With("component", "render"))
 
 	// 单实例锁：必须在打开数据库、连网关之前拿到。
 	//
@@ -135,6 +145,8 @@ func run() (*core.RestartRequest, error) {
 		Log:     log,
 		Config:  cfg,
 		Plugins: host.Registered(),
+		// 核心只认 host.Renderer 接口，不 import 渲染实现包。
+		Renderer: renderer,
 	})
 	if err != nil {
 		return nil, err
