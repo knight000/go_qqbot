@@ -77,6 +77,16 @@ func (c *Client) WithDomains(domains []string) *Client {
 	return &clone
 }
 
+// WithTimeout 返回共享连接池与限流器、只替换整体超时的副本。
+//
+// 用来给大请求体（富媒体上传）放宽窗口：http.Client.Timeout 是硬上限，
+// context 只能收紧不能放宽，所以必须另起一个 Client。
+func (c *Client) WithTimeout(d time.Duration) *Client {
+	clone := *c
+	clone.hc = &http.Client{Transport: c.hc.Transport, Timeout: d}
+	return &clone
+}
+
 // HTTPError 表示非 2xx 响应，调用方可据此区分限流/业务错误。
 type HTTPError struct {
 	Status int

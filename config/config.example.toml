@@ -36,7 +36,9 @@ events   = "72h"    # 覆盖 resume 窗口
 job_runs = "168h"
 
 [media]
-# 默认不接收图片，只记 has_media=1；音视频在入口过滤
+# 保留但未启用：入站媒体（图片/音视频）一律不下载，只记 has_media=1。
+# enabled = true 当前不产生任何效果——发图片走的是出站富媒体上传，
+# 与这一段配置无关（见 README「发图片」）。
 enabled = false
 dir = "./.temp/media"
 max_file_bytes = 8388608

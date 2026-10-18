@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -26,6 +27,13 @@ type fakeAPI struct {
 	errs map[string]error
 	// infoCalls 记录接口调用次数，用于断言"已退出的群不该去刷"。
 	infoCalls int
+
+	// 上传相关：图片走 /files，与发消息分开计数。
+	uploads    int
+	uploadReqs []api.MediaUpload
+	uploadErr  error
+	// failSendAt 让第 N 次（1 起）发消息返回错误，用于验证"第二条失败"。
+	failSendAt int
 }
 
 func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.MessageBody) error {
@@ -33,7 +41,25 @@ func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.
 	defer f.mu.Unlock()
 	f.calls++
 	f.bodies = append(f.bodies, body)
+	if f.failSendAt > 0 && f.calls == f.failSendAt {
+		return errors.New("模拟发送失败")
+	}
 	return nil
+}
+
+func (f *fakeAPI) UploadMedia(ctx context.Context, scene, peer string, up api.MediaUpload) (api.MediaUploadResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.uploads++
+	f.uploadReqs = append(f.uploadReqs, up)
+	if f.uploadErr != nil {
+		return api.MediaUploadResult{}, f.uploadErr
+	}
+	return api.MediaUploadResult{
+		FileUUID: fmt.Sprintf("uuid-%d", f.uploads),
+		FileInfo: fmt.Sprintf("file-info-%d", f.uploads),
+		TTL:      300,
+	}, nil
 }
 
 func (f *fakeAPI) GroupInfo(ctx context.Context, groupOpenID string) (api.GroupInfo, error) {
@@ -66,6 +92,18 @@ func (f *fakeAPI) bodyAt(i int) api.MessageBody {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.bodies[i]
+}
+
+func (f *fakeAPI) uploadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.uploads
+}
+
+func (f *fakeAPI) uploadAt(i int) api.MediaUpload {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.uploadReqs[i]
 }
 
 func (f *fakeAPI) lastBody() (api.MessageBody, bool) {

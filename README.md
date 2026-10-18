@@ -8,9 +8,9 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 |---|---|
 | `internal/config` | TOML 配置、默认值、环境变量覆盖、启动校验 |
 | `internal/httpx` | 统一出站：https 强制、域名白名单、令牌桶、重试与全抖动退避 |
-| `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息 |
+| `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息、富媒体上传（`/files`） |
 | `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避 |
-| `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、调度器、7 天 GC、`/reload` 自重启、`/reset` 分级重置 |
+| `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、发图（上传 + `msg_type=7`）、调度器、7 天 GC、`/reload` 自重启、`/reset` 分级重置 |
 | `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
 | `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 收件人目录 / 日志） |
@@ -324,8 +324,41 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 - **任何级别都不动**：`admins`（删了就永久锁在门外）、`bot_state`（token / session / seq）、`qq_groups`（群名单，清掉等于对所有群静默拉黑）。
 - **R2 清 `job_runs` 但保留 `jobs`**：执行历史是该群的业务数据，任务定义（含 per-peer 实例行）是配置。
 - **媒体先删文件再删行**；配了 `[media].dir` 时只删该目录内的路径，库里的 `path` 若被写坏，不会变成一次任意文件删除。
+  入站媒体不下载（见「发图片」），所以这一步现在扫不到任何行——路径保留，接回下载时不用重写。
 - 冷却按 `(级别, 会话)` 计：连清两个群互不影响；R0/R3 是全局冷却。
 - 每次尝试都进 `reset_audit`，包括失败与未确认就过期的那些。
+
+## 发图片（富媒体）
+
+插件通过 `Reply.Image` 发图，上传与发送都在核心完成——插件不碰平台接口。
+
+```go
+// 本地文件：发送时才读取，所以路径可以稍后才有
+&host.Reply{Image: host.ImageFromFile("/tmp/chart.png")}
+
+// 内存字节：文件名按内容嗅探（png/jpg/gif/webp/bmp）
+&host.Reply{Image: host.ImageFromBytes(png)}
+
+// 公网地址：平台侧下载转存，本机不出站
+&host.Reply{Image: host.ImageFromURL("https://example.com/a.png")}
+```
+
+平台约束直接决定了实现形态：
+
+| 约束 | 后果 |
+|---|---|
+| 先 `POST /v2/{groups\|users}/{openid}/files` 换 `file_info`，再以 `msg_type=7` 发送 | 一次发图 = 两次 HTTP；**上传失败不消耗被动配额**（先上传、后占位） |
+| 一条消息只有一种 `msg_type` | `Content` 与 `Image` 同设时拆成两条：先文本、后图片，**消耗两格被动配额** |
+| `file_data` 是 base64 且 ≤ 5 MB | 超了本地直接报错；分片上传未实现，大图请用 `ImageFromURL` |
+| 群与单聊的上传接口互不通用 | 场景由核心按事件的 `Scene` 决定，插件指定不了 |
+| 图片软限 20 MB，超过降级成文件消息 | 5 MB 直传上限更先撞上，实际走不到这里 |
+
+几处行为细节：
+
+- `Content` 为空时只发图片；`MsgType=7` 却没设 `Image` 会被核心拒绝——发出去只会被平台打回。
+- 图文拆分后第二条失败，错误里带「前 N 条已发出」：别把两条都重发，否则文字会重复。
+- 主动消息同样能发图，但日预算**先扣再上传**（按天计的额度比 5 分钟的被动窗口稀缺）。
+- 上传超时放宽到 30 s：默认的 `[http].timeout=5s` 传不完 5 MB 的 base64 请求体。
 
 ## 单实例：同一份数据只能跑一个进程
 
@@ -423,7 +456,8 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 
 ## 尚未实现（下一步）
 
-- 媒体下载与配额淘汰（表结构与 GC 已就位，`media.enabled=false` 时只记 `has_media`）；
+- 入站媒体下载：**明确不做**（2026-10-18 定案）。机器人只处理文本，图片/音视频只记 `has_media` 与 `msg_type`，不下载、不落盘；`[media]` 配置段与 `media` 表保留但未启用。发图走的是另一条路（见「发图片」）；
+- 分片上传：出站图片只支持 ≤ 5 MB 的 base64 直传，更大的图本地直接拒绝；
 - `plugins/torn`：业务插件与 Torn 限流/缓存分层；
 - 多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
 - `/grant` / `/revoke` 只剩一句重定向回复，功能已被 `/admin add|rm` 取代。
