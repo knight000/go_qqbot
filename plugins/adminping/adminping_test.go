@@ -144,8 +144,9 @@ func TestManifestDeclaresPing(t *testing.T) {
 	if len(m.Commands) != 1 || m.Commands[0].Prefix != "/ping" {
 		t.Fatalf("Commands = %+v, want 单个 /ping", m.Commands)
 	}
-	// /ping 不能被核心保留前缀拦截
-	for _, rp := range []string{"/claim", "/reset", "/grant", "/revoke"} {
+	// /ping 不能被核心保留前缀拦截（清单镜像自 core.reservedPrefixes，
+	// 插件不 import core，只能手工同步；真实清单由 core 的测试保证）
+	for _, rp := range []string{"/claim", "/admin", "/group", "/reset", "/reload", "/restart"} {
 		if strings.HasPrefix(strings.ToLower(m.Commands[0].Prefix), rp) {
 			t.Fatalf("命令 %q 撞上保留前缀 %q", m.Commands[0].Prefix, rp)
 		}

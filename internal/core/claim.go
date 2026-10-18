@@ -77,10 +77,6 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		c.trace.CoreCommand(cmd)
 		c.handleReset(ctx, ev)
 		return true
-	case "/grant", "/revoke":
-		c.trace.CoreCommand(cmd)
-		c.replyText(ctx, ev, "已改为 /admin add <openid> 与 /admin rm <openid>（仅 Bot 所有者）。")
-		return true
 	}
 	return false
 }
