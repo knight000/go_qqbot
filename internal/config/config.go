@@ -69,6 +69,11 @@ type Retention struct {
 	JobRuns  Duration `toml:"job_runs"`
 }
 
+// Media 是入站媒体下载的配置，**保留但未启用**。
+//
+// 入站媒体（图片/音视频）一律不下载，只记 has_media 与 msg_type；
+// 出站发图走富媒体上传，与这段配置无关。字段留着是为了不再改一次配置
+// 结构（以及 /reset 里的媒体文件清理路径），enabled=true 当前无效果。
 type Media struct {
 	Enabled      bool   `toml:"enabled"`
 	Dir          string `toml:"dir"`

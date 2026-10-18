@@ -65,7 +65,9 @@ type Event struct {
 	MsgID    string // 被动回复必须携带
 	Content  string
 	// MsgType 是平台的 message_type：0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用。
-	MsgType   int
+	MsgType int
+	// HasMedia 表示平台载荷里带附件。附件不会被下载（入站媒体不做），
+	// 所以它只是"这条消息有图/音视频"的标记，别指望能读到内容。
 	HasMedia  bool
 	Payload   []byte // 原始 JSON，仅未知事件保留（排查"平台到底推了什么"）
 	Timestamp time.Time
@@ -106,10 +108,63 @@ type AdminDirectory interface {
 	Targets(ctx context.Context) ([]AdminTarget, error)
 }
 
+// ImageSource 说明一张待发图片的内容从哪里来。
+type ImageSource string
+
+const (
+	// ImageSourceNone 是零值：表示"这次不带图片"。
+	ImageSourceNone ImageSource = ""
+	// ImageSourceFile 是本地文件路径，发送时才读取。
+	ImageSourceFile ImageSource = "file"
+	// ImageSourceBytes 是内存里的图片字节。
+	ImageSourceBytes ImageSource = "bytes"
+	// ImageSourceURL 是公网地址，由平台自己下载转存。
+	ImageSourceURL ImageSource = "url"
+)
+
+// Image 是待发送的图片。零值表示没有图片，可直接放进 Reply。
+//
+// 三个构造函数覆盖三种来源，字段不导出——插件拼不出"既给路径又给 URL"
+// 这种非法组合。构造本身不产生 IO：图片在核心真正调用发消息接口之前
+// 才读取与上传，所以 file 来源的路径可以稍后才写出来。
+//
+// 平台限制（官方文档）：二进制直传上限 5 MB，更大的图必须走分片上传；
+// 图片格式为 png/jpg，软限 20 MB（超过会降级成文件消息）。
+type Image struct {
+	src  ImageSource
+	path string
+	data []byte
+	url  string
+}
+
+// ImageFromFile 用本地文件构造图片。
+func ImageFromFile(path string) Image { return Image{src: ImageSourceFile, path: path} }
+
+// ImageFromBytes 用内存字节构造图片。文件名由核心按内容嗅探生成。
+func ImageFromBytes(data []byte) Image { return Image{src: ImageSourceBytes, data: data} }
+
+// ImageFromURL 用公网地址构造图片，要求 http(s) 且可匿名访问——
+// 平台侧下载，本机不需要可达。
+func ImageFromURL(rawURL string) Image { return Image{src: ImageSourceURL, url: rawURL} }
+
+// Valid 报告是否真的有一张图。零值 Image 返回 false。
+func (i Image) Valid() bool { return i.src != ImageSourceNone }
+
+func (i Image) Source() ImageSource { return i.src }
+func (i Image) Path() string        { return i.path }
+func (i Image) Data() []byte        { return i.data }
+func (i Image) URL() string         { return i.url }
+
 // Reply 是插件的唯一出站形态。
+//
+// Content 与 Image 同时设置时，核心拆成两条消息（先文本、后图片）：
+// 平台一条消息只能有一种 msg_type，图文没法合在一条里，代价是消耗两次
+// 被动回复配额（群 5 次/5 分钟、单聊 4 次/小时）。拆分的顺序固定，
+// 第二条失败时核心会在错误里说明"前 N 条已发出"。
 type Reply struct {
 	Content string
 	MsgType int // 0 text / 2 markdown / 7 media
+	Image   Image
 }
 
 // Sender 负责被动回复与主动消息。msg_seq 由核心分配，插件不得自行指定。

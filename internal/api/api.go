@@ -23,8 +23,14 @@ type StateStore interface {
 	PutState(ctx context.Context, key, value string) error
 }
 
+// uploadTimeout 是富媒体上传的整体超时。
+// 官方建议上传接口不少于 5 s，而 5 MB 的 base64 请求体在慢速上行下
+// 5 s 传不完——默认的 [http].timeout 对上传太紧。
+const uploadTimeout = 30 * time.Second
+
 type Client struct {
 	hc       *httpx.Client
+	hcSlow   *httpx.Client // 共享连接池与限流器，只放宽超时
 	base     string
 	tokenURL string
 	appID    string
@@ -52,8 +58,14 @@ func New(o Options) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	hc := o.HTTP
+	var hcSlow *httpx.Client
+	if hc != nil {
+		hcSlow = hc.WithTimeout(uploadTimeout)
+	}
 	return &Client{
-		hc:       o.HTTP,
+		hc:       hc,
+		hcSlow:   hcSlow,
 		base:     strings.TrimRight(o.BaseURL, "/"),
 		tokenURL: o.TokenURL,
 		appID:    o.AppID,
@@ -189,14 +201,25 @@ func (c *Client) Post(ctx context.Context, path string, in, out any) error {
 	return nil
 }
 
-// postOnce 用于发消息：不自动重试，避免非幂等写操作重复发送。
-func (c *Client) postOnce(ctx context.Context, path string, in any) error {
+// postOnce 用于非幂等写操作：不自动重试，避免重复发送。
+func (c *Client) postOnce(ctx context.Context, path string, in, out any) error {
+	return c.postOnceWith(ctx, c.hc, path, in, out)
+}
+
+// postOnceSlow 用更长的超时跑大请求体（富媒体上传）。
+func (c *Client) postOnceSlow(ctx context.Context, path string, in, out any) error {
+	return c.postOnceWith(ctx, c.hcSlow, path, in, out)
+}
+
+// postOnceWith 是两者共用的实现。重试次数恒为 0：非幂等写操作在超时后
+// 可能已经落地，重试等于重复发送或重复上传。
+func (c *Client) postOnceWith(ctx context.Context, hc *httpx.Client, path string, in, out any) error {
 	tok, err := c.AccessToken(ctx)
 	if err != nil {
 		return err
 	}
 	h := map[string]string{"Authorization": "QQBot " + tok}
-	if err := c.hc.PostJSONOnce(ctx, c.base+path, h, in, nil); err != nil {
+	if err := hc.PostJSONOnce(ctx, c.base+path, h, in, out); err != nil {
 		if httpx.IsStatus(err, 401) {
 			c.InvalidateToken()
 		}
@@ -205,13 +228,101 @@ func (c *Client) postOnce(ctx context.Context, path string, in any) error {
 	return nil
 }
 
+// scenePath 拼按场景分类的接口路径：群走 /v2/groups/，单聊走 /v2/users/。
+//
+// 群与单聊的接口在平台侧完全隔离（连富媒体上传的文件都不通用），
+// 所以路径只能由场景决定，不能靠调用方传。
+func scenePath(scene, peer, suffix string) (string, error) {
+	switch scene {
+	case "group":
+		return "/v2/groups/" + url.PathEscape(peer) + "/" + suffix, nil
+	case "c2c":
+		return "/v2/users/" + url.PathEscape(peer) + "/" + suffix, nil
+	default:
+		return "", fmt.Errorf("暂不支持的场景: %s", scene)
+	}
+}
+
+// MediaRef 引用一次富媒体上传的结果，值是上传接口返回的 file_info。
+// 平台要求原样透传，不要尝试解析或改写。
+type MediaRef struct {
+	FileInfo string `json:"file_info"`
+}
+
 // MessageBody 是发送消息的请求体。
 type MessageBody struct {
-	Content string `json:"content"`
-	MsgType int    `json:"msg_type"`
-	MsgID   string `json:"msg_id,omitempty"`
-	MsgSeq  int    `json:"msg_seq,omitempty"`
-	Image   string `json:"image,omitempty"`
+	Content string    `json:"content"`
+	MsgType int       `json:"msg_type"`
+	MsgID   string    `json:"msg_id,omitempty"`
+	MsgSeq  int       `json:"msg_seq,omitempty"`
+	Media   *MediaRef `json:"media,omitempty"`
+}
+
+// 富媒体文件类型（file_type）。
+const (
+	MediaImage = 1 // png/jpg，软限 20 MB
+	MediaVideo = 2 // 仅 mp4
+	MediaVoice = 3 // silk/mp3/wav/ogg
+	MediaFile  = 4 // 任意格式，按文件卡片展示
+)
+
+// MaxInlineMediaBytes 是「二进制直传」的原始字节上限。
+//
+// 平台规定 file_data 不超过 5 MB，超过必须走分片上传
+// （upload_prepare → 逐片 PUT → upload_part_finish → 携带 upload_id 合并）。
+// 分片上传当前未实现，所以调用方要在此之前把大小判掉。
+const MaxInlineMediaBytes = 5 << 20
+
+// MediaUpload 是 POST /v2/{groups|users}/{openid}/files 的请求体。
+//
+// URL 与 FileData 互斥：前者由平台下载转存，后者是 base64 编码的原始字节。
+// SrvSendMsg 恒为 false——上传与发送分成两步，发送才能复用核心的频控、
+// msg_seq 与「一条消息一种 msg_type」的约束。
+type MediaUpload struct {
+	FileType   int    `json:"file_type"`
+	URL        string `json:"url,omitempty"`
+	FileData   string `json:"file_data,omitempty"`
+	FileName   string `json:"file_name,omitempty"`
+	SrvSendMsg bool   `json:"srv_send_msg"`
+}
+
+// MediaUploadResult 是上传接口的响应。TTL 为 file_info 的有效期（秒），
+// 0 表示长期有效；过期后必须重新上传。
+type MediaUploadResult struct {
+	FileUUID string `json:"file_uuid"`
+	FileInfo string `json:"file_info"`
+	TTL      int    `json:"ttl"`
+}
+
+// UploadMedia 上传富媒体，返回可用于发消息的 file_info。
+func (c *Client) UploadMedia(ctx context.Context, scene, peer string, up MediaUpload) (MediaUploadResult, error) {
+	path, err := scenePath(scene, peer, "files")
+	if err != nil {
+		return MediaUploadResult{}, err
+	}
+	if up.FileType == 0 {
+		up.FileType = MediaImage
+	}
+	var out MediaUploadResult
+	// 上传不重试：每次重试都会多存一份，占用平台每日上传容量。
+	// 单次超时用更长的窗口——5 s 的默认值不够传完 5 MB。
+	if err := c.postOnceSlow(ctx, path, up, &out); err != nil {
+		return MediaUploadResult{}, err
+	}
+	if out.FileInfo == "" {
+		return out, fmt.Errorf("上传响应缺少 file_info")
+	}
+	return out, nil
+}
+
+// SendMessage 按场景分发到群/单聊接口。
+// 频道场景当前未实现（ARCHITECTURE.md D3：频道作为可选扩展）。
+func (c *Client) SendMessage(ctx context.Context, scene, peer string, body MessageBody) error {
+	path, err := scenePath(scene, peer, "messages")
+	if err != nil {
+		return err
+	}
+	return c.postOnce(ctx, path, body, nil)
 }
 
 // GroupInfo 是 GET /v2/groups/{group_openid}/info 的响应。
@@ -235,19 +346,4 @@ func (c *Client) GroupInfo(ctx context.Context, groupOpenID string) (GroupInfo, 
 	}
 	err := c.Get(ctx, "/v2/groups/"+url.PathEscape(groupOpenID)+"/info", &out)
 	return out, err
-}
-
-// SendMessage 按场景分发到群/单聊接口。
-// 频道场景当前未实现（ARCHITECTURE.md D3：频道作为可选扩展）。
-func (c *Client) SendMessage(ctx context.Context, scene, peer string, body MessageBody) error {
-	var path string
-	switch scene {
-	case "group":
-		path = "/v2/groups/" + url.PathEscape(peer) + "/messages"
-	case "c2c":
-		path = "/v2/users/" + url.PathEscape(peer) + "/messages"
-	default:
-		return fmt.Errorf("暂不支持的消息场景: %s", scene)
-	}
-	return c.postOnce(ctx, path, body)
 }
