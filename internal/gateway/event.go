@@ -169,7 +169,7 @@ func decodeMessage(t string, scene host.Scene, raw json.RawMessage) (*host.Event
 		Scene:     scene,
 		UnionID:   d.Author.UnionOpenID,
 		MsgID:     d.ID,
-		Content:   strings.TrimSpace(d.Content),
+		Content:   normalizeContent(d.Content),
 		MsgType:   d.MsgType,
 		HasMedia:  len(d.Attachments) > 0,
 		Timestamp: parseTime(d.Timestamp),
@@ -197,6 +197,20 @@ func decodeMessage(t string, scene host.Scene, raw json.RawMessage) (*host.Event
 		}
 	}
 	return ev, nil
+}
+
+// normalizeContent 把行结束符统一成 `\n`，并去掉首尾空白。
+//
+// 平台实测（2026-10-19，raw 轨迹取证）：群消息里多行内容的换行是 CR（U+000D），
+// 不是 LF。原样透传的后果不只是观感——按 `\n` 切行的下游（渲染器、任何读正文的
+// 插件）会把整段当成一行。这是平台的编码差异而非业务语义，归一化归网关，
+// 核心与插件只处理 LF。
+func normalizeContent(s string) string {
+	if strings.ContainsRune(s, '\r') {
+		s = strings.ReplaceAll(s, "\r\n", "\n")
+		s = strings.ReplaceAll(s, "\r", "\n")
+	}
+	return strings.TrimSpace(s)
 }
 
 func decodeGeneric(t string, spec eventSpec, raw json.RawMessage) (*host.Event, error) {

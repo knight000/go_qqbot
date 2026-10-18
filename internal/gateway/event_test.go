@@ -234,3 +234,17 @@ func TestDecodeC2CHasNoGroupRole(t *testing.T) {
 		t.Fatalf("单聊不应有群内角色，实际 %q", ev.Actor.GroupRole)
 	}
 }
+
+// 平台下发的多行内容是单独 CR（2026-10-19 raw 轨迹取证：`"content":"/md # 标题\r## 二级标题"`），
+// 不是 LF。必须在这里统一成 LF，否则按 `\n` 切行的下游会把整段当成一行。
+func TestDecodeNormalizesLineEndings(t *testing.T) {
+	const raw = `{"id":"MSG3","group_openid":"G1","author":{"id":"U1","member_openid":"M1","member_role":"member"},"content":"a\rb\r\nc\rd\n","message_type":0,"timestamp":"2026-10-19T08:00:00+08:00"}`
+	ev, err := Decode(platGroupMessageAll, json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	// CR、CRLF 都变成 LF，首尾空白（含结尾的 LF）被去掉，内部换行保留。
+	if want := "a\nb\nc\nd"; ev.Content != want {
+		t.Fatalf("content=%q, want %q", ev.Content, want)
+	}
+}

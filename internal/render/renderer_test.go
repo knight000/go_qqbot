@@ -331,3 +331,19 @@ func TestRenderWritesNoFilesByDefault(t *testing.T) {
 		t.Errorf("渲染产生了文件 %v，期望不落盘", names)
 	}
 }
+
+// 平台下发的是单独 CR（2026-10-19 raw 轨迹取证）。CR 与 CRLF 必须和 LF 出图
+// 逐字节一致——归一化前整段被当成一个 ATX 标题画成一行（166 px，多行是 466 px）。
+func TestMarkdownNormalizesLineEndings(t *testing.T) {
+	const lf = "# 标题\n## 二级标题\n\n```\nimport os\nreturn\n```"
+	want := renderPNG(t, lf)
+	for _, c := range []struct{ name, src string }{
+		{"CR", strings.ReplaceAll(lf, "\n", "\r")},
+		{"CRLF", strings.ReplaceAll(lf, "\n", "\r\n")},
+	} {
+		got := renderPNG(t, c.src)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s 换行与 LF 出图不一致（%d vs %d 字节）", c.name, len(got), len(want))
+		}
+	}
+}
