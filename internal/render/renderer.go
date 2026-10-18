@@ -11,15 +11,16 @@ import (
 	"image/png"
 	"log/slog"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
+	east "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/text"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
@@ -101,9 +102,11 @@ func (r *Renderer) Markdown(ctx context.Context, src string) (host.Image, error)
 	// 第二遍：画。y 的推进与第一遍完全一致，因为两遍走的是同一套块代码。
 	canvas := newLayout(faces, src)
 	canvas.img = img
+	canvas.log = r.log
 	if err := canvas.blocks(ctx, doc); err != nil {
 		return host.Image{}, err
 	}
+	canvas.warnMissing()
 
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
@@ -226,20 +229,34 @@ type layout struct {
 	faces *faceScope
 	src   []byte
 	img   *image.RGBA
+	log   *slog.Logger
 
 	x, right   float64
 	y          float64
 	prevBottom float64
 	started    bool
+
+	// muted 表示当前处于块引用内：文字整体降一档亮度（GitHub 的
+	// blockquote 用 --fgColor-muted）。
+	muted bool
+	// nested 是列表嵌套深度：嵌套列表的 margin-top 为 0。
+	nested int
+	// items 非 nil 时逐项记录列表项的块级几何。缩进漂移是几何量：记下
+	// 每项的起始 x 就能断言兄弟项没有互相影响，不必比对像素。只有测试会
+	// 设置它，正常渲染路径为 nil。
+	items *[]listItemGeom
+	// missing 记录本遍布局遇到的缺字。只在绘制遍上报一次 warn。
+	missing map[rune]struct{}
 }
 
 func newLayout(faces *faceScope, src string) *layout {
 	return &layout{
-		faces: faces,
-		src:   []byte(src),
-		x:     padX,
-		right: imgWidth - padX,
-		y:     padY,
+		faces:   faces,
+		src:     []byte(src),
+		x:       padX,
+		right:   imgWidth - padX,
+		y:       padY,
+		missing: make(map[rune]struct{}),
 	}
 }
 
@@ -274,9 +291,19 @@ func (l *layout) block(n ast.Node) error {
 	case *ast.ThematicBreak:
 		l.hr()
 		return nil
+	case *ast.List:
+		return l.list(v)
+	case *ast.Blockquote:
+		return l.blockquote(v)
+	case *ast.FencedCodeBlock:
+		return l.codeBlock(v)
+	case *ast.CodeBlock:
+		return l.codeBlock(v)
+	case *east.Table:
+		return l.table(v)
 	default:
-		// 其余块（列表、引用、代码块、表格……）留在后续 ticket；
-		// 递归子块至少不会把整篇文档吞掉。
+		// 其余块（图片块、脚注等 v1 不支持的语法）递归子块，
+		// 至少不会把整篇文档吞掉。
 		for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 			if err := l.block(c); err != nil {
 				return err
@@ -331,6 +358,10 @@ func (l *layout) hr() {
 
 // textBlock 把一组 span 折行、逐行推进并绘制。行高与字号由调用方给，行内
 // 字族仍按字符逐字选择。
+//
+// 左边界在进入函数时就固定成本地变量 x：药丸 padding、折行、续行都只作用于
+// 行内游标，块级 l.x 在整个段落里不变。这样"一个段落画了几行"就不可能改变
+// 后面兄弟块的横向位置——列表标记列依赖的正是块级 l.x。
 func (l *layout) textBlock(sp []span, w Weight, size, lineH float64) error {
 	gs, err := l.glyphs(sp, w, size)
 	if err != nil {
@@ -340,8 +371,9 @@ func (l *layout) textBlock(sp []span, w Weight, size, lineH float64) error {
 	if err != nil {
 		return err
 	}
-	for _, line := range l.wrap(gs, l.right-l.x) {
-		l.drawLine(line, l.x, l.y, lineH, fallback)
+	x := l.x
+	for _, line := range l.wrap(gs, l.right-x) {
+		l.drawLine(line, x, l.y, lineH, fallback)
 		l.y += lineH
 	}
 	return nil
@@ -377,93 +409,40 @@ func (l *layout) gap(top float64) {
 
 func (l *layout) bottom(m float64) { l.prevBottom = m }
 
-// ---- 行内 span 与字形 ----
-
-// span 是一段同源的纯文本。本 ticket 行内一律按纯文本处理，样式留给后续
-// ticket，所以这里只有文本与硬换行两种形态。
-type span struct {
-	text string
-	br   bool
-}
-
-func collectSpans(n ast.Node, src []byte) []span {
-	var out []span
-	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
-		switch v := c.(type) {
-		case *ast.Text:
-			out = append(out, span{text: string(v.Value(src))})
-			if v.HardLineBreak() {
-				out = append(out, span{br: true})
-			} else if v.SoftLineBreak() {
-				// 软换行在 HTML 里就是一个空格：折行器需要它作为断点。
-				out = append(out, span{text: " "})
-			}
-		case *ast.String:
-			out = append(out, span{text: string(v.Value)})
-		case *ast.AutoLink:
-			// 自动链接没有子节点，写回它的标签文本，否则整段链接凭空消失。
-			out = append(out, span{text: string(v.Label(src))})
-		case *ast.RawHTML:
-			// 内嵌 HTML 没有子节点，取原文，避免"内容被吃掉"。
-			if v.Segments != nil {
-				for i := 0; i < v.Segments.Len(); i++ {
-					seg := v.Segments.At(i)
-					out = append(out, span{text: string(seg.Value(src))})
-				}
-			}
-		default:
-			out = append(out, collectSpans(c, src)...)
-		}
+// noteMissing 记录一个子集外的字符。整篇画完才统一打一条 warn：一行生僻字
+// 不该刷出几十条日志，也绝不能变成 error——出一张带方框的图比什么都看不到
+// 更接近读者的意图。
+func (l *layout) noteMissing(r rune) {
+	if l.missing == nil {
+		return
 	}
-	return out
+	l.missing[r] = struct{}{}
 }
 
-type glyph struct {
-	r   rune
-	f   font.Face
-	col color.Color
-	br  bool
-	adv float64
-}
-
-// glyphs 把 span 拍平成逐字符的字形。字族按字符选：CJK 走 FontSC，
-// 其余走 FontSans——不是"整段用一个字体再回退"。
-func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
-	var out []glyph
-	for _, s := range sp {
-		if s.br {
-			out = append(out, glyph{br: true})
-			continue
-		}
-		for _, r := range s.text {
-			f, err := l.faces.face(familyOf(r), w, size)
-			if err != nil {
-				return nil, err
-			}
-			adv, ok := f.GlyphAdvance(r)
-			width := float64(adv) / 64
-			if !ok {
-				// 字体里没有这个字形：给个半角宽度，别让整行挤成一团。
-				width = size * 0.5
-			}
-			out = append(out, glyph{r: r, f: f, col: colFg, adv: width})
-		}
+func (l *layout) warnMissing() {
+	if l.log == nil || len(l.missing) == 0 {
+		return
 	}
-	return out, nil
-}
-
-// familyOf 是"逐字符选字族"的唯一决策点。
-func familyOf(r rune) Family {
-	if isCJK(r) {
-		return FontSC
+	runes := make([]rune, 0, len(l.missing))
+	for r := range l.missing {
+		runes = append(runes, r)
 	}
-	return FontSans
-}
+	sort.Slice(runes, func(i, j int) bool { return runes[i] < runes[j] })
 
-// isCJK 覆盖汉字、假名、谚文与全角标点（CJK 标点区、全角区）。
-func isCJK(r rune) bool {
-	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) ||
-		(r >= 0x3000 && r <= 0x303F) || (r >= 0xFF00 && r <= 0xFFEF)
+	const maxList = 8
+	var sb strings.Builder
+	for i, r := range runes {
+		if i == maxList {
+			fmt.Fprintf(&sb, " 等 %d 个", len(runes))
+			break
+		}
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		fmt.Fprintf(&sb, "%q(U+%04X)", r, r)
+	}
+	l.log.Warn("渲染遇到字体子集外的字符，已画成方框",
+		"count", len(runes), "runes", sb.String())
 }
 
 // ---- 折行 ----
@@ -490,14 +469,22 @@ func canBreak(a, b rune) bool {
 }
 
 func (l *layout) wrap(gs []glyph, maxW float64) [][]glyph {
+	return l.wrapMode(gs, maxW, false)
+}
+
+// wrapMode 是唯一的折行实现。keepIndent 为真时保留行首空格——代码块的
+// 缩进是内容的一部分，按正文那样吃掉会让代码失去层级。
+func (l *layout) wrapMode(gs []glyph, maxW float64, keepIndent bool) [][]glyph {
 	var lines [][]glyph
 	var cur []glyph
 	width := 0.0
 	lastBreak := -1
 
-	// 段首的空格（含 markdown 里为对齐写的空格）不进图。
-	for len(gs) > 0 && !gs[0].br && gs[0].r == ' ' {
-		gs = gs[1:]
+	// 段首的空格（含 markdown 里为对齐写的空格）不进图；代码块例外。
+	if !keepIndent {
+		for len(gs) > 0 && !gs[0].br && gs[0].r == ' ' {
+			gs = gs[1:]
+		}
 	}
 
 	flush := func() {
@@ -520,9 +507,11 @@ func (l *layout) wrap(gs []glyph, maxW float64) [][]glyph {
 			}
 			lines = append(lines, cur[:cut])
 			rest := append([]glyph{}, cur[cut:]...)
-			// 断点落在空格上时，行首的空格丢弃。
-			for len(rest) > 0 && rest[0].r == ' ' {
-				rest = rest[1:]
+			// 断点落在空格上时，行首的空格丢弃（代码块保留）。
+			if !keepIndent {
+				for len(rest) > 0 && rest[0].r == ' ' {
+					rest = rest[1:]
+				}
 			}
 			cur = rest
 			width, lastBreak = 0, -1
@@ -558,6 +547,32 @@ func (l *layout) fillRect(x, y, w, h float64, c color.Color) {
 	draw.Draw(l.img, dr, image.NewUniform(c), image.Point{}, draw.Over)
 }
 
+// roundRect 画圆角矩形。逐行扫描而不是逐像素：边角只有十几行，代价可以
+// 忽略，换来的是不引任何绘图库。
+func (l *layout) roundRect(x, y, w, h, rad float64, c color.Color) {
+	if l.img == nil || w <= 0 || h <= 0 {
+		return
+	}
+	if rad <= 0 {
+		l.fillRect(x, y, w, h, c)
+		return
+	}
+	for row := 0; row < int(h); row++ {
+		fy := float64(row) + 0.5
+		dy := 0.0
+		if fy < rad {
+			dy = rad - fy
+		} else if fy > h-rad {
+			dy = fy - (h - rad)
+		}
+		inset := 0.0
+		if dy > 0 {
+			inset = rad - math.Sqrt(math.Max(0, rad*rad-dy*dy))
+		}
+		l.fillRect(x+inset, y+float64(row), w-2*inset, 1, c)
+	}
+}
+
 func (l *layout) text(s string, f font.Face, c color.Color, x, baseline float64) float64 {
 	if s == "" {
 		return x
@@ -576,46 +591,4 @@ func (l *layout) text(s string, f font.Face, c color.Color, x, baseline float64)
 		d.DrawString(s)
 	}
 	return x + w
-}
-
-func measureString(f font.Face, s string) float64 {
-	d := font.Drawer{Face: f}
-	return float64(d.MeasureString(s)) / 64
-}
-
-// drawLine 按**这一行实际使用的 face** 的 Metrics 定位基线，而不是把文字
-// 垂直居中：CSS 的行盒高度不等分，ascent/descent 的比例由字体决定。
-// 用正文字体给标题定基线会让标题整体偏移。
-func (l *layout) drawLine(gs []glyph, x, y, lineH float64, fallback font.Face) {
-	baseline := baselineOf(lineFace(gs, fallback), y, lineH)
-
-	cx := x
-	for i := 0; i < len(gs); {
-		j := i
-		var sb strings.Builder
-		for j < len(gs) && gs[j].f == gs[i].f && gs[j].col == gs[i].col {
-			sb.WriteRune(gs[j].r)
-			j++
-		}
-		cx = l.text(sb.String(), gs[i].f, gs[i].col, cx, baseline)
-		i = j
-	}
-}
-
-// lineFace 取行内第一个非空格字形所属的 face。混排行（中英混排）里各字族
-// 的 ascent/descent 只差零点几个像素，取首个即为该行的"主字体"。
-func lineFace(gs []glyph, fallback font.Face) font.Face {
-	for _, g := range gs {
-		if !g.br && g.r != ' ' {
-			return g.f
-		}
-	}
-	return fallback
-}
-
-func baselineOf(f font.Face, y, lineH float64) float64 {
-	m := f.Metrics()
-	asc := float64(m.Ascent) / 64
-	desc := float64(m.Descent) / 64
-	return y + (lineH-(asc+desc))/2 + asc
 }
