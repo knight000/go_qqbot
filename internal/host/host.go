@@ -15,7 +15,9 @@ import (
 //
 // 版本 4：任务支持会话维度（JobSpec.PerPeer / JobSpec.Peer），
 // JobRunner 可能收到非空的 Peer。
-const APIVersion = "4"
+//
+// 版本 5：Host 新增 Renderer()，插件可把 markdown 文档源画成图片。
+const APIVersion = "5"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -246,6 +248,9 @@ type Host interface {
 	// Admins 提供启动通知等场景所需的收件人列表（已按单聊 openid 去重）。
 	Admins() AdminDirectory
 	Log() *slog.Logger
+	// Renderer 返回把 markdown 画成图片的能力。永不为 nil：未装配时返回
+	// 一个拒绝一切的替身，插件不必写判空分支。
+	Renderer() Renderer
 }
 
 // Command 是声明式路由规则：前缀或正则二选一。
