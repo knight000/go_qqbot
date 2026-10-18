@@ -241,6 +241,10 @@ type layout struct {
 	muted bool
 	// nested 是列表嵌套深度：嵌套列表的 margin-top 为 0。
 	nested int
+	// items 非 nil 时逐项记录列表项的块级几何。缩进漂移是几何量：记下
+	// 每项的起始 x 就能断言兄弟项没有互相影响，不必比对像素。只有测试会
+	// 设置它，正常渲染路径为 nil。
+	items *[]listItemGeom
 	// missing 记录本遍布局遇到的缺字。只在绘制遍上报一次 warn。
 	missing map[rune]struct{}
 }
@@ -354,6 +358,10 @@ func (l *layout) hr() {
 
 // textBlock 把一组 span 折行、逐行推进并绘制。行高与字号由调用方给，行内
 // 字族仍按字符逐字选择。
+//
+// 左边界在进入函数时就固定成本地变量 x：药丸 padding、折行、续行都只作用于
+// 行内游标，块级 l.x 在整个段落里不变。这样"一个段落画了几行"就不可能改变
+// 后面兄弟块的横向位置——列表标记列依赖的正是块级 l.x。
 func (l *layout) textBlock(sp []span, w Weight, size, lineH float64) error {
 	gs, err := l.glyphs(sp, w, size)
 	if err != nil {
@@ -363,8 +371,9 @@ func (l *layout) textBlock(sp []span, w Weight, size, lineH float64) error {
 	if err != nil {
 		return err
 	}
-	for _, line := range l.wrap(gs, l.right-l.x) {
-		l.drawLine(line, l.x, l.y, lineH, fallback)
+	x := l.x
+	for _, line := range l.wrap(gs, l.right-x) {
+		l.drawLine(line, x, l.y, lineH, fallback)
 		l.y += lineH
 	}
 	return nil
