@@ -2,9 +2,11 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
+	"github.com/knight000/qqbot/internal/api"
 	"github.com/knight000/qqbot/internal/host"
 	"github.com/knight000/qqbot/internal/store"
 )
@@ -69,19 +71,19 @@ func (c *Core) logGroupGateState(ctx context.Context) {
 	if c.store == nil || !c.whitelistEnabled() {
 		return
 	}
-	total, allowed, _, err := c.store.CountGroups(ctx)
+	s, err := c.store.CountGroups(ctx)
 	if err != nil {
 		c.log.Warn("读取群准入状态失败", "err", err)
 		return
 	}
-	if allowed == 0 {
+	if s.Allowed == 0 {
 		c.log.Warn("群白名单已开启但没有允许的群，所有群消息都会被丢弃",
-			"已登记群", total,
+			"已登记群", s.InUse(),
 			"处理", "私聊 /group allow <group_openid>，或由 Bot 管理员在群内发 /group allow")
 		return
 	}
-	c.log.Info("群准入已启用", "白名单", allowed, "已登记群", total,
-		"黑名单开关", c.blacklistEnabled())
+	c.log.Info("群准入已启用", "白名单", s.Allowed, "已登记群", s.InUse(),
+		"已退出", s.Left, "黑名单开关", c.blacklistEnabled())
 }
 
 // groupControlExempt 判断这条被拦下的消息是否可以例外放行到核心指令。
@@ -107,31 +109,63 @@ func isGroupControlCommand(content string) bool {
 
 const groupInfoTimeout = 8 * time.Second
 
-// fetchGroupName 尝试用官方接口补全群名。
+var (
+	// ErrGroupInfoForbidden 表示群信息接口拒绝访问（11253：仅白名单机器人可用，
+	// 需要官方内邀）。它不是配置错误，只是这个可选增强不可用。
+	ErrGroupInfoForbidden = errors.New("群信息接口无访问权限(11253)")
+	errNoGroupInfoSource  = errors.New("未配置群信息接口")
+)
+
+// groupInfoSource 是核心取群信息的外部依赖。
 //
-// 该接口（GET /v2/groups/{openid}/info）目前仅对白名单机器人开放，
-// 普通机器人调用会得到 11253；这不是错误配置，只是一个可选增强。
-// 失败后不重试：群名可以随时用 /group name 手工设置，而每条新群消息都重试
-// 只会白白消耗 30 QPM 的配额。
-func (c *Core) fetchGroupName(openid string) {
+// 抽成接口只有一个目的：让"入群取名字"和"批量刷新群名"这两条逻辑
+// 能在没有真实 API、没有网络的情况下被测试——它们全是分支逻辑，不值得靠人肉验证。
+type groupInfoSource interface {
+	GroupInfo(ctx context.Context, groupOpenID string) (api.GroupInfo, error)
+}
+
+// lookupGroupName 调接口取群名。
+//
+// 单次调用自己的超时在这里统一兜住，调用方只管传上下文：批量刷新时
+// 一个卡死的请求绝不能吃掉整批的预算。
+//
+// 返回空名也不算错误：平台可能有这个群但不给名字。是否写库由调用方决定——
+// 把空名写进去会擦掉已有的名字。
+func (c *Core) lookupGroupName(ctx context.Context, openid string) (string, error) {
 	if c.api == nil {
-		return
+		return "", errNoGroupInfoSource
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), groupInfoTimeout)
+	ctx, cancel := context.WithTimeout(ctx, groupInfoTimeout)
 	defer cancel()
 
 	info, err := c.api.GroupInfo(ctx, openid)
 	if err != nil {
 		if strings.Contains(err.Error(), "11253") {
-			c.log.Info("群信息接口无访问权限（11253），群名留空；可用 /group name 设置",
-				"group", openid)
-			return
+			return "", ErrGroupInfoForbidden
 		}
+		return "", err
+	}
+	return strings.TrimSpace(info.GroupName), nil
+}
+
+// fetchGroupName 尝试用官方接口补全群名（首次见到新群时异步调用一次）。
+//
+// 该接口（GET /v2/groups/{openid}/info）目前仅对白名单机器人开放，
+// 普通机器人调用会得到 11253；这不是错误配置，只是一个可选增强。
+// 失败后不重试：群名可以随时用 /group name 手工设置，而每条新群消息都重试
+// 只会白白消耗 30 QPM 的配额。需要批量重试时走 /group refresh。
+func (c *Core) fetchGroupName(openid string) {
+	ctx := context.Background()
+	name, err := c.lookupGroupName(ctx, openid)
+	switch {
+	case errors.Is(err, ErrGroupInfoForbidden):
+		c.log.Info("群信息接口无访问权限（11253），群名留空；可用 /group name 设置",
+			"group", openid)
+		return
+	case err != nil:
 		c.log.Debug("获取群名称失败，群名留空", "group", openid, "err", err)
 		return
-	}
-	name := strings.TrimSpace(info.GroupName)
-	if name == "" {
+	case name == "":
 		return
 	}
 	if err := c.store.SetGroupName(ctx, openid, name, "api"); err != nil {

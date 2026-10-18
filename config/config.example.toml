@@ -88,9 +88,13 @@ deny_reply = false
 [group]
 whitelist = true
 blacklist = true
-# 首次见到新群时尝试调用 GET /v2/groups/{id}/info 取群名。
+# 首次见到新群 / 收到入群通知时，尝试调用 GET /v2/groups/{id}/info 取群名。
 # 该接口目前仅白名单机器人可用（11253），取不到就留空，用 /group name 手工设置。
+# 之后可用 /group refresh 批量重试。
 fetch_name = true
+# 入群/退群通知私聊发给谁：owner（默认，只发所有者）| admin（所有者+管理员）| off。
+# 通知走主动消息，受 [active].enabled 与每日预算约束，但不受 [active].plugins 限制。
+notify = "owner"
 
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取
 [plugins.echo]

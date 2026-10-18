@@ -37,12 +37,28 @@ const (
 	KindUnknown Kind = "unknown" // 解码表里没有的事件，只观测、不路由
 )
 
+// Notice 给少数"核心必须理解语义"的通知事件一个稳定标签。
+//
+// 绝大多数通知只有 Name（平台事件名）供观测，核心不解析；但群生命周期的
+// 两个事件会改变本地状态（qq_groups 的在群标记），必须有语义标签——
+// 否则核心就得比较平台事件名，破坏"平台事件名只出现在 gateway"的边界。
+type Notice string
+
+const (
+	NoticeNone Notice = ""
+	// NoticeBotJoinedGroup：机器人被拉进群（平台事件 GROUP_ADD_ROBOT）。
+	NoticeBotJoinedGroup Notice = "bot.joined_group"
+	// NoticeBotLeftGroup：机器人被移出群（平台事件 GROUP_DEL_ROBOT）。
+	NoticeBotLeftGroup Notice = "bot.left_group"
+)
+
 // Event 是归一化后的事件。插件只看这一层，感知不到 WSS 与 opcode。
 type Event struct {
 	ID       string // 平台事件/消息 ID，用于幂等
 	Kind     Kind   // 大类，见 Kind* 常量
 	Name     string // 平台原始事件名，只用于观测与排障
 	Scene    Scene  // group | c2c | guild；无法判定时为空
+	Notice   Notice // 仅 Kind=notice 且有核心语义时非空；插件可读但无需关心
 	PeerID   string // 群 openid 或用户 openid
 	SenderID string // 发送者 openid（跨场景同值，平台不另给 QQ 号）
 	UnionID  string // 平台给的跨场景标识，可能为空

@@ -194,3 +194,25 @@ fetch_name = false
 		t.Fatalf("显式 false 应关闭全部群准入开关: %+v", cfg.Group)
 	}
 }
+
+// 入群/退群通知默认只发所有者。写错的值回退 owner 而不是 off：
+// 通知发多了只是吵，发少了会让"机器人被谁拉进了哪个群"悄无声息地过去。
+func TestGroupNotifyMode(t *testing.T) {
+	cases := map[string]string{
+		"":        NotifyOwner,
+		"owner":   NotifyOwner,
+		"OWNER":   NotifyOwner,
+		" admin ": NotifyAdmin,
+		"admins":  NotifyAdmin,
+		"off":     NotifyOff,
+		"none":    NotifyOff,
+		"typo":    NotifyOwner,
+	}
+	for raw, want := range cases {
+		cfg := &Config{}
+		cfg.Group.Notify = raw
+		if got := cfg.GroupNotifyMode(); got != want {
+			t.Errorf("notify=%q 应归一化为 %q，实际 %q", raw, want, got)
+		}
+	}
+}

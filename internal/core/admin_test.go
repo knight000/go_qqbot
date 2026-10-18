@@ -58,10 +58,11 @@ func adminEvent(content, sender, union string, scene host.Scene, peer string) *h
 
 func lastReply(t *testing.T, f *fakeAPI) string {
 	t.Helper()
-	if len(f.bodies) == 0 {
+	b, ok := f.lastBody()
+	if !ok {
 		t.Fatal("没有发出任何回复")
 	}
-	return f.bodies[len(f.bodies)-1].Content
+	return b.Content
 }
 
 func seedAdmin(t *testing.T, c *Core, openid, union, role string) {

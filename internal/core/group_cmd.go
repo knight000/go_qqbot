@@ -21,9 +21,11 @@ const groupUsage = `用法：
 /group deny [openid]           加入黑名单
 /group clear [openid]          移出黑白名单
 /group name [openid] <名称>     更新群名称
+/group refresh                 重新获取所有在群群的名称
 
 群聊里省略 openid 表示当前群；按 id 操作时写完整 32 位 openid。
 白名单开启时只有白名单群可用；黑名单优先于白名单。
+已退出的群保留记录但不参与 refresh。
 仅 Bot 管理员与所有者可用。`
 
 func (c *Core) handleGroup(ctx context.Context, ev *host.Event) {
@@ -56,6 +58,8 @@ func (c *Core) handleGroup(ctx context.Context, ev *host.Event) {
 		c.groupClear(ctx, ev, args)
 	case "name", "rename":
 		c.groupRename(ctx, ev, args)
+	case "refresh", "refetch", "sync":
+		c.groupRefresh(ctx, ev, args)
 	default:
 		c.replyText(ctx, ev, "未知子命令。\n"+groupUsage)
 	}
@@ -263,6 +267,12 @@ func (c *Core) groupStatus(ctx context.Context, ev *host.Event, args []string) {
 		b.WriteString("名称 （未命名，可用 /group name 设置）")
 	}
 	fmt.Fprintf(&b, "\n名单 %s\n", modeLabel(g.Mode))
+	if g.Left() {
+		fmt.Fprintf(&b, "状态 已退出（%s），不参与 /group refresh\n",
+			g.LeftAt.Format("2006-01-02 15:04"))
+	} else {
+		b.WriteString("状态 在群\n")
+	}
 	if allowed {
 		b.WriteString("准入 放行")
 	} else {
@@ -276,14 +286,19 @@ func (c *Core) groupStatus(ctx context.Context, ev *host.Event, args []string) {
 }
 
 func (c *Core) groupOverview(ctx context.Context, ev *host.Event) {
-	total, allowed, denied, err := c.store.CountGroups(ctx)
+	st, err := c.store.CountGroups(ctx)
 	if err != nil {
 		c.log.Error("统计群失败", "err", err)
 		c.replyText(ctx, ev, "读取群统计失败，请查看日志。")
 		return
 	}
-	msg := fmt.Sprintf("群准入\n白名单 %s｜黑名单 %s\n已记录 %d 个群｜白名单 %d｜黑名单 %d\n用 /group list 查看 openid 与名称。",
-		onOff(c.whitelistEnabled()), onOff(c.blacklistEnabled()), total, allowed, denied)
+	msg := fmt.Sprintf("群准入\n白名单 %s｜黑名单 %s\n在群 %d｜白名单 %d｜黑名单 %d",
+		onOff(c.whitelistEnabled()), onOff(c.blacklistEnabled()),
+		st.InUse(), st.Allowed, st.Denied)
+	if st.Left > 0 {
+		msg += fmt.Sprintf("\n已退出 %d（保留记录，不参与 refresh）", st.Left)
+	}
+	msg += "\n用 /group list 查看 openid 与名称，/group refresh 重新获取群名。"
 	c.replyText(ctx, ev, msg)
 }
 
@@ -310,7 +325,7 @@ func (c *Core) groupList(ctx context.Context, ev *host.Event, args []string) {
 		return
 	}
 
-	var allowed, denied int
+	var allowed, denied, left int
 	var shown []store.Group
 	for _, g := range groups {
 		switch g.Mode {
@@ -319,13 +334,20 @@ func (c *Core) groupList(ctx context.Context, ev *host.Event, args []string) {
 		case store.GroupModeDeny:
 			denied++
 		}
+		if g.Left() {
+			left++
+		}
 		if filter == "all" || g.Mode == filter {
 			shown = append(shown, g)
 		}
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "群 %d 个｜白名单 %d｜黑名单 %d", len(groups), allowed, denied)
+	fmt.Fprintf(&b, "群 %d 个｜在群 %d｜白名单 %d｜黑名单 %d",
+		len(groups), len(groups)-left, allowed, denied)
+	if left > 0 {
+		fmt.Fprintf(&b, "｜已退出 %d", left)
+	}
 	if filter != "all" {
 		fmt.Fprintf(&b, "（只显示%s）", modeLabel(filter))
 	}
@@ -346,6 +368,9 @@ func (c *Core) groupList(ctx context.Context, ev *host.Event, args []string) {
 			b.WriteString(" " + clipRunes(g.Name, 20))
 		}
 		fmt.Fprintf(&b, "｜活跃 %s", g.LastSeenAt.Format("01-02 15:04"))
+		if g.Left() {
+			fmt.Fprintf(&b, "｜已退出 %s", g.LeftAt.Format("01-02 15:04"))
+		}
 	}
 	c.replyText(ctx, ev, b.String())
 }

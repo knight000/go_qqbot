@@ -76,6 +76,15 @@ var eventTable = map[string]eventSpec{
 	platSubscribeStatus:   {host.KindMeta, "", false},
 }
 
+// noticeSemantics 是"核心必须理解语义"的通知白名单。
+//
+// 其余通知核心一律不解析——它们只带 Kind/Name 供观测，加进来就要分析载荷，
+// 那是插件的事。这两个则不同：它们直接改变 qq_groups 的在群状态。
+var noticeSemantics = map[string]host.Notice{
+	platGroupAddRobot: host.NoticeBotJoinedGroup,
+	platGroupDelRobot: host.NoticeBotLeftGroup,
+}
+
 type payload struct {
 	Op int             `json:"op"`
 	D  json.RawMessage `json:"d"`
@@ -208,6 +217,7 @@ func decodeGeneric(t string, spec eventSpec, raw json.RawMessage) (*host.Event, 
 		ID:        firstNonEmpty(d.ID, stableOpID(t, d)),
 		Kind:      spec.kind,
 		Name:      t,
+		Notice:    noticeSemantics[t],
 		Scene:     scene,
 		PeerID:    firstNonEmpty(d.GroupOpenID, d.OpenID, d.UserOpenID),
 		SenderID:  firstNonEmpty(d.OpMemberOpenID, d.MemberOpenID, d.OpenID, d.UserOpenID),

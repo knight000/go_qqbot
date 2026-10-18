@@ -74,11 +74,14 @@ var schema = []string{
 	// 平台没有"列出机器人加入的群"的接口，所以只能靠收到群事件时登记；
 	// group_name 可能为空（群信息接口 11253 需要内邀），由 /group name 手工补。
 	// mode: ''=未设置 / 'allow'=白名单 / 'deny'=黑名单。
+	// left_at: 0=机器人仍在群里；>0=退出时间。退群不删记录——
+	// 删了就连"这个群曾经存在过"都查不到，而名单与历史活跃时间还有诊断价值。
 	`CREATE TABLE IF NOT EXISTS qq_groups (
 		group_openid  TEXT PRIMARY KEY,
 		group_name    TEXT NOT NULL DEFAULT '',
 		name_source   TEXT NOT NULL DEFAULT '',
 		mode          TEXT NOT NULL DEFAULT '',
+		left_at       INTEGER NOT NULL DEFAULT 0,
 		first_seen_at INTEGER NOT NULL,
 		last_seen_at  INTEGER NOT NULL,
 		updated_at    INTEGER NOT NULL
