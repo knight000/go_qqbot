@@ -23,6 +23,7 @@ import (
 	"github.com/knight000/qqbot/internal/gateway"
 	"github.com/knight000/qqbot/internal/host"
 	"github.com/knight000/qqbot/internal/httpx"
+	"github.com/knight000/qqbot/internal/instance"
 	"github.com/knight000/qqbot/internal/logx"
 	"github.com/knight000/qqbot/internal/store"
 
@@ -76,6 +77,31 @@ func run() (*core.RestartRequest, error) {
 	}
 	log := logx.New(logLevel, cfg.Log.Format)
 	slog.SetDefault(log)
+
+	// 单实例锁：必须在打开数据库、连网关之前拿到。
+	//
+	// 两个进程共用一份数据目录会互相顶掉网关 session（日志里是 4902 reset by
+	// resume），并且各自回复一遍消息、各记一遍幂等表——不是"慢一点"，是明确错误。
+	// 锁按数据库路径划分：不同 [store].path 就是不同实例，可以同时跑。
+	//
+	// 注意锁的 defer 注册在 db.Close 之前，所以退出时的顺序是"先关库再放手"，
+	// 不会给下一个实例留下一个刚拿到锁但库还开着的窗口。
+	lockWait := 2 * time.Second
+	if buildinfo.RestartedByReload() {
+		// /reload 是交接而不是竞争：run 返回时锁已经放开，正常情况下新进程
+		// 一次就能拿到。多等一会儿只是保险——万一将来改了重启顺序（比如
+		// 先拉起子进程再放手），这里不会变成"重启后起不来"。
+		lockWait = 15 * time.Second
+	}
+	lock, err := instance.Acquire(cfg.Store.Path+".lock", lockWait)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := lock.Release(); err != nil {
+			log.Warn("释放单实例锁失败", "lock", lock.Path(), "err", err)
+		}
+	}()
 
 	db, err := store.Open(cfg.Store.Path)
 	if err != nil {
@@ -143,6 +169,7 @@ func run() (*core.RestartRequest, error) {
 	log.Info("qqbot 启动完成",
 		"config", *cfgPath,
 		"db", db.Path(),
+		"lock", lock.Path(),
 		"sandbox", cfg.App.Sandbox,
 		"debug", cfg.Debug.Enabled,
 		"version", bi.String(),

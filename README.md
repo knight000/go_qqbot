@@ -293,6 +293,37 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 - `/reload` 与 `/reset` 无关：前者重启进程，后者（分级重置数据）尚未实现。
 - 插件不能声明 `/reload` / `/restart` 前缀，否则启动即拒绝加载。
 
+## 单实例：同一份数据只能跑一个进程
+
+启动时会在数据库旁边取一把**操作系统级**文件锁（`<store.path>.lock`）。拿不到就直接退出，
+不连网关、不开库：
+
+```
+启动失败: 另一个实例正在运行：pid 20384（D:\vscode\go\qqbot\bot.exe，启动于 2026-10-18 11:52:07）持有 D:\vscode\go\qqbot\.temp\data\qqbot.db.lock
+```
+
+这不是保守限制。两个进程共用一份库会：
+
+- 抢同一个网关 session —— 日志里反复出现 `4902 reset by resume`，两边轮流被踢下线；
+- 各回一遍消息：同一个 `msg_id` 被两边各当成一条事件，用户看到重复回复，被动额度翻倍扣。
+
+锁是**内核持有的锁，不是"锁文件存不存在"**。所以 `kill -9`、任务管理器结束、断电重启
+都不会留下"需要手动删掉的残留锁"；也正因如此，锁文件本身永不删除（删掉别人正持有的
+锁会让第三个进程误以为没人占用）。
+
+| 场景 | 行为 |
+|---|---|
+| 正常退出 / Ctrl-C | 显式释放，下一个进程立刻能拿 |
+| 崩溃 / 强杀 | 句柄随进程销毁，内核释放 |
+| `/reload` 拉起的进程 | 旧进程已经先放手，正常一次就能拿到；仍留 15 s 余量 |
+| 另一个实例 | 最多等 2 s，然后带着上面的错误退出 |
+
+错误里带 pid 与可执行文件路径，是为了**能精确结束那个进程**而不是让你猜：Windows 在任务
+管理器里搜 `qqbot`，Linux 用 `ps -p <pid> -o pid,etime,cmd`。
+
+**不同 `[store].path` 就是不同实例**，可以同时跑。但同一 appID 的多个进程即使库不同也仍会
+抢 session——只有 `[bot].shard_id` 不同的分片部署才是合法的多进程形态。
+
 ## `/ping`（仅管理员）
 
 群聊需 @ 机器人后发送 `/ping`，单聊直接发。鉴权由核心完成：`adminping` 在 Manifest 里
@@ -363,7 +394,6 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 - 媒体下载与配额淘汰（表结构与 GC 已就位，`media.enabled=false` 时只记 `has_media`）；
 - `plugins/torn`：业务插件与 Torn 限流/缓存分层；
 - 多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
-- 单实例保护：两个进程共用同一个库时会互相 `4902 reset by resume`，当前靠部署约束（systemd 单实例），未做文件锁。
 
 ## 目录
 
@@ -374,6 +404,7 @@ internal/core/    路由、幂等、频控、调度、GC、认领、/admin 权�
 internal/host/    Host 能力实现（插件唯一可见的 API）
 internal/sysinfo/ 跨平台资源采集（build tag 分 windows / linux）
 internal/store/   schema、迁移、分批 GC、管理员与身份映射
+internal/instance/ 单实例文件锁（flock / CreateFile 独占共享）
 internal/httpx/   统一出站客户端
 internal/api/     QQ 开放平台 REST 封装
 plugins/echo/     示例插件

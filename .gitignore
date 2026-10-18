@@ -13,6 +13,8 @@ qqbot.exe
 *.db
 *.db-wal
 *.db-shm
+# 单实例锁文件（<store.path>.lock），随进程存活，不删不入库
+*.db.lock
 
 # 编辑器 / 本地工具状态
 .idea/
