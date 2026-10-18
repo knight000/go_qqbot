@@ -33,6 +33,32 @@ func TestRouterRejectsReservedPrefix(t *testing.T) {
 	}
 }
 
+// 保留前缀清单必须与 handleReserved 的 case 严格对应：多列一个就等于
+// 白占名字（第三方插件想用也会被拒绝加载），少列一个则核心的处理会
+// 静默遮蔽插件声明的同名命令。
+func TestReservedPrefixesMatchCoreCommands(t *testing.T) {
+	want := []string{"/claim", "/admin", "/group", "/reset", "/reload", "/restart"}
+	if len(reservedPrefixes) != len(want) {
+		t.Fatalf("保留前缀 = %v, want %v", reservedPrefixes, want)
+	}
+	for i := range want {
+		if reservedPrefixes[i] != want[i] {
+			t.Fatalf("保留前缀 = %v, want %v", reservedPrefixes, want)
+		}
+	}
+}
+
+// /grant、/revoke 的功能已由 /admin add|rm 取代，指令本身随之删除，
+// 名字也应释放——不允许再以"保留前缀"的名义挡下插件的合法声明。
+func TestGrantRevokeNoLongerReserved(t *testing.T) {
+	for _, gone := range []string{"/grant", "/revoke"} {
+		p := &fakePlugin{m: manifest("legacy", 1, gone)}
+		if _, err := NewRouter([]host.Plugin{p}); err != nil {
+			t.Fatalf("插件声明 %q 不应被拒绝加载: %v", gone, err)
+		}
+	}
+}
+
 func TestRouterRejectsAPIVersionMismatch(t *testing.T) {
 	m := manifest("old", 1, "!old")
 	m.APIVersion = "0"

@@ -12,8 +12,12 @@ import (
 // reservedPrefixes 是核心保留指令。插件若声明相同前缀，启动即拒绝加载，
 // 否则第三方插件可以劫持 /reset 之类的不可逆操作（§3.4），
 // 或者用 /admin 给自己提权、用 /reload 让机器人反复下线。
+//
+// 这份清单必须与 handleReserved 的 case 一一对应：列了却不处理，等于
+// 白占一个前缀（第三方插件想用也加载不了），而未列却被处理，则插件声明的
+// 同名命令会被核心静默遮蔽。/grant、/revoke 已随功能移除一并退场。
 var reservedPrefixes = []string{
-	"/claim", "/admin", "/group", "/reset", "/grant", "/revoke", "/reload", "/restart",
+	"/claim", "/admin", "/group", "/reset", "/reload", "/restart",
 }
 
 type compiledCommand struct {
