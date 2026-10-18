@@ -142,8 +142,9 @@ type glyph struct {
 // inlinePad 是行内代码的左右内边距（GitHub 的 .4em）。
 func inlinePad() float64 { return math.Round(fsCode * 0.4) }
 
-// glyphs 把 span 拍平成逐字符的字形。字族按字符选：CJK 走 FontSC，
-// 拉丁走 FontSans；行内代码用 FontMono，其中的中文仍回退 FontSC。
+// glyphs 把 span 拍平成逐字符的字形。首选字族按字符选：CJK 走 FontSC，
+// 拉丁走 FontSans；行内代码用 FontMono。首选族没有该字形时沿回退链继续问，
+// 三族都没有才算缺字（见 pickFace）。
 func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 	var out []glyph
 	for _, s := range sp {
@@ -172,19 +173,17 @@ func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 
 		start := len(out)
 		for _, r := range s.text {
-			fam := familyOfRune(r)
+			pref := familyOfRune(r)
 			if (s.code || s.mono) && !isCJK(r) {
-				fam = FontMono
+				pref = FontMono
 			}
-			f, err := l.faces.face(fam, weight, sz)
+			f, width, ok, err := l.pickFace(r, pref, weight, sz)
 			if err != nil {
 				return nil, err
 			}
-			adv, ok := f.GlyphAdvance(r)
-			width := float64(adv) / 64
 			missing := !ok
 			if missing {
-				// 字体里没有这个字形：给个半角宽度的方框，别让整行挤成一团。
+				// 三族都没有这个字形：给个半角宽度的方框，别让整行挤成一团。
 				width = sz * 0.5
 				l.noteMissing(r)
 			}
@@ -207,7 +206,46 @@ func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 	return out, nil
 }
 
-// familyOfRune 是"逐字符选字族"的唯一决策点。
+// pickFace 按回退链接逐族取字形，返回第一个**真有该字形**的 face 及其推进量。
+//
+// 三族覆盖是互补的：Noto Sans 没有 → ✓ ★ ● 这类符号，Noto Sans SC 有；等宽
+// 族有框线却未必有 ✓。只按码位选唯一一族会把子集内本来就有的字符画成方框，
+// 所以每次都要问 face 本身（GlyphAdvance 的 ok 就是 cmap 的答案）。
+//
+// 三族都没有时返回首选族的 face 与 ok=false，调用方据此画方框——face 仍要
+// 有值，药丸与方框的度量都靠它。
+func (l *layout) pickFace(r rune, pref Family, w Weight, size float64) (font.Face, float64, bool, error) {
+	var first font.Face
+	for i, fam := range faceOrder(pref) {
+		f, err := l.faces.face(fam, w, size)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if i == 0 {
+			first = f
+		}
+		if adv, ok := f.GlyphAdvance(r); ok {
+			return f, float64(adv) / 64, true, nil
+		}
+	}
+	return first, 0, false, nil
+}
+
+// faceOrder 是回退链：首选族 → 另一个正文族 → 等宽族。首选族放最前是为了
+// 让覆盖重叠的字符（ASCII、全角标点）留在本来该用的字体里，视觉不跳。
+func faceOrder(pref Family) []Family {
+	switch pref {
+	case FontSC:
+		return []Family{FontSC, FontSans, FontMono}
+	case FontMono:
+		return []Family{FontMono, FontSC, FontSans}
+	default:
+		return []Family{FontSans, FontSC, FontMono}
+	}
+}
+
+// familyOfRune 是"逐字符选首选字族"的唯一决策点；真正的字形可能来自回退链
+// 上的下一族，见 pickFace。
 func familyOfRune(r rune) Family {
 	if isCJK(r) {
 		return FontSC
