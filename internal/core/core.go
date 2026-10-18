@@ -205,6 +205,12 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		c.log.Debug("未知事件，仅记录不路由", "name", ev.Name)
 		return
 	}
+	// 轨迹要显示 Bot 角色（owner/admin/user），而"收到"块打印在去重与闸门之前。
+	// 只在 full 级别提前解析：关闭态与 plugin 级别保持原样，不给热路径加查询；
+	// resolveActor 幂等，后面那次会直接命中"已解析"分支。
+	if c.trace.full() {
+		c.resolveActor(ctx, ev)
+	}
 	// 先打轨迹再去重：调试模式下"收到的每一条"都要看见，包括重复投递的那条。
 	c.trace.Received(ctx, ev)
 	if ev.ID == "" {
