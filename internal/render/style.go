@@ -52,12 +52,18 @@ const (
 	codePad    = 32.0
 	codeRadius = 12.0
 	listIndent = 64.0
-	liGap      = 8.0
-	quoteBar   = 8.0
-	quotePad   = 32.0
-	tablePadV  = 12.0
-	tablePadH  = 26.0
-	borderW    = 2.0
+	// listMarkerGap 是标记右缘与内容起点之间的距离。
+	listMarkerGap = 12.0
+	// listCheckX 是任务列表复选框相对列表左缘的偏移。
+	listCheckX = 16.0
+	// checkSize 是任务列表复选框的边长（GitHub 16 CSS px 的 2×）。
+	checkSize = 30.0
+	liGap     = 8.0
+	quoteBar  = 8.0
+	quotePad  = 32.0
+	tablePadV = 12.0
+	tablePadH = 26.0
+	borderW   = 2.0
 )
 
 // 颜色。全部是不透明的 Primer token；半透明色必须用 color.NRGBA，
