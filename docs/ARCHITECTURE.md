@@ -185,6 +185,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | `HTTP.GetJSON` / `PostJSON` | 域名白名单 + 超时 + 重试 + 自动降级 | 未声明域名一律拒绝 |
 | `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
 | `Log` | 结构化日志，自动带 plugin 字段 | 敏感字段脱敏 |
+| `Renderer` | 把 markdown 画成图片（`Markdown(ctx, src) (Image, error)`），契约见 §3.8 | 未注入时返回拒绝性 stub（错误可被 `errors.Is` 分类为超时/超大/能力缺失），不是 nil |
 
 **插件不直接持有 SQLite 连接、不直接持有 WS 连接、不读环境变量取密钥。** 这条边界决定了：插件可单测（Host 用 fake）、可复用（换核心只改 Host 适配层）、可审计（能力清单即权限清单）。
 
