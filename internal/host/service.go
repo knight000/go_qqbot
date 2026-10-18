@@ -80,6 +80,8 @@ type Options struct {
 	Sched   Scheduler
 	Log     *slog.Logger
 	Domains []string
+	// Renderer 为零值时由 NewService 换成拒绝性替身，见 Renderer()。
+	Renderer Renderer
 }
 
 // Service 是 Host 的实现，每个插件一份。
@@ -94,6 +96,7 @@ type Service struct {
 	log       *slog.Logger
 	sender    Sender
 	admin     AdminBackend
+	renderer  Renderer
 }
 
 func NewService(o Options) *Service {
@@ -112,6 +115,7 @@ func NewService(o Options) *Service {
 		log:       logger.With("plugin", o.Name),
 		sender:    o.Sender,
 		admin:     o.Admin,
+		renderer:  resolveRenderer(o.Renderer),
 	}
 }
 
@@ -123,6 +127,9 @@ func (s *Service) Query() QueryStore    { return s.query }
 func (s *Service) HTTP() HTTP           { return s.http }
 func (s *Service) Scheduler() Scheduler { return s.sched }
 func (s *Service) Log() *slog.Logger    { return s.log }
+
+// Renderer 返回注入的渲染能力；未注入时是拒绝性替身，永不为 nil。
+func (s *Service) Renderer() Renderer { return s.renderer }
 
 // PeerKV 返回该会话私有的 KV 命名空间。
 //
