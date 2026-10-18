@@ -20,7 +20,10 @@ type listItemGeom struct {
 	depth   int
 	x       float64
 	markerX float64
-	y       float64
+	// markerRight 是标记的右缘。同一列表里无序符号、序号、任务复选框共用
+	// 这一条边（宽度不同，左缘必然不同），混排时标记才不会一跳一跳。
+	markerRight float64
+	y           float64
 }
 
 // list 画有序/无序列表。标记单独占一列，内容整体右移 listIndent：这样嵌套
@@ -68,10 +71,11 @@ func (l *layout) list(n *ast.List) error {
 // 嵌套列表再右移一层——都以这个起始值为基准，谁都不许改动块级 x 的"所有权"。
 func (l *layout) listItem(li *ast.ListItem, marker string, task, checked bool) error {
 	l.gap(0) // 项间用 liGap，靠 margin collapsing 取较大值
-	markerX := l.drawMarker(marker, task, checked)
+	markerX, markerW := l.drawMarker(marker, task, checked)
 	if l.items != nil {
 		*l.items = append(*l.items, listItemGeom{
-			depth: l.nested, x: l.x, markerX: markerX, y: l.y,
+			depth: l.nested, x: l.x, markerX: markerX,
+			markerRight: markerX + markerW, y: l.y,
 		})
 	}
 
@@ -101,29 +105,35 @@ func (l *layout) listItem(li *ast.ListItem, marker string, task, checked bool) e
 	return nil
 }
 
-// drawMarker 在列表内容列之前画标记，返回标记的绘制起点。有序列表右对齐，
-// 数字位数变化时正文起点不动。
-func (l *layout) drawMarker(marker string, task, checked bool) float64 {
+// drawMarker 在列表内容列之前画标记，返回标记的绘制起点与宽度。所有标记
+// 右对齐到同一条边：有序列表的序号位数变化、无序符号与任务复选框混排时，
+// 正文起点都不动。
+func (l *layout) drawMarker(marker string, task, checked bool) (x, w float64) {
 	mf, err := l.faces.face(FontSans, WeightRegular, fsBody)
 	if err != nil {
-		return l.x
+		return l.x, 0
 	}
 	baseline := baselineOf(mf, l.y, lhBody)
 
+	// 所有标记共用一条右缘：无序符号、序号、复选框都右对齐到标记列末端。
+	// 之前复选框固定从 listCheckX 起画，混排时它会比项目符号左移 26px，
+	// 同一列表里标记一跳一跳。
+	markerRight := l.x + listIndent - listMarkerGap
+
 	if task {
-		x := l.x + listCheckX
+		x = markerRight - checkSize
 		l.checkbox(x, l.y+(lhBody-checkSize)/2, checked)
-		return x
+		return x, checkSize
 	}
 
-	w := measureString(mf, marker)
+	w = measureString(mf, marker)
 	col := colFg
 	if l.muted {
 		col = colMuted
 	}
-	x := l.x + listIndent - listMarkerGap - w
+	x = markerRight - w
 	l.text(marker, mf, col, x, baseline)
-	return x
+	return x, w
 }
 
 // itemTask 判断列表项是否是任务项：GFM 把复选框插在第一个段落的最前面。

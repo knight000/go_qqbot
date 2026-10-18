@@ -52,10 +52,9 @@ const (
 	codePad    = 32.0
 	codeRadius = 12.0
 	listIndent = 64.0
-	// listMarkerGap 是标记右缘与内容起点之间的距离。
+	// listMarkerGap 是标记右缘与内容起点之间的距离。无序符号、序号与任务列表
+	// 复选框共用这条右缘，混排时标记才不会一跳一跳。
 	listMarkerGap = 12.0
-	// listCheckX 是任务列表复选框相对列表左缘的偏移。
-	listCheckX = 16.0
 	// checkSize 是任务列表复选框的边长（GitHub 16 CSS px 的 2×）。
 	checkSize = 30.0
 	liGap     = 8.0
