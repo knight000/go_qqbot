@@ -52,12 +52,23 @@ const (
 	codePad    = 32.0
 	codeRadius = 12.0
 	listIndent = 64.0
-	liGap      = 8.0
-	quoteBar   = 8.0
-	quotePad   = 32.0
-	tablePadV  = 12.0
-	tablePadH  = 26.0
-	borderW    = 2.0
+	// listMarkerGap 是标记右缘与内容起点之间的距离。无序符号、序号与任务列表
+	// 复选框共用这条右缘，混排时标记才不会一跳一跳。
+	listMarkerGap = 12.0
+	// checkSize 是任务列表复选框的边长（GitHub 16 CSS px 的 2×）。
+	checkSize = 30.0
+	liGap     = 8.0
+	quoteBar  = 8.0
+	quotePad  = 32.0
+	tablePadV = 12.0
+	tablePadH = 26.0
+	// tableMinColWidth 是表格列宽的可读性下限：约 6 个半角字符（3 个汉字）。
+	//
+	// 没有它，压缩列宽会一路退到"最长不可断片段"，而中文可按任意字符断行，
+	// 于是那一列的最小宽度只剩 1 个汉字——一条不可断的长 token 就能把旁边的
+	// 说明列压成竖排。下限保证每列至少还能横着读三个字。
+	tableMinColWidth = 6 * fsBody / 2
+	borderW          = 2.0
 )
 
 // 颜色。全部是不透明的 Primer token；半透明色必须用 color.NRGBA，
