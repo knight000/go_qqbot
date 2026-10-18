@@ -13,10 +13,10 @@
 // 平台事实（2026-10-19 用 [debug].raw 取证）：群消息里的换行是**单独 CR**
 // （`"\r"`），不是 LF——`"content":"/md # 标题\r## 二级标题"`。goldmark 只认
 // `\n` 与 `\r\n`，于是整段被当成一个 ATX 标题画成一行（166 px 而非 466 px）。
-// 现在由网关统一归一化成 LF，插件拿到的正文就是正常多行。
+// 该差异已由网关统一归一化成 LF，插件拿到的正文就是正常多行。
 //
-// unescape 保留下来是当糖用的：想在一行里写多行时打 `\n` 即可，
-// 不必依赖客户端能否插入真换行。
+// 因此正文一律**原样**交给渲染器：所见即所渲染。反斜杠不解释，
+// 代码块里写 `C:\new`、正则里写 `\d+` 都不会被吃掉。
 package md
 
 import (
@@ -32,7 +32,7 @@ import (
 
 func init() { host.Register(&Plugin{}) }
 
-const usage = `用法：/md <markdown>，多行用 \n 分隔；例：/md # 标题\n- 一\n- 二`
+const usage = "用法：/md <markdown 源码>，可直接换行；例：/md # 标题"
 
 type Plugin struct {
 	host host.Host
@@ -42,7 +42,7 @@ type Plugin struct {
 func (p *Plugin) Manifest() host.Manifest {
 	return host.Manifest{
 		Name:         "md",
-		Version:      "0.2.0",
+		Version:      "0.3.0",
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.reply", "render", "log"},
 		Intents:      []string{"message"},
@@ -70,7 +70,6 @@ func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error
 	if src == "" {
 		return &host.Reply{Content: usage}, nil
 	}
-	src = unescape(src)
 	// 行数是区分"没换行"与"没渲染"的唯一凭据，排查换行类问题先看这行。
 	p.log.Debug("渲染请求", "bytes", len(src), "lines", strings.Count(src, "\n")+1)
 
@@ -114,38 +113,4 @@ func parse(content string) (src string, ok bool) {
 		return "", false
 	}
 	return strings.TrimSpace(rest), true
-}
-
-// unescape 把单行里写的 `\n`、`\t`、`\\` 还原成真字符。
-//
-// 这只是便利：客户端不一定能插入真换行（移动端尤其麻烦），一行里打 `\n`
-// 更省事。代价是 `C:\new` 这类路径会被当成换行——要写反斜杠就打 `\\`。
-// 只认这三个序列，其余 `\x`（`\d`、`\S` 之类正则片段）原样保留：宁可少猜，
-// 也不要把用户正则里的反斜杠吃掉。
-func unescape(s string) string {
-	if !strings.ContainsRune(s, '\\') {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		// UTF-8 的续字节都 ≥ 0x80，不可能等于 '\\'，所以按字节扫不会切坏中文。
-		if s[i] != '\\' || i+1 == len(s) {
-			b.WriteByte(s[i])
-			continue
-		}
-		switch s[i+1] {
-		case 'n':
-			b.WriteByte('\n')
-		case 't':
-			b.WriteByte('\t')
-		case '\\':
-			b.WriteByte('\\')
-		default:
-			b.WriteByte('\\') // 未知转义：留着，下一轮按普通字符处理
-			continue
-		}
-		i++
-	}
-	return b.String()
 }
