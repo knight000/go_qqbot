@@ -142,12 +142,13 @@ Commands: []host.Command{{
 
 | 指令 | 说明 |
 |---|---|
-| `/group list [allow\|deny\|all]` | 列出已登记的群：openid ↔ 名称 ↔ 名单 |
+| `/group list [allow\|deny\|all]` | 列出已登记的群：openid ↔ 名称 ↔ 名单（含已退出标记） |
 | `/group status [openid]` | 私聊不带参数看总览；群聊不带参数看当前群 |
 | `/group allow [openid]` | 加入白名单 |
 | `/group deny [openid]` | 加入黑名单 |
 | `/group clear [openid]` | 移出黑白名单 |
 | `/group name [openid] <名称>` | 更新群名称 |
+| `/group refresh` | 重新获取所有**在群**群的名称（后台跑，完成后私聊汇报） |
 
 群聊里省略 `openid` 表示当前群；按 id 操作通常在私聊进行（id 是 32 位十六进制）。
 
@@ -155,20 +156,37 @@ Commands: []host.Command{{
 - 判定发生在去重、落库、路由**之前**：未放行的群消息不落库、不触发插件，
   调试轨迹里只留一行 `群未放行，已丢弃（原因）`。
 - 群事件仍会登记 `group_openid`，所以被拦下的群也能在 `/group list` 里看到。
-- **唯一例外**：Bot 管理员在"未进白名单"的群里发 `/group allow`，用于新群自助接入；
+- **例外一**：Bot 管理员在"未进白名单"的群里发 `/group allow`，用于新群自助接入；
   黑名单是硬阻断，群内任何人都不能自助解除，只能从私聊操作。
-- 群名来自 `GET /v2/groups/{id}/info`（该接口需要内邀，错误码 `11253`）：
-  能取到就自动记录，取不到留空，用 `/group name` 补；手工名字不会被自动抓取覆盖。
+- **例外二**：入群/退群通知不走准入判定——新群此刻必然未放行，走闸门这条信息就丢了。
+
+**群生命周期**（平台事件 `GROUP_ADD_ROBOT` / `GROUP_DEL_ROBOT`）：
+
+| 事件 | 行为 |
+|---|---|
+| 机器人被拉进群 | 立即建档 + 取群名，并私聊通知（默认只发所有者） |
+| 机器人被移出群 | 标记 `left_at`，并私聊通知；**名单与名称保留**，重新拉回群时不用再授权 |
+
+- 通知收件人由 `[group].notify` 控制：`owner`（默认）｜`admin`（含管理员）｜`off`。
+  通知走主动私聊，受 `[active].enabled` 与每日预算约束。
+- 已退出的群不再计入"在群"、不再被 `/group refresh` 刷新，但仍出现在 `/group list`
+  末尾并标出退出时间。
+- **自愈**：收到该群任何消息都会清掉退出标记——断线期间丢失的入群事件靠这条兜住。
+
+**群名**来自 `GET /v2/groups/{id}/info`（该接口需要内邀，错误码 `11253`）：
+能取到就自动记录，取不到留空，用 `/group name` 补；手工名字（`name_source=manual`）
+不会被自动抓取或 `/group refresh` 覆盖。
 
 ```toml
 [group]
-whitelist  = true   # 只允许白名单群
-blacklist  = true   # 丢弃黑名单群（优先于白名单）
-fetch_name = true   # 首次见群时尝试调用群信息接口取名称
+whitelist  = true    # 只允许白名单群
+blacklist  = true    # 丢弃黑名单群（优先于白名单）
+fetch_name = true    # 见群/入群时尝试调用群信息接口取名称
+notify     = "owner" # 入群/退群通知：owner｜admin｜off
 ```
 
 > **升级提示**：白名单默认开启且初始为空，升级后所有群消息都会被丢弃。
-> 先私聊机器人 `/group list` 找到目标群 id（只要收到过该群消息就会登记），
+> 先私聊机器人 `/group list` 找到目标群 id（收到过该群消息、或机器人被拉进群时都会登记），
 > 再 `/group allow <id>`；或者以 Bot 管理员身份在群里直接发 `/group allow`。
 
 ### 为什么是 openid 而不是 QQ 号

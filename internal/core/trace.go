@@ -117,6 +117,14 @@ func (t *Trace) GroupDropped(ev *host.Event, reason string) {
 	t.emit(fmt.Sprintf("[%s] 群未放行，已丢弃（%s）：%s\n", stamp(), reason, dash(ev.PeerID)))
 }
 
+// GroupLifecycle 打印改变本地群状态的入群/退群通知。
+func (t *Trace) GroupLifecycle(action, groupID string) {
+	if !t.full() {
+		return
+	}
+	t.emit(fmt.Sprintf("[%s] 群生命周期：机器人%s %s\n", stamp(), action, dash(groupID)))
+}
+
 // NoMatch 打印没有插件认领的消息。
 func (t *Trace) NoMatch(ev *host.Event) {
 	if !t.full() {

@@ -125,7 +125,34 @@ type Group struct {
 	// 该接口目前仅白名单机器人可用（错误码 11253），取不到就留空，
 	// 之后可用 /group name 手动设置。默认开启：能取到时省一次手工操作。
 	FetchName *bool `toml:"fetch_name"`
+	// Notify 控制"入群/退群"这类群生命周期通知私聊发给谁：
+	// owner（默认，只发给所有者）| admin（所有者 + 管理员）| off（不发）。
+	// 默认只发所有者，因为新群是否放行是所有权者一个人的决定，
+	// 把每条入群通知抄送给所有管理员只会制造噪音。
+	Notify string `toml:"notify"`
 }
+
+// GroupNotifyMode 归一化 [group].notify。
+//
+// 写错的值一律回退 owner 而不是 off：通知发多了只是吵，发少了会让
+// "机器人被拉进某个群"这件本该由人决定的事悄无声息地过去。
+func (c *Config) GroupNotifyMode() string {
+	switch strings.ToLower(strings.TrimSpace(c.Group.Notify)) {
+	case "admin", "admins":
+		return NotifyAdmin
+	case "off", "none", "false", "0":
+		return NotifyOff
+	default:
+		return NotifyOwner
+	}
+}
+
+// 群生命周期通知的收件人范围。
+const (
+	NotifyOwner = "owner"
+	NotifyAdmin = "admin"
+	NotifyOff   = "off"
+)
 
 // WhitelistEnabled 返回白名单开关的最终值（默认 true）。
 func (c *Config) WhitelistEnabled() bool {

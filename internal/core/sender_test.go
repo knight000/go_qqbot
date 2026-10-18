@@ -4,21 +4,77 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/knight000/qqbot/internal/api"
 	"github.com/knight000/qqbot/internal/host"
 )
 
+// fakeAPI 记录每一次出站，并实现 groupInfoSource。
+//
+// 带锁不是洁癖：群生命周期与群名刷新都在后台协程里发消息、调接口，
+// 断言与写入必然并发，裸切片会变成随机失败。
 type fakeAPI struct {
+	mu     sync.Mutex
 	calls  int
 	bodies []api.MessageBody
+
+	// groupNames 是群信息接口的返回值；没写进 map 的群当作失败。
+	names map[string]string
+	// groupErr 让指定群返回错误（例如 11253）。
+	errs map[string]error
+	// infoCalls 记录接口调用次数，用于断言"已退出的群不该去刷"。
+	infoCalls int
 }
 
 func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.MessageBody) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	f.bodies = append(f.bodies, body)
 	return nil
+}
+
+func (f *fakeAPI) GroupInfo(ctx context.Context, groupOpenID string) (api.GroupInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.infoCalls++
+	if err := f.errs[groupOpenID]; err != nil {
+		return api.GroupInfo{}, err
+	}
+	name, ok := f.names[groupOpenID]
+	if !ok {
+		return api.GroupInfo{}, errors.New("群不存在")
+	}
+	return api.GroupInfo{GroupOpenID: groupOpenID, GroupName: name}, nil
+}
+
+func (f *fakeAPI) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeAPI) infoCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.infoCalls
+}
+
+func (f *fakeAPI) bodyAt(i int) api.MessageBody {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bodies[i]
+}
+
+func (f *fakeAPI) lastBody() (api.MessageBody, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.bodies) == 0 {
+		return api.MessageBody{}, false
+	}
+	return f.bodies[len(f.bodies)-1], true
 }
 
 func TestSenderPassiveLimitGroup(t *testing.T) {
@@ -31,15 +87,15 @@ func TestSenderPassiveLimitGroup(t *testing.T) {
 		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
 			t.Fatalf("第 %d 次回复不应失败: %v", i, err)
 		}
-		if got := f.bodies[i-1].MsgSeq; got != i {
+		if got := f.bodyAt(i - 1).MsgSeq; got != i {
 			t.Fatalf("msg_seq 应单调递增到 %d，实际 %d", i, got)
 		}
 	}
 	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrPassiveExhausted) {
 		t.Fatalf("第 6 次应耗尽额度，实际 err=%v", err)
 	}
-	if f.calls != 5 {
-		t.Fatalf("耗尽后不应再发 HTTP，实际调用 %d 次", f.calls)
+	if n := f.callCount(); n != 5 {
+		t.Fatalf("耗尽后不应再发 HTTP，实际调用 %d 次", n)
 	}
 }
 
@@ -78,18 +134,18 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 	if err := s.ForPlugin("evil").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
 		t.Fatalf("非白名单插件应被拒绝，实际 err=%v", err)
 	}
-	if f.calls != 0 {
-		t.Fatalf("被拒绝时不应发 HTTP，实际 %d 次", f.calls)
+	if n := f.callCount(); n != 0 {
+		t.Fatalf("被拒绝时不应发 HTTP，实际 %d 次", n)
 	}
 
 	if err := s.ForPlugin("bootnotice").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "上线"}); err != nil {
 		t.Fatalf("白名单插件应能发送: %v", err)
 	}
-	if f.calls != 1 {
-		t.Fatalf("应发 1 次，实际 %d 次", f.calls)
+	if n := f.callCount(); n != 1 {
+		t.Fatalf("应发 1 次，实际 %d 次", n)
 	}
-	if f.bodies[0].MsgID != "" {
-		t.Errorf("主动消息不应带 msg_id，实际 %q", f.bodies[0].MsgID)
+	if got := f.bodyAt(0).MsgID; got != "" {
+		t.Errorf("主动消息不应带 msg_id，实际 %q", got)
 	}
 }
 
@@ -112,8 +168,8 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
 		t.Fatalf("第 3 次应超出日预算，实际 err=%v", err)
 	}
-	if f.calls != 2 {
-		t.Fatalf("额度用尽后不应再发 HTTP，实际 %d 次", f.calls)
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("额度用尽后不应再发 HTTP，实际 %d 次", n)
 	}
 	// 预算是按 peer 计的，换个收件人不受影响
 	if err := p.SendActive(ctx, host.SceneC2C, "u2", host.Reply{Content: "x"}); err != nil {

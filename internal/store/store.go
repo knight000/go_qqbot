@@ -99,6 +99,8 @@ var columnMigrations = []struct {
 }{
 	{"admins", "note", "TEXT NOT NULL DEFAULT ''"},
 	{"admins", "union_openid", "TEXT NOT NULL DEFAULT ''"},
+	// 旧库没有"退出"这个概念，一律补 0（在群），与实际状态一致。
+	{"qq_groups", "left_at", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // Migrate 幂等建表并补齐新增列。

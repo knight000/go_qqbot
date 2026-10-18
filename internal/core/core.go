@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/knight000/qqbot/internal/api"
@@ -33,7 +34,7 @@ type Options struct {
 type Core struct {
 	store   *store.DB
 	cfg     *config.Config
-	api     *api.Client
+	api     groupInfoSource
 	http    *httpx.Client
 	log     *slog.Logger
 	plugins []host.Plugin
@@ -52,6 +53,10 @@ type Core struct {
 	// restart 只缓冲一条：重复的 /reload 直接返回 ErrRestartPending，
 	// 避免同一个进程被多条请求推着反复重启。
 	restart chan RestartRequest
+
+	// refreshing 保证同一时刻只有一个批量刷新群名的任务：
+	// 两个并发刷新会互相打满 30 QPM 的接口配额，还会把同一批群名写两遍。
+	refreshing atomic.Bool
 }
 
 func New(o Options) (*Core, error) {
@@ -80,10 +85,17 @@ func New(o Options) (*Core, error) {
 	dispatch.trace = trace
 	dispatch.denyReply = o.Config.Permission.DenyReply
 
+	// 显式判空再赋给接口：把 nil 的 *api.Client 存进接口会得到一个
+	// 非 nil 接口，后续 `c.api == nil` 就永远不成立。
+	var info groupInfoSource
+	if o.API != nil {
+		info = o.API
+	}
+
 	return &Core{
 		store:     o.Store,
 		cfg:       o.Config,
-		api:       o.API,
+		api:       info,
 		http:      o.HTTP,
 		log:       logger,
 		plugins:   o.Plugins,
@@ -180,13 +192,21 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	}
 
 	// 群准入：在去重与落库之前判定，未授权的群不会留下任何业务数据。
-	// 例外只给 Bot 管理员的 /group 指令——否则新群无法在群内自助加入白名单。
-	if allowed, g, reason := c.groupAccess(ctx, ev); !allowed {
-		if !c.groupControlExempt(ctx, ev, g) {
-			c.trace.GroupDropped(ev, reason)
-			c.log.Debug("群未放行，丢弃事件",
-				"peer", ev.PeerID, "mode", g.Mode, "reason", reason)
-			return
+	// 两个例外：
+	//   - Bot 管理员的 /group 指令，否则新群无法在群内自助接入；
+	//   - 群生命周期通知（入群/退群），见下。
+	//
+	// 生命周期通知不走闸门：它们描述的是机器人自身的状态变化，不是群里的消息。
+	// 新群此刻必然还没被放行，走闸门就会被丢掉，结果是"被谁拉进了哪个群"
+	// 永远没人知道。它们照样参与后面的去重。
+	if ev.Notice == host.NoticeNone {
+		if allowed, g, reason := c.groupAccess(ctx, ev); !allowed {
+			if !c.groupControlExempt(ctx, ev, g) {
+				c.trace.GroupDropped(ev, reason)
+				c.log.Debug("群未放行，丢弃事件",
+					"peer", ev.PeerID, "mode", g.Mode, "reason", reason)
+				return
+			}
 		}
 	}
 
@@ -199,6 +219,12 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	if !seen {
 		c.trace.Duplicate(ev)
 		c.log.Debug("重复事件，忽略", "event", ev.ID)
+		return
+	}
+
+	// 生命周期处理必须排在去重之后：平台重投同一条入群事件时，
+	// 不能给所有者发两遍私聊，也不能把 left_at 反复改来改去。
+	if c.handleGroupLifecycle(ctx, ev) {
 		return
 	}
 

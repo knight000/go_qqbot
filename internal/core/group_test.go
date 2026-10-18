@@ -274,7 +274,7 @@ func TestGroupCommandsFromPrivateChat(t *testing.T) {
 	// 状态总览
 	c.Handle(ctx, adminEvent("/group status", "owner-1", "", host.SceneC2C, "owner-1"))
 	got = lastReply(t, f)
-	for _, want := range []string{"白名单 开", "黑名单 开", "已记录 2 个群"} {
+	for _, want := range []string{"白名单 开", "黑名单 开", "在群 2"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("status 缺少 %q:\n%s", want, got)
 		}
