@@ -245,9 +245,10 @@ Go 项目的长期维护成本几乎全部来自依赖链，而不是自己的�
 | Markdown 解析 | `yuin/goldmark` | 纯 Go、GFM 语义完整（表格/任务列表/删除线）；`go.mod` 只有两行、零 require，是一棵没有分叉的叶子 |
 | 字体光栅 | `golang.org/x/image` | TrueType/OpenType 解析、字形光栅与 `font.Drawer` 都在这里，自写光栅器不现实；间接引入 `x/text` |
 
-后两项服务于**渲染**能力（见 §3.8）：落地前 `go.mod` 里不会出现它们。
+后两项服务于**渲染**能力（见 §3.8），已随该能力落地进入 `go.mod`：解析在 `internal/render`，
+契约（接口与哨兵）在 `internal/host/render.go`。
 
-不上依赖的部分：HTTP 用标准库 `net/http`（连接复用、超时、退避自己写，约 100 行）；测试用标准 `testing` + fake Host，不引 testify。目标 Go 版本 1.22+（`slog` 与循环变量语义修复）。
+不上依赖的部分：HTTP 用标准库 `net/http`（连接复用、超时、退避自己写，约 100 行）；测试用标准 `testing` + fake Host，不引 testify。目标 Go 版本 1.26+（`slog` 与循环变量语义修复；`modernc.org/sqlite v1.60` 要求 1.26）。
 
 ---
 
@@ -285,8 +286,12 @@ H3 40px、代码 27px / 行高 39px。完整数值落在 `internal/render/style.
 `Noto Sans Mono`（代码），均取 Regular + Bold 的**静态实例**，随附 OFL 许可文本。
 可变字体用不了——`opentype` 没有 variation axis。
 
-**错误语义**：`ErrTooLarge`（超 4000px，附实际高度，插件可拆图重试）、`ErrTimeout`（ctx 到期）、
-其余错误原样包装返回。缺字**不是错误**：画方框 + warn 日志。
+**错误语义**：`host.ErrRenderTooLarge`（超 4000px，`host.RenderTooLargeError` 附带实际所需高度，
+插件可据此拆图）、`host.ErrRenderTimeout`（ctx 到期或在等并发槽时被取消）、
+其余错误原样包装返回。两个哨兵定义在 `host` 而不是实现包——插件只 import `host`，
+放实现包里插件的 `errors.Is` 就拿不到。未注入实现时 `Host.Renderer()` 返回**拒绝性 stub**
+（永不 nil），且其错误刻意不命中上述哨兵：环境没装配要与内容有问题可区分。
+缺字**不是错误**：画方框 + warn 日志。
 
 **明确不做**：HTML（需要浏览器内核）、图片 / 内嵌 HTML / 公式 / 脚注 / 语法高亮 / 彩色 emoji
 （未识别语法按纯文本原样输出，不报错）、缓存、页脚时间戳、深色主题、自动分页。
