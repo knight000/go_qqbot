@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -77,7 +76,7 @@ func msg(content string) *host.Event {
 	return &host.Event{ID: "e1", Kind: host.KindMessage, Scene: host.SceneGroup, Content: content}
 }
 
-// 指令判定是插件自己的事：Manifest 里的前缀/正则只是粗筛。
+// 指令判定是插件自己的事：Manifest 里的前缀只是粗筛（裸 HasPrefix 会命中 /md5）。
 func TestParse(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -86,13 +85,15 @@ func TestParse(t *testing.T) {
 		note string
 	}{
 		{in: "/md # 标题", src: "# 标题", ok: true},
-		{in: "md # 标题", src: "# 标题", ok: true},
 		{in: "  /md   两侧空格  ", src: "两侧空格", ok: true},
 		{in: "/md", src: "", ok: true, note: "只有指令 -> 回用法"},
-		{in: "  md  ", src: "", ok: true},
+		{in: "  /md  ", src: "", ok: true},
+		{in: "/md\n# 标题", src: "# 标题", ok: true, note: "换行也算分隔"},
 		{in: "/md\n    indented code", src: "indented code", ok: true},
-		{in: "mdline1\nline2", src: "mdline1\nline2", ok: false, note: "整段保留换行"},
+		{in: "md # 标题", ok: false, note: "裸写不触发"},
+		{in: "md", ok: false},
 		{in: "/md5 abc", ok: false, note: "不能吃掉 /md5"},
+		{in: "/mdx", ok: false},
 		{in: "md5sum foo", ok: false},
 		{in: "hello", ok: false},
 		{in: "", ok: false},
@@ -141,14 +142,12 @@ func TestHandleRendersImage(t *testing.T) {
 // 空内容回用法，且不碰渲染器——传 nil 渲染器也不会 panic。
 func TestHandleUsage(t *testing.T) {
 	p, _ := newPlugin(t, nil)
-	for _, in := range []string{"/md", "md"} {
-		reply, err := p.Handle(context.Background(), msg(in))
-		if err != nil {
-			t.Fatalf("Handle(%q): %v", in, err)
-		}
-		if reply == nil || !strings.Contains(reply.Content, "用法") {
-			t.Fatalf("Handle(%q) 应回用法，实际 %+v", in, reply)
-		}
+	reply, err := p.Handle(context.Background(), msg("/md"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply == nil || !strings.Contains(reply.Content, "用法") {
+		t.Fatalf("应回用法，实际 %+v", reply)
 	}
 }
 
@@ -192,25 +191,21 @@ func TestManifestIsLoadable(t *testing.T) {
 	if m.APIVersion != host.APIVersion {
 		t.Fatalf("APIVersion=%q，核心要求 %q", m.APIVersion, host.APIVersion)
 	}
-	if len(m.Commands) == 0 || len(m.Intents) == 0 {
-		t.Fatal("必须声明命令与订阅事件，否则插件收不到任何消息")
+	if len(m.Intents) == 0 {
+		t.Fatal("必须订阅事件，否则插件收不到任何消息")
 	}
-	for _, c := range m.Commands {
-		if (c.Prefix == "") == (c.Pattern == "") {
-			t.Fatalf("命令 %q 必须且只能设置 Prefix 或 Pattern 之一", c.Prefix+c.Pattern)
-		}
-		if c.Pattern != "" {
-			if _, err := regexp.Compile(c.Pattern); err != nil {
-				t.Fatalf("正则 %q 无法编译: %v", c.Pattern, err)
-			}
-		}
+	// 只留 /md 一条：多声明一条 Pattern 命令就等于把裸写形式又放回来了。
+	// 同时锁住"Prefix 非空"——两者都空/都非空核心会在装配期直接拒不加载。
+	if len(m.Commands) != 1 || m.Commands[0].Prefix != "/md" || m.Commands[0].Pattern != "" {
+		t.Fatalf("应只声明 /md 一条前缀命令，实际 %+v", m.Commands)
 	}
 }
 
 // 不是本指令时返回 (nil, nil)：让出给优先级更低的插件。
+// 裸写 md 必须安静放行——这是刻意的取舍，不是漏判。
 func TestHandlePassThrough(t *testing.T) {
 	p, _ := newPlugin(t, &stubRenderer{img: host.ImageFromBytes([]byte("png"))})
-	for _, in := range []string{"hello", "/ping", "/md5 abc", "md5sum x"} {
+	for _, in := range []string{"hello", "/ping", "/md5 abc", "/mdx", "md5sum x", "md # 标题", "md"} {
 		reply, err := p.Handle(context.Background(), msg(in))
 		if err != nil || reply != nil {
 			t.Fatalf("Handle(%q) 应放行，实际 %+v, %v", in, reply, err)
