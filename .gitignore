@@ -21,3 +21,7 @@ qqbot.exe
 .vscode/
 .workbuddy/
 *.swp
+
+# Python 工具的字节码缓存（tools/ 下只有生成期脚本）
+__pycache__/
+*.pyc
