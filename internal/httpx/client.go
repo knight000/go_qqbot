@@ -137,6 +137,14 @@ func (c *Client) PostJSONOnce(ctx context.Context, rawURL string, header map[str
 	return c.doWithRetries(ctx, http.MethodPost, rawURL, header, body, out, 0)
 }
 
+// GetJSONOnce 只尝试一次，不重试。
+//
+// 给"配额由调用方自己记账"的场景用：出站层的隐式重试不经过业务配额，
+// 按本地为准的账会被放大 2–3 倍。调用方愿意重试时自己决定节奏与退避。
+func (c *Client) GetJSONOnce(ctx context.Context, rawURL string, header map[string]string, out any) error {
+	return c.doWithRetries(ctx, http.MethodGet, rawURL, header, nil, out, 0)
+}
+
 func encode(in any) ([]byte, error) {
 	if in == nil {
 		return nil, nil
