@@ -61,6 +61,16 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 
 `-debug` 会顺带把 `log.level` 降到 `debug`，两边细节保持一致。轨迹走 stdout，时间戳在终端里是青蓝色；同一套判定也用在日志上（`WARN` 黄、`ERROR` 红），一旦重定向到文件就全部退回纯文本，落盘的内容可以直接 grep。
 
+普通日志与轨迹共用同一副行首，扫起来是连续的：
+
+```
+[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping 权限=bot-admin
+[13:50:34] [WARN] 队列已满，丢弃事件 peer=g1
+[13:50:34] [ERROR] 插件处理失败 plugin=md err="i/o timeout"
+```
+
+值只有必要时才加引号（空格、等号、引号、控制字符），所以 `peer=g1` 能直接 grep；`format = "json"` 时仍是标准 slog JSON，供机器读取。
+
 ### `level = "full"`（默认）
 
 ```

@@ -2,69 +2,128 @@ package logx
 
 import (
 	"bytes"
+	"context"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/knight000/go_qqbot/internal/termcolor"
 )
 
-// 上色只认行首那个 level 字段：正文里出现同样的字样不能误伤。
-func TestColorizeLevel(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string // 空表示"原样返回"
-	}{
-		{
-			name: "WARN 黄",
-			in:   `time=2026-10-19T01:00:00.000+08:00 level=WARN msg="队列已满"`,
-			want: `time=2026-10-19T01:00:00.000+08:00 level=` + termcolor.Yellow + `WARN` + termcolor.Reset + ` msg="队列已满"`,
-		},
-		{
-			name: "ERROR 红",
-			in:   `time=2026-10-19T01:00:00.000+08:00 level=ERROR msg="连接失败" err="i/o timeout"`,
-			want: `time=2026-10-19T01:00:00.000+08:00 level=` + termcolor.Red + `ERROR` + termcolor.Reset + ` msg="连接失败" err="i/o timeout"`,
-		},
-		{
-			name: "INFO 不动",
-			in:   `time=2026-10-19T01:00:00.000+08:00 level=INFO msg=ok`,
-		},
-		{
-			name: "DEBUG 不动",
-			in:   `time=2026-10-19T01:00:00.000+08:00 level=DEBUG msg=ok`,
-		},
-		{
-			name: "正文里的 level=ERROR 不误伤",
-			in:   `time=2026-10-19T01:00:00.000+08:00 level=INFO msg="他说 level=ERROR 才是问题"`,
-		},
-	}
+var testTime = time.Date(2026, 10, 19, 13, 50, 33, 666e6, time.Local)
 
+func record(msg string, lv slog.Level, attrs ...slog.Attr) slog.Record {
+	r := slog.NewRecord(testTime, lv, msg, 0)
+	r.AddAttrs(attrs...)
+	return r
+}
+
+// 文本日志的骨架：`[HH:MM:SS] [LEVEL] msg k=v`，正文不因为含空格被加引号。
+func TestTextFormat(t *testing.T) {
+	var buf bytes.Buffer
+	h := newTextHandler(&buf, slog.LevelInfo, false)
+	r := record("adminping 插件已初始化", slog.LevelInfo,
+		slog.String("plugin", "adminping"), slog.String("权限", "bot-admin"))
+	if err := h.Handle(context.Background(), r); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	want := "[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping 权限=bot-admin\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("格式不符\n期望 %q\n实际 %q", want, got)
+	}
+}
+
+// 值里的空格要加引号，否则 `err=i/o timeout` 会被读成两个字段。
+func TestTextFormatQuotesValues(t *testing.T) {
+	var buf bytes.Buffer
+	h := newTextHandler(&buf, slog.LevelInfo, false)
+	if err := h.Handle(context.Background(), record("调用失败", slog.LevelWarn,
+		slog.String("err", "i/o timeout"))); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if want := `err="i/o timeout"`; !strings.Contains(buf.String(), want) {
+		t.Fatalf("期望包含 %q，实际 %q", want, buf.String())
+	}
+}
+
+// 终端里时间戳青蓝、WARN 黄、ERROR 红；INFO 的等级标签不上色。
+func TestTextColors(t *testing.T) {
+	cases := []struct {
+		name  string
+		level slog.Level
+		msg   string
+		tag   string // 已上色的等级标签
+	}{
+		{"WARN 黄", slog.LevelWarn, "队列已满", termcolor.Wrap(termcolor.Yellow, "[WARN]")},
+		{"ERROR 红", slog.LevelError, "连接失败", termcolor.Wrap(termcolor.Red, "[ERROR]")},
+		{"INFO 只有时间是彩色", slog.LevelInfo, "普通", "[INFO]"},
+	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			want := c.want
-			if want == "" {
-				want = c.in
+			var buf bytes.Buffer
+			h := newTextHandler(&buf, slog.LevelDebug, true)
+			if err := h.Handle(context.Background(), record(c.msg, c.level)); err != nil {
+				t.Fatalf("Handle: %v", err)
 			}
-			if got := string(colorizeLevel([]byte(c.in))); got != want {
-				t.Fatalf("上色结果不符\n期望 %q\n实际 %q", want, got)
+			want := termcolor.Wrap(termcolor.Cyan, "[13:50:33]") + " " + c.tag + " " + c.msg + "\n"
+			if got := buf.String(); got != want {
+				t.Fatalf("上色不符\n期望 %q\n实际 %q", want, got)
 			}
 		})
 	}
 }
 
-// Write 必须按输入长度计数：TextHandler 依赖 io.Writer 的契约，
-// 返回实际写出的字节数（多了几个转义码）会被当成短写。
-func TestLevelColorWriterCountsInputBytes(t *testing.T) {
+// WithAttrs 在 WithGroup 之前定格，之后的 attrs 才带组前缀——与 TextHandler 一致。
+func TestTextHandlerGroups(t *testing.T) {
 	var buf bytes.Buffer
-	in := []byte("time=x level=WARN msg=w\n")
-	n, err := levelColorWriter{w: &buf}.Write(in)
-	if err != nil {
-		t.Fatalf("Write: %v", err)
+	h := newTextHandler(&buf, slog.LevelInfo, false).
+		WithAttrs([]slog.Attr{slog.String("component", "gateway")}).
+		WithGroup("db")
+	h2 := h.WithAttrs([]slog.Attr{slog.Int("rows", 3)})
+	if err := h2.Handle(context.Background(), record("查询完成", slog.LevelInfo, slog.Bool("ok", true))); err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
-	if n != len(in) {
-		t.Fatalf("应返回输入长度 %d，实际 %d", len(in), n)
+	want := "[13:50:33] [INFO] 查询完成 component=gateway db.rows=3 db.ok=true\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("分组格式不符\n期望 %q\n实际 %q", want, got)
 	}
-	if !strings.Contains(buf.String(), termcolor.Yellow+"WARN"+termcolor.Reset) {
-		t.Fatalf("输出未上色: %q", buf.String())
+}
+
+// 换行必须转义，否则一条记录会被拆成两行。
+func TestTextFormatQuotesMultilineMessage(t *testing.T) {
+	var buf bytes.Buffer
+	h := newTextHandler(&buf, slog.LevelInfo, false)
+	if err := h.Handle(context.Background(), record("第一行\n第二行", slog.LevelInfo)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if want := `"第一行\n第二行"`; !strings.Contains(buf.String(), want) {
+		t.Fatalf("多行正文应被转义，期望包含 %q，实际 %q", want, buf.String())
+	}
+	if strings.Count(buf.String(), "\n") != 1 {
+		t.Fatalf("一条记录只能占一行，实际 %q", buf.String())
+	}
+}
+
+// 空消息不留多余空格：`[13:50:33] [INFO] k=v`。
+func TestTextFormatEmptyMessage(t *testing.T) {
+	var buf bytes.Buffer
+	h := newTextHandler(&buf, slog.LevelInfo, false)
+	if err := h.Handle(context.Background(), record("", slog.LevelInfo, slog.String("k", "v"))); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if want := "[13:50:33] [INFO] k=v\n"; buf.String() != want {
+		t.Fatalf("空消息格式不符\n期望 %q\n实际 %q", want, buf.String())
+	}
+}
+
+// 等级过滤：低于配置等级的记录直接不写。
+func TestTextHandlerEnabled(t *testing.T) {
+	h := newTextHandler(new(bytes.Buffer), slog.LevelWarn, false)
+	if h.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatalf("warn 级别不应放行 info")
+	}
+	if !h.Enabled(context.Background(), slog.LevelWarn) || !h.Enabled(context.Background(), slog.LevelError) {
+		t.Fatalf("warn 级别应放行 warn 与 error")
 	}
 }
