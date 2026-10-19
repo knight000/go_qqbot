@@ -24,9 +24,10 @@ qqbot.exe
 !/plugins/bootnotice
 !/plugins/md
 
-# 把私有插件编进二进制的唯一开关，每个工作区自己维护，不入库。
-# 没有它时 cmd/bot 只带示例插件——这正是核心仓克隆下来就能构建的原因。
-/cmd/bot/private_plugins.go
+# 由 tools/genplugins 生成：把 plugins/ 下的插件编进二进制的唯一开关。
+# 不入库——核心仓克隆下来只带 main.go 里的示例插件，插件工作区跑一次
+# `go generate ./cmd/bot` 即可把新插件纳入构建。
+/cmd/bot/plugins_gen.go
 
 # 编辑器 / 本地工具状态
 .idea/

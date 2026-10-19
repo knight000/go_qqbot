@@ -35,6 +35,8 @@ go run ./cmd/bot          # 不填 -c 时默认读相对路径 config/config.loc
 
 默认路径是**相对当前工作目录**的 `config/config.local.toml`；换目录启动或改用 `/etc/qqbot/config.toml` 时用 `-c <路径>` 指定。
 
+私有插件放进 `plugins/<repo>/` 后，跑一次 `go generate ./cmd/bot` 把它编进二进制。生成物 `cmd/bot/plugins_gen.go` 不入库，所以核心仓克隆下来只带示例插件（见 ARCHITECTURE §3.5）。
+
 启动日志里会出现：
 
 ```
