@@ -7,7 +7,7 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | 模块 | 内容 |
 |---|---|
 | `internal/config` | TOML 配置、默认值、环境变量覆盖、启动校验 |
-| `internal/httpx` | 统一出站：https 强制、域名白名单、令牌桶、重试与全抖动退避 |
+| `internal/httpx` | 统一出站：https 强制、域名白名单、按域名分桶的令牌桶、重试与全抖动退避 |
 | `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息、富媒体上传（`/files`） |
 | `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避 |
 | `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、发图（上传 + `msg_type=7`）、调度器、7 天 GC、`/reload` 自重启、`/reset` 分级重置 |
@@ -483,7 +483,7 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 | 层 | 位置 | 职责 |
 |---|---|---|
 | 协议账本（必须本地） | `internal/core/sender.go` | 被动窗口与次数、`msg_id + msg_seq` 原子分配；文档明确同一 `msg_id + msg_seq` 重复发送会失败 |
-| 接口限流（粗粒度） | `internal/httpx` | 全 Bot 出站令牌桶；发消息走 `PostJSONOnce`，不自动重试 |
+| 接口限流（粗粒度） | `internal/httpx` | 全进程出站令牌桶，可按域名分桶（`[http.domains]`）；发消息走 `PostJSONOnce`，不自动重试 |
 | 返回值校正 | `sender` / `dispatch` | 429 → `ErrRateLimited` 告警；401 → 刷新 token |
 
 不能只依赖返回值的三个原因：
@@ -503,7 +503,7 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 - **不做**：入群欢迎语。`GROUP_ADD_ROBOT` 载荷没有 `msg_id`，只能走主动消息，不值（§8.5）；
 - **不做**：对外 REST 接口。进程不监听任何入站端口，全部为出站调用（§11）；
 - **搁置**：分片上传。出站图片只支持 ≤ 5 MB 的 base64 直传，更大的图本地直接拒绝；大图请用 `ImageFromURL`，下载发生在平台侧；
-- **搁置**：`plugins/torn` 业务插件与 Torn 限流/缓存分层；
+- **在插件仓做**：`plugins/torn` 业务插件与 Torn 限流/缓存分层。核心侧的前置能力（带请求头的 GET、只发一次、按请求放宽超时、按域名分桶、配置解码）已就绪，见 `docs/ARCHITECTURE.md §6` 与插件仓的设计文档；
 - **待做**：多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
 
 `/grant` / `/revoke` 已删除（不是搁置）：功能由 `/admin add|rm` 取代，指令与保留前缀一并清理。

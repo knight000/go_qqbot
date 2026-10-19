@@ -111,7 +111,7 @@ func TestComposeContainsStartAndPlugins(t *testing.T) {
 }
 
 func TestNotifySendsToReachableAdminsOnly(t *testing.T) {
-	p, h := newPlugin(t, nil, fakeDir{
+	p, h := newPlugin(t, host.Params{}, fakeDir{
 		{Role: "owner", C2COpenID: "c2c-owner"},
 		{Role: "admin", C2COpenID: ""}, // 只有群身份，无法私聊
 	})
@@ -133,7 +133,7 @@ func TestNotifySendsToReachableAdminsOnly(t *testing.T) {
 }
 
 func TestNotifySkipsWhenNoReachableAdmin(t *testing.T) {
-	p, h := newPlugin(t, nil, fakeDir{{Role: "owner", C2COpenID: ""}})
+	p, h := newPlugin(t, host.Params{}, fakeDir{{Role: "owner", C2COpenID: ""}})
 	p.delay = 0
 	p.run(context.Background())
 
@@ -144,7 +144,7 @@ func TestNotifySkipsWhenNoReachableAdmin(t *testing.T) {
 
 // 崩溃重启时不得反复刷屏：距上次启动不足 min_interval 整轮跳过。
 func TestNotifySuppressedWithinMinInterval(t *testing.T) {
-	p, h := newPlugin(t, nil, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
+	p, h := newPlugin(t, host.Params{}, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
 	p.delay = 0
 	h.kv.m[keyLastStart] = []byte(time.Now().Add(-time.Minute).Format(time.RFC3339))
 
@@ -166,7 +166,7 @@ func TestNotifySuppressedWithinMinInterval(t *testing.T) {
 
 // 发送失败重试一次，仍失败则放弃，并把失败如实留在日志里。
 func TestNotifyRetriesOnce(t *testing.T) {
-	p, h := newPlugin(t, nil, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
+	p, h := newPlugin(t, host.Params{}, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
 	p.delay = 0
 	p.retryDelay = time.Millisecond // 0 表示不重试，这里要测重试所以给个极小值
 	p.minInterval = 0               // 用例内会连着跑两次，关掉间隔抑制
@@ -187,7 +187,7 @@ func TestNotifyRetriesOnce(t *testing.T) {
 // /reload 是管理员显式重启，必须发通知：否则"重启后确认更新是否生效"没有回执。
 func TestNotifyIgnoresIntervalAfterReload(t *testing.T) {
 	t.Setenv(buildinfo.RestartEnv, "1")
-	p, h := newPlugin(t, nil, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
+	p, h := newPlugin(t, host.Params{}, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
 	p.delay = 0
 	// 落在 min_interval 窗口内
 	h.kv.m[keyLastStart] = []byte(time.Now().Add(-time.Minute).Format(time.RFC3339))
@@ -206,7 +206,7 @@ func TestNotifyIgnoresIntervalAfterReload(t *testing.T) {
 }
 
 func TestDisabledPluginDoesNotStart(t *testing.T) {
-	p, h := newPlugin(t, host.Params{"enabled": "false"}, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
+	p, h := newPlugin(t, host.NewParams("bootnotice", map[string]any{"enabled": "false"}), fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
 	if p.enabled {
 		t.Fatal("enabled=false 应关闭插件")
 	}
