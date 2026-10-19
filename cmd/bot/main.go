@@ -1,6 +1,9 @@
 // Command bot 是唯一装配点：加载配置 → 打开存储 → 构造核心 → 连接网关。
 //
-// 加插件只需在下方 blank import 一行（P1 编译期注册），见 ARCHITECTURE.md §3.1。
+// 内置插件在本文件 blank import（P1 编译期注册，见 ARCHITECTURE.md §3.1）；
+// plugins/ 下的其余插件由 tools/genplugins 生成到 plugins_gen.go，见 §3.5。
+//
+//go:generate go run ../../tools/genplugins
 package main
 
 import (

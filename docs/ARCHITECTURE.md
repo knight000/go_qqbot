@@ -226,15 +226,17 @@ qqbot/
 go_qqbot/                       核心工作区：只带示例插件，git pull 即更新
 qqbot-plugin-torn/              插件工作区：核心仓的克隆
   plugins/qqbot-plugin-torn/    ← 插件仓（自己的 .git），commit/push 只影响它自己
-  cmd/bot/private_plugins.go    ← 未跟踪：把插件编进二进制的唯一开关
+  cmd/bot/plugins_gen.go        ← 生成物，未跟踪：把 plugins/ 全部插件编进二进制
 ```
 
 - **核心更新**：两个工作区各自 `git pull`。插件目录被忽略，外层 pull 不会与插件的本地提交冲突，也不需要 bump 指针。
 - **插件更新**：进入 `plugins/<repo>/` 提交推送，不产生任何核心仓提交。
-- **编进二进制**：`cmd/bot/private_plugins.go` 里一行 blank import（`_ "github.com/knight000/go_qqbot/plugins/<repo>"`）。该文件不入库，所以核心仓永远只引用示例插件，克隆即可构建。
+- **编进二进制**：放入 `plugins/<repo>/` 后跑一次 `go generate ./cmd/bot`，`tools/genplugins` 扫描目录、生成 `cmd/bot/plugins_gen.go`（一行一个 blank import）。生成物不入库，所以核心仓永远只带 `main.go` 里写死的示例插件，克隆即可构建。
 - **插件目录不能有 `go.mod`**：嵌套模块会让 `go build ./...` 静默跳过它。要单独跑测试就在工作区里 `go test ./plugins/<repo>/...`。
 
-推论：同一个核心提交在不同工作区可能产出不同二进制（取决于该工作区有没有 `private_plugins.go`）。这是「核心不引用业务插件」的代价，换来核心仓克隆即可构建、插件仓有独立提交历史。
+**为什么需要「生成」这一步**：Go 的 import 是静态的，编译器不会去发现目录里的包，`go build ./...` 只编译不链接，未 import 的包会被丢弃。所以"放入即生效"在 Go 里没有零步骤方案；生成器是成本最低的那个——它只读目录名，不解析代码，40 行，无第三方依赖。
+
+推论：同一个核心提交在不同工作区可能产出不同二进制（取决于 `plugins_gen.go` 生成时目录里有什么）。这是「核心不引用业务插件」的代价，换来核心仓克隆即可构建、插件仓有独立提交历史。
 
 > 为什么不拆成独立 module：`internal/host` 按 Go 规则只能被 `github.com/knight000/go_qqbot/` 路径下的包 import，另一个模块路径必然编译失败；把契约移出 `internal/` 是另一件事，当前不做。
 
