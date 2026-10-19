@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -244,7 +245,7 @@ func (h *httpClient) GetJSON(ctx context.Context, url string, out any) error {
 	if err != nil {
 		return err
 	}
-	return c.GetJSON(ctx, url, out)
+	return wrapHTTPErr(c.GetJSON(ctx, url, out))
 }
 
 func (h *httpClient) GetJSONWithHeader(ctx context.Context, url string, header map[string]string, out any) error {
@@ -252,7 +253,7 @@ func (h *httpClient) GetJSONWithHeader(ctx context.Context, url string, header m
 	if err != nil {
 		return err
 	}
-	return c.GetJSONWithHeader(ctx, url, header, out)
+	return wrapHTTPErr(c.GetJSONWithHeader(ctx, url, header, out))
 }
 
 func (h *httpClient) GetJSONOnce(ctx context.Context, url string, header map[string]string, out any) error {
@@ -260,7 +261,9 @@ func (h *httpClient) GetJSONOnce(ctx context.Context, url string, header map[str
 	if err != nil {
 		return err
 	}
-	return c.GetJSONOnce(ctx, url, header, out)
+	// 429 / 5xx 走的是 httpx 循环里保存的 lastErr，同样是 *httpx.HTTPError，
+	// 所以转换必须发生在这里，而不是只包住 GetJSONWithHeader。
+	return wrapHTTPErr(c.GetJSONOnce(ctx, url, header, out))
 }
 
 func (h *httpClient) WithTimeout(d time.Duration) HTTP {
@@ -277,7 +280,24 @@ func (h *httpClient) PostJSON(ctx context.Context, url string, in, out any) erro
 	if err != nil {
 		return err
 	}
-	return c.PostJSON(ctx, url, in, out)
+	return wrapHTTPErr(c.PostJSON(ctx, url, in, out))
+}
+
+// wrapHTTPErr 把 httpx 的非 2xx 错误翻译成宿主契约里的类型，
+// 让插件不必 import internal/httpx。
+//
+// 刻意不 Unwrap 出原始的 *httpx.HTTPError：两个类型同时可命中会让调用方
+// 分不清该信哪个，也会让「插件只依赖 host」这条边界在错误处理上失效。
+// 非 HTTPError 的错误（网络失败、ctx 取消、解析失败）原样返回。
+func wrapHTTPErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var he *httpx.HTTPError
+	if errors.As(err, &he) {
+		return &HTTPStatusError{Status: he.Status, Body: he.Body}
+	}
+	return err
 }
 
 // pluginSched 替插件把 JobSpec.Plugin 填上。
