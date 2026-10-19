@@ -270,6 +270,8 @@ retry_delay = "30s"
 
 Go 插件是编译期静态链接的，改动无法热替换；`/reload` 的做法是**重新执行磁盘上的二进制**，用来回答"新构建到底部署上没有"。
 
+这里有一个容易误解的点：`/reload` **不重新编译，也不扫 `plugins/`**。插件靠 `host.Register` 在 `init()` 注册，哪些插件包被链接进来由 `cmd/bot/plugins_gen.go` 的 blank import 决定。所以新克隆一个插件仓库后直接 `/reload`，不会有任何变化——磁盘上的二进制必须先被换掉。
+
 ```
 /reload              重启
 /reload 上线 v0.2     重启，备注写进日志
@@ -295,6 +297,20 @@ Go 插件是编译期静态链接的，改动无法热替换；`/reload` 的做�
 
 版本串带 `+dirty` 表示构建时工作区有未提交改动——部署的不是干净构建时一眼能看出来。
 
+### 开发期：让新插件随 `/reload` 生效
+
+用 `tools/devrun` 托管进程，它在前台持有终端，循环执行「`go generate` → `go build` → 换二进制 → 拉起」：
+
+```bash
+go run ./tools/devrun -c config/config.local.toml
+```
+
+此后每次 `/reload` 都会重新扫描 `plugins/`，新放入的插件随之加载。编译失败时它会打印错误并用**旧二进制**继续运行，机器人不会掉线。
+
+原理：bot 在 `QQBOT_SUPERVISOR=1` 下把 `/reload` 从「自己换映像」改为**以退出码 75 退出**，由父进程接手重编译。Windows 没有 `execve`，这一步还顺带解决了「每次重载都把终端丢回提示符」的问题——终端始终由 devrun 占着，日志连续。
+
+生产环境不设置该变量，行为与下一节完全一致。
+
 ### 部署更新的完整步骤
 
 ```bash
@@ -311,7 +327,8 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 
 ### 几个边界
 
-- `go run ./cmd/bot` 下 `/reload` 只会重启同一份临时构建，**不会重新编译**；回复里会明确提示这一点。
+- `go run ./cmd/bot` 下 `/reload` 只会重启同一份临时构建，**不会重新编译**；回复里会明确提示这一点。开发时请改用 `tools/devrun`（见上一节）。
+- `tools/devrun` 只在开发工作区有意义：它需要源码与 Go 工具链。服务器上部署的是二进制，`/reload` 仍是「换文件 + execve」。
 - 同一进程只接受一条重启请求，重复发只回「已有重启请求」。
 - `/reload` 与 `/reset` 无关：前者重启进程并重读配置，后者按级别清数据（见下一节）。
 - 插件不能声明 `/reload` / `/restart` 前缀，否则启动即拒绝加载。
