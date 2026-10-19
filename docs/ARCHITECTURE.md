@@ -124,6 +124,16 @@ D5 的前提有两层，必须分清：
   实例，可以同时跑。但这不等于同一 appID 可以多进程：网关 session 是按
   appID + 分片分配的，同分片两个进程仍会互顶（`4902 reset by resume`），
   只有 `[bot].shard_id` 不同的分片部署是合法的多进程形态。
+- **开发期可由 supervisor 托管**：`tools/devrun` 在前台持有终端，把 `/reload` 变成
+  「退出码 75 → 重新 `go generate` + `go build` → 换掉磁盘上的二进制 → 拉起」。
+  这是唯一能让**新放入 `plugins/` 的插件生效**的路径：`/reload` 本身只重新执行
+  磁盘上已有的二进制，不重编译、不扫目录（插件由 `host.Register` 在 `init()` 注册，
+  链接哪些包取决于 `plugins_gen.go` 的 blank import）。
+  协议只有两个约定：环境变量 `QQBOT_SUPERVISOR=1`（由 devrun 注入）与退出码 75
+  （`EX_TEMPFAIL`）。生产不设置该变量——服务器上没有源码与工具链，`/reload` 仍是
+  换二进制后 execve，与本节前述行为一致。
+  Windows 没有 `execve`，supervisor 也无法让 PID 保持不变；它解决的是「终端不释放」
+  与「重载前重新编译」，不是进程替换语义。
 
 ### 2.2 三条数据流
 
