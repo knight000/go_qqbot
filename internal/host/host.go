@@ -17,7 +17,10 @@ import (
 // JobRunner 可能收到非空的 Peer。
 //
 // 版本 5：Host 新增 Renderer()，插件可把 markdown 文档源画成图片。
-const APIVersion = "5"
+//
+// 版本 6：Host.HTTP 新增 GetJSONWithHeader（带鉴权头）、GetJSONOnce（不重试）、
+// WithTimeout（按请求放宽超时，共享连接池与限流状态）。
+const APIVersion = "6"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -195,9 +198,21 @@ type KV interface {
 }
 
 // HTTP 是统一出站客户端，域名必须在 Manifest.AllowedDomains 中声明。
+//
+// 所有方法都经过同一套白名单、连接池与进程级限流；`WithTimeout` 返回的视图
+// 与调用者共享这些状态，只替换整体超时。
 type HTTP interface {
 	GetJSON(ctx context.Context, url string, out any) error
 	PostJSON(ctx context.Context, url string, in, out any) error
+	// GetJSONWithHeader 与 GetJSON 相同，额外附加一组请求头。
+	// 请求头由调用方负责（鉴权、User-Agent 等），核心不解释其含义。
+	GetJSONWithHeader(ctx context.Context, url string, header map[string]string, out any) error
+	// GetJSONOnce 只尝试一次，不重试。配额由调用方自己记账时必须用它：
+	// 出站层的隐式重试不经过业务配额，会把账放大 2–3 倍。
+	GetJSONOnce(ctx context.Context, url string, header map[string]string, out any) error
+	// WithTimeout 返回共享连接池与全部限流状态、只替换整体超时的视图。
+	// 返回接口而不是具体类型，以便与其他修饰器自由串联。
+	WithTimeout(d time.Duration) HTTP
 }
 
 // JobSpec 是插件注册的定时任务。Plugin 字段由 Host 填充。

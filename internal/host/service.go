@@ -247,6 +247,31 @@ func (h *httpClient) GetJSON(ctx context.Context, url string, out any) error {
 	return c.GetJSON(ctx, url, out)
 }
 
+func (h *httpClient) GetJSONWithHeader(ctx context.Context, url string, header map[string]string, out any) error {
+	c, err := h.client()
+	if err != nil {
+		return err
+	}
+	return c.GetJSONWithHeader(ctx, url, header, out)
+}
+
+func (h *httpClient) GetJSONOnce(ctx context.Context, url string, header map[string]string, out any) error {
+	c, err := h.client()
+	if err != nil {
+		return err
+	}
+	return c.GetJSONOnce(ctx, url, header, out)
+}
+
+func (h *httpClient) WithTimeout(d time.Duration) HTTP {
+	// 后端缺失时保持"调用即报错"的行为，不要在这里换成 nil 客户端：
+	// 插件会因为拿不到错误而误以为请求成功。
+	if h.raw == nil {
+		return h
+	}
+	return &httpClient{raw: h.raw.WithTimeout(d), domains: h.domains}
+}
+
 func (h *httpClient) PostJSON(ctx context.Context, url string, in, out any) error {
 	c, err := h.client()
 	if err != nil {
