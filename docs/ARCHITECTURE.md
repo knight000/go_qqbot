@@ -211,14 +211,34 @@ qqbot/
   internal/host/               Host 接口实现（插件唯一可见的 API）
   internal/store/              schema、迁移、GC
   internal/httpx/              统一出站客户端
-  plugins/torn/                插件：Torn 查询
+  plugins/qqbot-plugin-torn/   插件：Torn 查询（独立仓的嵌套克隆，未跟踪）
   plugins/echo/                插件：最小示例，兼作契约回归用例
   config/config.toml           全局配置，插件配置在 [plugins.<name>]
   deploy/qqbot.service
   docs/ARCHITECTURE.md
 ```
 
-复用方式：`plugins/*` 与 `internal/host` 可拆为独立 Go module，供其他机器人项目引用；业务插件不 import `internal/gateway`，所以换接入层（例如将来支持别的 IM）时插件零改动。
+**Go 构建不拆分**：私有插件不是独立 module，也不是 submodule——它是放在 `plugins/<repo>/` 下的一个**嵌套克隆**，被 `.gitignore` 忽略，随核心模块一起编译。
+
+**双工作区**：
+
+```
+go_qqbot/                       核心工作区：只带示例插件，git pull 即更新
+qqbot-plugin-torn/              插件工作区：核心仓的克隆
+  plugins/qqbot-plugin-torn/    ← 插件仓（自己的 .git），commit/push 只影响它自己
+  cmd/bot/private_plugins.go    ← 未跟踪：把插件编进二进制的唯一开关
+```
+
+- **核心更新**：两个工作区各自 `git pull`。插件目录被忽略，外层 pull 不会与插件的本地提交冲突，也不需要 bump 指针。
+- **插件更新**：进入 `plugins/<repo>/` 提交推送，不产生任何核心仓提交。
+- **编进二进制**：`cmd/bot/private_plugins.go` 里一行 blank import（`_ "github.com/knight000/go_qqbot/plugins/<repo>"`）。该文件不入库，所以核心仓永远只引用示例插件，克隆即可构建。
+- **插件目录不能有 `go.mod`**：嵌套模块会让 `go build ./...` 静默跳过它。要单独跑测试就在工作区里 `go test ./plugins/<repo>/...`。
+
+推论：同一个核心提交在不同工作区可能产出不同二进制（取决于该工作区有没有 `private_plugins.go`）。这是「核心不引用业务插件」的代价，换来核心仓克隆即可构建、插件仓有独立提交历史。
+
+> 为什么不拆成独立 module：`internal/host` 按 Go 规则只能被 `github.com/knight000/go_qqbot/` 路径下的包 import，另一个模块路径必然编译失败；把契约移出 `internal/` 是另一件事，当前不做。
+
+⚠️ `git clean -xdf` 会连同插件目录里的 `.git` 一起删掉——插件仓有未推送提交时不要跑。
 
 ### 3.6 隔离与超时
 
