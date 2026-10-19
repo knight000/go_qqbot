@@ -504,6 +504,7 @@ internal/api/     QQ 开放平台 REST 封装
 plugins/echo/     示例插件
 plugins/adminping/ 管理员 /ping
 plugins/bootnotice/ 启动/重启主动私聊通知
+plugins/<repo>/   私有插件：独立仓的嵌套克隆，未跟踪（见 ARCHITECTURE §3.5）
 config/           配置样例与本地配置（后者不入 git）
 deploy/           systemd 单元
 ```

@@ -16,6 +16,18 @@ qqbot.exe
 # 单实例锁文件（<store.path>.lock），随进程存活，不删不入库
 *.db.lock
 
+# 私有插件工作区：plugins/<repo>/ 是独立仓的嵌套克隆，只见于各自的工作区。
+# 白名单只留示例插件——新增示例插件必须在这里补一行，否则会被静默忽略。
+/plugins/*
+!/plugins/echo
+!/plugins/adminping
+!/plugins/bootnotice
+!/plugins/md
+
+# 把私有插件编进二进制的唯一开关，每个工作区自己维护，不入库。
+# 没有它时 cmd/bot 只带示例插件——这正是核心仓克隆下来就能构建的原因。
+/cmd/bot/private_plugins.go
+
 # 编辑器 / 本地工具状态
 .idea/
 .vscode/
