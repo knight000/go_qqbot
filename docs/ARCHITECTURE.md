@@ -193,6 +193,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | `KV` / `PeerKV(peer)` | 按插件命名空间隔离的 KV，支持 TTL；`PeerKV` 多一层会话维度 | 只能读写自己的命名空间；`/reset session` 只清 `PeerKV` 写入的部分 |
 | `Store.Query` | 只读、参数化、行数上限 1000 | 不允许 DDL/写操作 |
 | `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝 |
+| `HTTPStatusError` | `{Status int, Body string}`；`HTTP` 的四个方法在非 2xx 时返回它，`Error()` 只含状态码 | 由 host 翻译 `*httpx.HTTPError` 而来，**插件不需要 import `internal/httpx`** 就能分辨 429 与普通失败；网络错误与 ctx 取消不包装 |
 | `Config()` | `[plugins.<name>]` 只读视图：`Str` / `Bool` / `Int` / `Duration` / `Decode(ptr)` | 只能读自己的配置段；`Decode` 把整段解成结构体，错误带段名与键名 |
 | `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
 | `Log` | 结构化日志，自动带 plugin 字段 | 敏感字段脱敏 |
