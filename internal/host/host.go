@@ -24,7 +24,10 @@ import (
 //
 // 版本 6：Host.HTTP 新增 GetJSONWithHeader（带鉴权头）、GetJSONOnce（不重试）、
 // WithTimeout（按请求放宽超时，共享连接池与限流状态）。
-const APIVersion = "6"
+//
+// 版本 7：Host.HTTP 的非 2xx 统一返回 *HTTPStatusError，插件不必 import
+// internal/httpx 就能分辨 429 与普通失败。
+const APIVersion = "7"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -205,6 +208,9 @@ type KV interface {
 //
 // 所有方法都经过同一套白名单、连接池与进程级限流；`WithTimeout` 返回的视图
 // 与调用者共享这些状态，只替换整体超时。
+//
+// 上游返回非 2xx 时，方法返回 *HTTPStatusError（不是 httpx 的类型）：
+// 插件据此分辨「429 → 冷却」与「普通失败」，而且不需要 import internal/httpx。
 type HTTP interface {
 	GetJSON(ctx context.Context, url string, out any) error
 	PostJSON(ctx context.Context, url string, in, out any) error
@@ -217,6 +223,24 @@ type HTTP interface {
 	// WithTimeout 返回共享连接池与全部限流状态、只替换整体超时的视图。
 	// 返回接口而不是具体类型，以便与其他修饰器自由串联。
 	WithTimeout(d time.Duration) HTTP
+}
+
+// HTTPStatusError 表示出站 HTTP 响应非 2xx。
+//
+// Body 已被核心截断，仅供排障；长度与内容都不保证，不要拿它做业务判断。
+// 网络错误与 ctx 取消不会被包装成它——它们保持 Go 的错误语义（如
+// context.DeadlineExceeded），调用方用 errors.Is 区分。
+//
+// 存在的理由是边界：插件想判 429 就必须读状态码，而读 httpx 的具体类型
+// 会把插件绑到核心的内部实现上。所以由 host 翻译，插件只依赖本类型。
+type HTTPStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *HTTPStatusError) Error() string {
+	// 只写状态码：URL 的 query 与请求头里的凭据都不该进错误串（会进日志）。
+	return fmt.Sprintf("host: HTTP %d", e.Status)
 }
 
 // JobSpec 是插件注册的定时任务。Plugin 字段由 Host 填充。
