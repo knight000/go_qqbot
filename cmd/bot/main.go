@@ -49,6 +49,14 @@ func main() {
 
 	// 走到这里时 run 已经返回：网关断开、session 落盘、数据库关闭。
 	// 此时再做进程替换，新进程不会和旧进程抢同一个 gateway session 与 SQLite 连接。
+	//
+	// 受 devrun 托管时不换映像：退出码就是协议，父进程负责重新生成装配、编译、
+	// 替换二进制再拉起。这是新放入 plugins/ 的插件能生效的唯一路径——重新执行
+	// 同一份二进制不会改变链接进来的插件集合。
+	if buildinfo.Supervised() {
+		os.Exit(buildinfo.ExitRestartRequired)
+	}
+
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "重启失败：定位可执行文件:", err)
@@ -237,7 +245,11 @@ func run() (*core.RestartRequest, error) {
 	coreImpl.Shutdown(shutdownCtx)
 
 	if req != nil {
-		log.Info("已关闭，准备重新执行自身", "version", bi.String())
+		if buildinfo.Supervised() {
+			log.Info("已关闭，交回 devrun 重新编译", "version", bi.String())
+		} else {
+			log.Info("已关闭，准备重新执行自身", "version", bi.String())
+		}
 	} else {
 		log.Info("已退出")
 	}

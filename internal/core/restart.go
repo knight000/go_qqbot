@@ -80,8 +80,9 @@ func (c *Core) handleReload(ctx context.Context, ev *host.Event) {
 		reason = string(r[:60])
 	}
 
+	// 托管模式下二进制路径由 devrun 掌握，本进程定位失败也不影响重载。
 	exe, exeErr := os.Executable()
-	if exeErr != nil {
+	if exeErr != nil && !buildinfo.Supervised() {
 		c.log.Error("定位可执行文件失败，取消重启", "err", exeErr)
 		c.replyText(ctx, ev, "重启失败：定位不到可执行文件，请查看日志。")
 		return
@@ -97,7 +98,9 @@ func (c *Core) handleReload(ctx context.Context, ev *host.Event) {
 	if reason != "" {
 		fmt.Fprintf(&b, "备注 %s\n", reason)
 	}
-	if isGoRunBinary(exe) {
+	if buildinfo.Supervised() {
+		b.WriteString("模式 受 devrun 托管：会重新扫描 plugins/ 并编译，失败则沿用旧二进制\n")
+	} else if isGoRunBinary(exe) {
 		b.WriteString("注意 当前由 go run 运行：重启的是同一份临时构建，不会重新编译\n")
 	}
 	b.WriteString("重启后会用私聊发「机器人已上线」，也可用 /ping 对比版本与启动时间。")

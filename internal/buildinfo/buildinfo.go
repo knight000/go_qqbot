@@ -25,6 +25,17 @@ var Version = "dev"
 // 启动日志据此标注"本次是重载启动"，bootnotice 据此跳过崩溃抑制窗口。
 const RestartEnv = "QQBOT_RESTARTED"
 
+// SupervisorEnv 由 tools/devrun 注入。设置后 /reload 不再自行换进程映像，
+// 而是以 ExitRestartRequired 退出，把重编译与拉起交给父进程。
+//
+// 为什么需要它：Go 的插件是编译期注册的，重新执行同一份二进制不会让新放入
+// plugins/ 的插件生效；只有重新编译才行。生产环境没有源码与工具链，不设该变量。
+const SupervisorEnv = "QQBOT_SUPERVISOR"
+
+// ExitRestartRequired 是「请重启我」的约定退出码（sysexits.h 的 EX_TEMPFAIL）。
+// 与 0/1 区分开，父进程才不会把一次正常重载当成崩溃。
+const ExitRestartRequired = 75
+
 type Info struct {
 	Version  string // dev / v1.2.3
 	Commit   string // 短哈希，脏工作区带 +dirty
@@ -90,6 +101,10 @@ func (i Info) String() string {
 
 // RestartedByReload 报告本进程是否由 /reload 拉起。
 func RestartedByReload() bool { return os.Getenv(RestartEnv) == "1" }
+
+// Supervised 报告本进程是否由 tools/devrun 托管。
+// 托管时 /reload 退化为「退出码 75」，由父进程重新编译后再拉起。
+func Supervised() bool { return os.Getenv(SupervisorEnv) == "1" }
 
 // isReleaseVersion 过滤 go build 自动生成的伪版本。
 //

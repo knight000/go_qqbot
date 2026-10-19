@@ -11,6 +11,11 @@ qqbot.exe
 # `go build ./cmd/bot` 的默认产物名
 /bot
 /bot.exe
+# devrun 的中间产物与 Windows 上被改名腾位的旧二进制
+/bot.new
+/bot.new.exe
+/bot.old
+/bot.old.exe
 
 # SQLite
 *.db
