@@ -1,9 +1,9 @@
 // Package httpx 是核心层唯一的出站 HTTP 客户端。
 //
-// 设计约束（ARCHITECTURE.md §6）：
+// 设计约束（ARCHITECTURE.md §6.2）：
 //   - 连接复用、超时、有限重试、全抖动指数退避；
 //   - 域名白名单由插件的 Manifest 声明，未声明一律拒绝；
-//   - 令牌桶限流，插件不得自带 client，否则限流不可观测。
+//   - 按域名分桶的进程级限流，插件不得自带 client，否则限流不可观测。
 package httpx
 
 import (
@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -27,6 +28,22 @@ type Options struct {
 	Timeout    time.Duration
 	Retries    int
 	RatePerMin int
+
+	// DomainRatePerMin 为特定主机名配置独立额度（每分钟请求数）。
+	// 键按主机名精确匹配、大小写不敏感；未列出的域名走 RatePerMin。
+	// 配了独立额度的域名**只**用它，不与默认桶叠加——叠加等于没有放宽。
+	// 零或负数的条目被忽略并告警，回退默认值（不做"零等于无限"这种隐式语义）。
+	DomainRatePerMin map[string]int
+
+	// HTTPClient 注入传输层实现，nil 时由 New 自己构造。
+	//
+	// 用途有二：测试可以注入信任自签证书的客户端；将来接代理或双向 TLS
+	// 时不必再改构造函数。注入后 Timeout 不再生效——调用方给的客户端
+	// 被原样使用；WithTimeout 仍会基于它的 Transport 重建。
+	HTTPClient *http.Client
+
+	// Log 用于告警被忽略的非法域名额度；nil 时静默。
+	Log *slog.Logger
 }
 
 func (o Options) withDefaults() Options {
@@ -45,26 +62,38 @@ func (o Options) withDefaults() Options {
 type Client struct {
 	hc         *http.Client
 	retries    int
-	limiter    *limiter
+	buckets    *bucketSet
 	allowed    []string // 仅在 restricted=true 时生效
 	restricted bool     // true = 该客户端属于插件，未声明域名一律拒绝
 	disableTPS bool
 }
 
-// New 构造核心客户端。
+// New 构造核心客户端（进程内唯一的根客户端）。
+//
+// 插件客户端都由它派生（WithDomains / WithTimeout），因此连接池与桶天然共享。
+// 不要为业务再 New 一个根客户端：那是第二份额度。
 func New(o Options) *Client {
 	o = o.withDefaults()
-	tr := &http.Transport{
-		MaxIdleConns:        20,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
+	hc := o.HTTPClient
+	if hc == nil {
+		tr := &http.Transport{
+			MaxIdleConns:        20,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+		hc = &http.Client{Transport: tr, Timeout: o.Timeout}
 	}
 	return &Client{
-		hc:      &http.Client{Transport: tr, Timeout: o.Timeout},
+		hc:      hc,
 		retries: o.Retries,
-		limiter: newLimiter(o.RatePerMin),
+		buckets: newBucketSet(o.RatePerMin, o.DomainRatePerMin, o.Log),
 	}
+}
+
+// DomainLimits 返回实际生效的域名独立额度（非法条目已剔除），供启动日志核对。
+func (c *Client) DomainLimits() map[string]int {
+	return c.buckets.limits()
 }
 
 // WithDomains 返回共享连接池与限流器的副本，只替换白名单。
@@ -161,9 +190,14 @@ func (c *Client) do(ctx context.Context, method, rawURL string, header map[strin
 }
 
 func (c *Client) doWithRetries(ctx context.Context, method, rawURL string, header map[string]string, body []byte, out any, retries int) error {
-	if err := c.checkURL(rawURL); err != nil {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("非法 URL: %w", err)
+	}
+	if err := c.checkParsedURL(u); err != nil {
 		return err
 	}
+	host := strings.ToLower(u.Hostname())
 
 	var lastErr error
 	for attempt := 0; attempt <= retries; attempt++ {
@@ -172,7 +206,7 @@ func (c *Client) doWithRetries(ctx context.Context, method, rawURL string, heade
 				return err
 			}
 		}
-		if err := c.limiter.wait(ctx); err != nil {
+		if err := c.buckets.wait(ctx, host); err != nil {
 			return err
 		}
 
@@ -226,6 +260,10 @@ func (c *Client) checkURL(rawURL string) error {
 	if err != nil {
 		return fmt.Errorf("非法 URL: %w", err)
 	}
+	return c.checkParsedURL(u)
+}
+
+func (c *Client) checkParsedURL(u *url.URL) error {
 	if u.Scheme != "https" {
 		return fmt.Errorf("仅允许 https，拒绝 %s", u.Scheme)
 	}
@@ -274,6 +312,62 @@ func truncate(b []byte) string {
 		return string(b)
 	}
 	return string(b[:max]) + "..."
+}
+
+// bucketSet 是按域名分的进程级限流器集合。
+//
+// 构造完成后只读（map 不再增删），因此并发读无需加锁；每个 limiter 自带互斥。
+// 克隆客户端只复制指针，不复制桶——同域名下的多个插件必须共享同一份额度。
+type bucketSet struct {
+	def    *limiter
+	byHost map[string]*limiter
+	rates  map[string]int // 归一化后的生效额度，供启动日志核对
+}
+
+func newBucketSet(defPerMin int, domainRatePerMin map[string]int, log *slog.Logger) *bucketSet {
+	s := &bucketSet{
+		def:    newLimiter(defPerMin),
+		byHost: make(map[string]*limiter, len(domainRatePerMin)),
+		rates:  make(map[string]int, len(domainRatePerMin)),
+	}
+	for host, perMin := range domainRatePerMin {
+		h := strings.ToLower(strings.TrimSpace(host))
+		if h == "" {
+			if log != nil {
+				log.Warn("出站限流：域名额度条目为空，已忽略", "rate_per_min", perMin, "default", defPerMin)
+			}
+			continue
+		}
+		if perMin <= 0 {
+			// 不做"零等于无限"：一次笔误不该让限流失效，也不该把机器人卡死。
+			if log != nil {
+				log.Warn("出站限流：域名额度非法，回退默认值",
+					"domain", h, "rate_per_min", perMin, "default", defPerMin)
+			}
+			continue
+		}
+		s.byHost[h] = newLimiter(perMin)
+		s.rates[h] = perMin
+	}
+	return s
+}
+
+// wait 取该域名对应的桶。未配置的域名走默认桶；配置了独立额度的域名
+// 只用独立桶，不与默认桶叠加。
+func (s *bucketSet) wait(ctx context.Context, host string) error {
+	l := s.def
+	if hl, ok := s.byHost[host]; ok {
+		l = hl
+	}
+	return l.wait(ctx)
+}
+
+func (s *bucketSet) limits() map[string]int {
+	out := make(map[string]int, len(s.rates))
+	for h, n := range s.rates {
+		out[h] = n
+	}
+	return out
 }
 
 // limiter 是简单令牌桶，按每分钟速率匀速补充。

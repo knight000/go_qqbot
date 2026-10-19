@@ -139,7 +139,7 @@ func (c *Core) Start(ctx context.Context) error {
 		m := p.Manifest()
 		svc := host.NewService(host.Options{
 			Name:     m.Name,
-			Config:   host.Params(c.cfg.Plugin(m.Name)),
+			Config:   host.NewParams(m.Name, c.cfg.Plugin(m.Name)),
 			Sender:   c.sender.ForPlugin(m.Name),
 			KV:       c.store,
 			DB:       c.store,

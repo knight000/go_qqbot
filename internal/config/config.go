@@ -85,6 +85,13 @@ type HTTP struct {
 	Timeout    Duration `toml:"timeout"`
 	Retries    int      `toml:"retries"`
 	RatePerMin int      `toml:"rate_per_min"`
+	// Domains 为特定主机名配置独立额度（每分钟请求数），形如
+	//   [http.domains]
+	//   "api.torn.com" = 800
+	// 未列出的域名走 RatePerMin。配了独立额度的域名只使用该桶（不叠加）。
+	// 零或负数在启动期被忽略并告警，回退默认值——这里不做校验，
+	// 否则一次笔误会让机器人起不来。
+	Domains map[string]int `toml:"domains"`
 }
 
 // Active 是主动消息策略。Enabled 用指针区分"未配置"与"显式关闭"：

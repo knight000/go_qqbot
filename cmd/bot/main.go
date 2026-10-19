@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 	// 内嵌 IANA 时区库：Windows 单文件与精简容器（scratch/alpine）没有 zoneinfo，
@@ -136,10 +138,18 @@ func run() (*core.RestartRequest, error) {
 	}
 
 	hc := httpx.New(httpx.Options{
-		Timeout:    cfg.HTTP.Timeout.Duration,
-		Retries:    cfg.HTTP.Retries,
-		RatePerMin: cfg.HTTP.RatePerMin,
+		Timeout:          cfg.HTTP.Timeout.Duration,
+		Retries:          cfg.HTTP.Retries,
+		RatePerMin:       cfg.HTTP.RatePerMin,
+		DomainRatePerMin: cfg.HTTP.Domains,
+		Log:              log.With("component", "httpx"),
 	})
+	// 域名独立额度放宽了单域名的出站速率，配错会打爆上游——启动时把实际
+	// 生效的清单打出来，是上线核对配置的唯一机会（非法值已在 New 里告警剔除）。
+	if limits := hc.DomainLimits(); len(limits) > 0 {
+		log.Info("出站限流：域名独立额度已启用",
+			"default_per_min", cfg.HTTP.RatePerMin, "domains", formatDomainLimits(limits))
+	}
 	apiClient := api.New(api.Options{
 		HTTP:     hc,
 		BaseURL:  cfg.App.APIBase,
@@ -263,4 +273,19 @@ func rawDumpFunc(cfg *config.Config, c *core.Core) func(string, []byte) {
 		return nil
 	}
 	return c.PrintRaw
+}
+
+// formatDomainLimits 把域名额度排成稳定顺序的 "host=rate" 列表。
+// map 遍历是随机的，而启动日志要能两次重启逐字比对。
+func formatDomainLimits(limits map[string]int) string {
+	hosts := make([]string, 0, len(limits))
+	for h := range limits {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	parts := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		parts = append(parts, fmt.Sprintf("%s=%d", h, limits[h]))
+	}
+	return strings.Join(parts, ", ")
 }

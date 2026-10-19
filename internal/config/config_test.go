@@ -195,6 +195,36 @@ fetch_name = false
 	}
 }
 
+// 域名独立额度是通用能力：配置写在这里，未列出的域名继续走默认桶。
+// 零/负数不在这里拒绝——由出站层在启动期告警并回退，避免一次笔误让机器人起不来。
+func TestHTTPDomainQuotasParsed(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+id = "123"
+secret = "s"
+
+[http]
+rate_per_min = 100
+
+[http.domains]
+"api.torn.com" = 800
+"Example.COM" = 50
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTP.RatePerMin != 100 {
+		t.Fatalf("默认额度=%d", cfg.HTTP.RatePerMin)
+	}
+	if got := cfg.HTTP.Domains["api.torn.com"]; got != 800 {
+		t.Fatalf("api.torn.com 额度=%d", got)
+	}
+	if got := cfg.HTTP.Domains["Example.COM"]; got != 50 {
+		t.Fatalf("域名键应原样保留（大小写在出站层归一化），实际 %d", got)
+	}
+}
+
 // 入群/退群通知默认只发所有者。写错的值回退 owner 而不是 off：
 // 通知发多了只是吵，发少了会让"机器人被谁拉进了哪个群"悄无声息地过去。
 func TestGroupNotifyMode(t *testing.T) {

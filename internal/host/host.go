@@ -7,8 +7,12 @@ package host
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"reflect"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 // APIVersion 是核心与插件之间的契约版本，不匹配直接拒绝加载。
@@ -329,17 +333,31 @@ type JobRunner interface {
 }
 
 // Params 是 [plugins.<name>] 段的只读视图。
-type Params map[string]any
+//
+// 带段名是为了让 Decode 的错误能指到具体插件段：配置写错时使用者需要
+// 一眼看出是"哪个插件、哪个键"，而不是去猜。
+type Params struct {
+	name string
+	vals map[string]any
+}
+
+// NewParams 构造插件配置视图。name 是配置段名（通常等于插件名）。
+func NewParams(name string, vals map[string]any) Params {
+	return Params{name: name, vals: vals}
+}
+
+// Name 返回配置段名。
+func (p Params) Name() string { return p.name }
 
 func (p Params) Str(key, def string) string {
-	if v, ok := p[key].(string); ok && v != "" {
+	if v, ok := p.vals[key].(string); ok && v != "" {
 		return v
 	}
 	return def
 }
 
 func (p Params) Bool(key string, def bool) bool {
-	switch v := p[key].(type) {
+	switch v := p.vals[key].(type) {
 	case bool:
 		return v
 	case string:
@@ -349,7 +367,7 @@ func (p Params) Bool(key string, def bool) bool {
 }
 
 func (p Params) Int(key string, def int) int {
-	switch v := p[key].(type) {
+	switch v := p.vals[key].(type) {
 	case int64:
 		return int(v)
 	case int:
@@ -361,10 +379,44 @@ func (p Params) Int(key string, def int) int {
 }
 
 func (p Params) Duration(key string, def time.Duration) time.Duration {
-	if s, ok := p[key].(string); ok {
+	if s, ok := p.vals[key].(string); ok {
 		if d, err := time.ParseDuration(s); err == nil {
 			return d
 		}
 	}
 	return def
+}
+
+// Decode 把整个配置段解成结构体，v 必须是非 nil 指针。
+//
+// 实现沿用仓库已有的 TOML 依赖：先把配置 map 编码回 TOML，再解进结构体。
+// 这条路径对配置值的类型无损，也不必为数组与嵌套表手写反射代码——
+// 插件不再需要自己「先序列化再反序列化」绕一圈。
+//
+// 错误带段名与键名（TOML 解码错误自带 "last key ..."），让类型不匹配在
+// 启动期就能定位到具体配置项。空配置段返回零值结构体且不报错，
+// 默认配置必须能正常启动。本方法只解码、不校验，必填项由插件自己检查。
+func (p Params) Decode(v any) error {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("插件配置段 %s: Decode 需要非 nil 指针", p.label())
+	}
+	if len(p.vals) == 0 {
+		return nil
+	}
+	data, err := toml.Marshal(p.vals)
+	if err != nil {
+		return fmt.Errorf("插件配置段 %s: 编码失败: %w", p.label(), err)
+	}
+	if err := toml.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("插件配置段 %s: %w", p.label(), err)
+	}
+	return nil
+}
+
+func (p Params) label() string {
+	if p.name == "" {
+		return "(未命名)"
+	}
+	return p.name
 }
