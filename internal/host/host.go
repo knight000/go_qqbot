@@ -227,7 +227,9 @@ type HTTP interface {
 
 // HTTPStatusError 表示出站 HTTP 响应非 2xx。
 //
-// Body 已被核心截断，仅供排障；长度与内容都不保证，不要拿它做业务判断。
+// Body 是**截断后**的响应原文：长度与内容都不保证，只能用于错误分类与排障
+// （Torn 把业务错误码放在 HTTP 200 的 body 里，调用方需要读它），不要当业务
+// 数据解析，也不要原样回显给终端用户。
 // 网络错误与 ctx 取消不会被包装成它——它们保持 Go 的错误语义（如
 // context.DeadlineExceeded），调用方用 errors.Is 区分。
 //
