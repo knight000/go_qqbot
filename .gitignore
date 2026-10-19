@@ -8,6 +8,9 @@
 /bin/
 qqbot
 qqbot.exe
+# `go build ./cmd/bot` 的默认产物名
+/bot
+/bot.exe
 
 # SQLite
 *.db
