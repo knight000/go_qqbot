@@ -213,6 +213,16 @@ func (c *Core) Start(ctx context.Context) error {
 func (c *Core) httpClient() *httpx.Client { return c.http }
 
 func (c *Core) Shutdown(ctx context.Context) {
+	// 先停调度并等任务收尾，再关插件：任务运行在插件的 JobRunner 里，先 Close
+	// 插件等于让任务往已经关掉的东西里写；任务本身还要写库，必须早于 main 里的
+	// db.Close。Stop 是必需的——/reload 路径下 main 不会取消 Start 收到的 ctx，
+	// 只停信号监听；不主动 Stop 就会在关库之后继续起新桶。
+	if c.sched != nil {
+		c.sched.Stop()
+		if !c.sched.Wait(ctx) {
+			c.log.Warn("调度任务未在关停期限内退出")
+		}
+	}
 	for i := len(c.plugins) - 1; i >= 0; i-- {
 		p := c.plugins[i]
 		if cl, ok := p.(host.Closer); ok {
