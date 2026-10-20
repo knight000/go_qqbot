@@ -244,7 +244,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 ```
 事件 → 去重（event_id）→ 落库 → 按 intents 过滤 → 每个插件内取 priority 最高的命中命令
      → 候选按 priority 降序、同 priority 按插件名升序排列
-     → 跳过无权限的 → 第一个有权限的是中标者，默认只跑它
+     → 跳过无权限的 → 第一个有权限的候选是组内起点（中标者），默认只跑它
      → 按 priority 分组，组内按上述顺序逐个执行；每个匹配者自己声明是否让位，
        遇到不让位者就停在这个插件（跨 priority 不扇出）
      → 全未命中 → 静默：核心不回任何内容，也没有可配置的默认提示语
