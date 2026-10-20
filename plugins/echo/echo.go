@@ -11,7 +11,6 @@ package echo
 import (
 	"context"
 	"log/slog"
-	"strings"
 
 	"github.com/knight000/go_qqbot/internal/host"
 )
@@ -47,19 +46,18 @@ func (p *Plugin) Init(ctx context.Context, h host.Host) error {
 	return nil
 }
 
-func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
-	content := strings.TrimSpace(ev.Content)
-
-	if strings.HasPrefix(content, "!ping") {
+// 命令由路由层分派：命中的事件才投递过来，Event.Command 是命中的那条命令，
+// Event.Args 是它之后已 TrimSpace 的剩余原文。插件不再用 HasPrefix 链判断。
+func (p *Plugin) Handle(_ context.Context, ev *host.Event) (*host.Reply, error) {
+	switch ev.Command {
+	case "!ping":
 		return &host.Reply{Content: p.prefix + "pong"}, nil
-	}
 
-	if strings.HasPrefix(content, "!echo") {
-		text := strings.TrimSpace(strings.TrimPrefix(content, "!echo"))
-		if text == "" {
+	case "!echo":
+		if ev.Args == "" {
 			return &host.Reply{Content: "用法：!echo <文本>"}, nil
 		}
-		return &host.Reply{Content: p.prefix + text}, nil
+		return &host.Reply{Content: p.prefix + ev.Args}, nil
 	}
 
 	return nil, nil
