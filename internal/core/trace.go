@@ -245,6 +245,27 @@ func (t *Trace) Denied(m Match, ev *host.Event) {
 		t.stamp(), m.Manifest.Name, cmd, m.Perm.String(), what))
 }
 
+// Blocked 打印"同组前序插件不让位，所以我没执行"的匹配者。
+//
+// 它只在 full 级别输出：plugin 级别只回答"谁触发了我"，被挡住的人没有触发任何人。
+// 阻断不是错误——不让位是合法的默认选择，所以这行不进 slog；但在排查
+// "zzz 声明了 yield=true 为什么没反应"时，它是唯一线索。
+func (t *Trace) Blocked(blocker, skipped Match) {
+	if !t.full() {
+		return
+	}
+	name := skipped.Manifest.Name
+	if skipped.Manifest.Version != "" {
+		name += " v" + skipped.Manifest.Version
+	}
+	cmd := "（订阅全部事件）"
+	if skipped.Command != "" {
+		cmd = fmt.Sprintf("命令 %q", skipped.Command)
+	}
+	t.emit(fmt.Sprintf("%s 未执行 · 插件 %s · %s（%s 未让位）\n",
+		t.stamp(), name, cmd, blocker.Manifest.Name))
+}
+
 // PluginDone 打印插件处理结果；回复正文由 Sent 统一打印，避免重复。
 // level=plugin 时成功分支不打印，只保留出错，否则每个插件会有两行冗余。
 func (t *Trace) PluginDone(m Match, cost time.Duration, reply *host.Reply, err error) {
