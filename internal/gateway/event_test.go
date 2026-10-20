@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/knight000/go_qqbot/internal/host"
 )
@@ -155,6 +156,37 @@ func TestDecodeTruncatesRawAtLimit(t *testing.T) {
 	}
 	if !bytes.HasPrefix([]byte(big), ev.Raw) {
 		t.Fatal("截断后的 Raw 必须是原文的前缀")
+	}
+}
+
+// 截断点不能落在多字节字符中间：Raw 若连合法 UTF-8 都不是，插件读到的
+// 就是一段"平台发了坏编码"的假象，排查方向会被带偏。
+// 上限不变（仍 ≤ MaxRawBytes），只是退到最近的 rune 边界。
+func TestDecodeTruncatesRawAtRuneBoundary(t *testing.T) {
+	big := `{"id":"M1","content":"` + strings.Repeat("汉", 11_000) + `"}`
+	if utf8.Valid([]byte(big[:host.MaxRawBytes])) {
+		t.Fatal("前置条件不成立：按字节硬切应正好落在汉字中间")
+	}
+
+	ev, err := Decode(platGroupMessageAll, json.RawMessage(big))
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	if !ev.RawTruncated {
+		t.Fatal("超长载荷的 RawTruncated 应为 true")
+	}
+	if len(ev.Raw) > host.MaxRawBytes {
+		t.Fatalf("Raw 不得超过 %d 字节，实际 %d", host.MaxRawBytes, len(ev.Raw))
+	}
+	if !utf8.Valid(ev.Raw) {
+		t.Fatal("Raw 必须是合法 UTF-8：截断点退到了 rune 边界")
+	}
+	if !bytes.HasPrefix([]byte(big), ev.Raw) {
+		t.Fatal("截断后的 Raw 必须是原文的前缀")
+	}
+	// 只丢一个残缺的 rune，不能借着"对齐"砍掉一截。
+	if min := host.MaxRawBytes - utf8.UTFMax; len(ev.Raw) < min {
+		t.Fatalf("Raw 应只退到最近的 rune 边界（≥ %d），实际 %d", min, len(ev.Raw))
 	}
 }
 

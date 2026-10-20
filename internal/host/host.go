@@ -137,8 +137,9 @@ type Event struct {
 	// 随 Event 一起被回收。
 	//
 	// 超过 MaxRawBytes 时截断为原文前缀，并置 RawTruncated=true。截断必须可判定：
-	// 不允许静默给出半截 JSON，让插件误以为平台发了坏数据。RawTruncated 为 false
-	// 时 Raw 与原文逐字节相等。
+	// 不允许静默给出半截 JSON，让插件误以为平台发了坏数据。截断点退到最近的
+	// rune 边界，因此 Raw 始终是合法 UTF-8、且只比上限少几个字节。
+	// RawTruncated 为 false 时 Raw 与原文逐字节相等。
 	//
 	// 与 Payload 的关系：Payload 的既有语义不动（**仅未知事件**、完整原文）；
 	// 未知事件因此同时有一份完整 Payload 与一份 ≤32 KiB 的 Raw，代价可以接受

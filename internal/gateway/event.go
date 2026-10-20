@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/knight000/go_qqbot/internal/host"
 )
@@ -195,12 +196,20 @@ func mentionsBot(t string) bool {
 // 副本而不是切片：入参 RawMessage 可能指向一整个 WS 帧的大 buffer，
 // 截一段留着会把整帧一起钉在内存里。截断时多分配一份上限大小的 buffer，
 // 但 RawTruncated 让下游知道它不完整。
+//
+// 截断点退到最近的 rune 边界：按字节硬切可能落在一个多字节字符（中文 3 字节、
+// emoji 4 字节）中间，那样 Raw 连合法 UTF-8 都不是，插件会误判成平台发了坏
+// 编码。上限仍是 MaxRawBytes，最多少留 3 个字节。
 func copyRaw(raw json.RawMessage) ([]byte, bool) {
 	if len(raw) <= host.MaxRawBytes {
 		return append([]byte(nil), raw...), false
 	}
-	out := make([]byte, host.MaxRawBytes)
-	copy(out, raw[:host.MaxRawBytes])
+	n := host.MaxRawBytes
+	for n > 0 && !utf8.RuneStart(raw[n]) {
+		n--
+	}
+	out := make([]byte, n)
+	copy(out, raw[:n])
 	return out, true
 }
 
