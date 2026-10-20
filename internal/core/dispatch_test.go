@@ -194,3 +194,78 @@ func TestRouterRejectsUnknownPermission(t *testing.T) {
 		t.Fatal("未定义的权限位应拒绝加载")
 	}
 }
+
+// argsRecorder 记录 Handle 收到的 Command/Args：路由命中的结果必须回传给插件，
+// 否则每个插件都得自己从 Content 里再解析一遍。
+type argsRecorder struct {
+	manifest host.Manifest
+	mu       sync.Mutex
+	cmd      []string
+	args     []string
+}
+
+func (c *argsRecorder) Manifest() host.Manifest               { return c.manifest }
+func (c *argsRecorder) Init(context.Context, host.Host) error { return nil }
+func (c *argsRecorder) Handle(_ context.Context, ev *host.Event) (*host.Reply, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cmd = append(c.cmd, ev.Command)
+	c.args = append(c.args, ev.Args)
+	return nil, nil
+}
+
+func (c *argsRecorder) last() (cmd, args string, calls int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.cmd) == 0 {
+		return "", "", 0
+	}
+	return c.cmd[len(c.cmd)-1], c.args[len(c.args)-1], len(c.cmd)
+}
+
+func TestDispatchFillsCommandAndArgs(t *testing.T) {
+	p := &argsRecorder{manifest: host.Manifest{
+		Name:       "echoer",
+		APIVersion: host.APIVersion,
+		Intents:    []string{"message"},
+		Commands:   []host.Command{{Prefix: "!echo", Priority: 100}},
+	}}
+	d, _ := newTestDispatcher(t, p)
+
+	d.handle(context.Background(), groupEvent("!echo 你好 世界", host.Principal{}))
+	cmd, args, calls := p.last()
+	if calls != 1 {
+		t.Fatalf("插件应被调用 1 次，实际 %d", calls)
+	}
+	if cmd != "!echo" || args != "你好 世界" {
+		t.Fatalf("Handle 应收到 Command=%q Args=%q，实际 %q / %q", "!echo", "你好 世界", cmd, args)
+	}
+}
+
+// 一次派发跑多个插件时，每个插件必须拿到自己命中那条命令的参数：
+// 在 Match 里写会互相覆盖，写早了会串味。
+func TestDispatchFillsPerPluginArgs(t *testing.T) {
+	// aaa 用正则吃掉整个 "!x 1"，它的 Args 是空串；zzz 用前缀，Args 是 "1"。
+	aaa := &argsRecorder{manifest: host.Manifest{
+		Name:       "aaa",
+		APIVersion: host.APIVersion,
+		Intents:    []string{"message"},
+		Broadcast:  true,
+		Commands:   []host.Command{{Pattern: `^!x 1`, Priority: 100}},
+	}}
+	zzz := &argsRecorder{manifest: host.Manifest{
+		Name:       "zzz",
+		APIVersion: host.APIVersion,
+		Intents:    []string{"message"},
+		Commands:   []host.Command{{Prefix: "!x", Priority: 100}},
+	}}
+	d, _ := newTestDispatcher(t, aaa, zzz)
+
+	d.handle(context.Background(), groupEvent("!x 1", host.Principal{}))
+	if cmd, args, calls := aaa.last(); calls != 1 || cmd != `^!x 1` || args != "" {
+		t.Fatalf("aaa 应收到自己的正则与空 Arg，实际 %d 次 %q / %q", calls, cmd, args)
+	}
+	if cmd, args, calls := zzz.last(); calls != 1 || cmd != "!x" || args != "1" {
+		t.Fatalf("zzz 应收到前缀与 Arg %q，实际 %d 次 %q / %q", "1", calls, cmd, args)
+	}
+}

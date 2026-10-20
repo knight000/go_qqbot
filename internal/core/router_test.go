@@ -123,3 +123,96 @@ func TestRouterIntentAnyScene(t *testing.T) {
 		t.Fatal("订阅 message 不应命中通知事件")
 	}
 }
+
+// 命令词边界与参数切分都在路由层：命中后 Match 带回命令写法与已 TrimSpace 的参数，
+// 插件不再自己 CutPrefix（否则每个插件都要重演一遍 /md5 误命中的兜底）。
+func TestRouterMatchPrefixArgs(t *testing.T) {
+	cases := []struct {
+		in      string
+		prefix  string
+		loose   bool
+		command string
+		args    string
+		hit     bool
+		note    string
+	}{
+		{in: "!echo hi", prefix: "!echo", command: "!echo", args: "hi", hit: true},
+		{in: "!echo", prefix: "!echo", command: "!echo", args: "", hit: true, note: "只有指令 -> 参数为空串"},
+		{in: "  !echo  ", prefix: "!echo", command: "!echo", args: "", hit: true},
+		{in: "!echo\nhi", prefix: "!echo", command: "!echo", args: "hi", hit: true, note: "换行也算分隔"},
+		{in: "  !echo   两侧空格  ", prefix: "!echo", command: "!echo", args: "两侧空格", hit: true},
+		{in: "!echo5 hi", prefix: "!echo", hit: false, note: "默认要求词边界，不能吃掉 !echo5"},
+		{in: "!echox", prefix: "!echo", hit: false},
+		{in: "hello", prefix: "!echo", hit: false},
+		// 显式放宽才退回裸前缀语义，参数从紧邻处开始。
+		{in: "!echo5 hi", prefix: "!echo", loose: true, command: "!echo", args: "5 hi", hit: true},
+	}
+	for _, c := range cases {
+		m := manifest("p", 10, c.prefix)
+		m.Commands[0].Loose = c.loose
+		r, err := NewRouter([]host.Plugin{&fakePlugin{m: m}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ms := r.Match(&host.Event{Kind: host.KindMessage, Scene: host.SceneGroup, Content: c.in})
+		if hit := len(ms) > 0; hit != c.hit {
+			t.Fatalf("Match(%q) 命中=%v, want %v（%s）", c.in, hit, c.hit, c.note)
+		}
+		if !c.hit {
+			continue
+		}
+		if ms[0].Command != c.command {
+			t.Fatalf("Match(%q) Command=%q, want %q", c.in, ms[0].Command, c.command)
+		}
+		if ms[0].Args != c.args {
+			t.Fatalf("Match(%q) Args=%q, want %q", c.in, ms[0].Args, c.args)
+		}
+	}
+}
+
+// 正则命令回传正则源码，Args 取匹配区间之后的剩余（不是整段内容）。
+func TestRouterMatchRegexArgs(t *testing.T) {
+	pattern := `^!roll\s+`
+	m := host.Manifest{
+		Name:       "roller",
+		APIVersion: host.APIVersion,
+		Intents:    []string{"group.message"},
+		Commands:   []host.Command{{Pattern: pattern, Priority: 10}},
+	}
+	r, err := NewRouter([]host.Plugin{&fakePlugin{m: m}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := r.Match(&host.Event{Kind: host.KindMessage, Scene: host.SceneGroup, Content: "!roll   3d6 +2"})
+	if len(ms) != 1 {
+		t.Fatalf("正则应命中，实际 %d 条", len(ms))
+	}
+	if ms[0].Command != pattern {
+		t.Fatalf("Command 应为正则源码 %q，实际 %q", pattern, ms[0].Command)
+	}
+	if ms[0].Args != "3d6 +2" {
+		t.Fatalf("Args 应取匹配区间之后，实际 %q", ms[0].Args)
+	}
+
+	if ms := r.Match(&host.Event{Kind: host.KindMessage, Scene: host.SceneGroup, Content: "roll 3d6"}); len(ms) != 0 {
+		t.Fatal("不匹配的正则不应命中")
+	}
+}
+
+// 未声明命令 = 订阅该 intent 的全部事件：没有命中的命令，两个字段都应是空串，
+// 而不是把整段正文塞进 Args。
+func TestRouterMatchWithoutCommandLeavesArgsEmpty(t *testing.T) {
+	m := host.Manifest{Name: "all", APIVersion: host.APIVersion, Intents: []string{"group.message"}}
+	r, err := NewRouter([]host.Plugin{&fakePlugin{m: m}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := r.Match(&host.Event{Kind: host.KindMessage, Scene: host.SceneGroup, Content: "随便说点什么"})
+	if len(ms) != 1 {
+		t.Fatalf("应命中 1 条，实际 %d", len(ms))
+	}
+	if ms[0].Command != "" || ms[0].Args != "" {
+		t.Fatalf("未命中命令时 Command/Args 应为空，实际 %q / %q", ms[0].Command, ms[0].Args)
+	}
+}
