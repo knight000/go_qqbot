@@ -346,7 +346,9 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	if ok, err := s.takeActiveBudget(ctx, scene, peerID); err != nil {
 		// fail-closed：账本不可信时不发。宁可少发一条，也不能把平台
 		// 每天 1000 条的配额当成无限量烧掉——额度超发是不可撤回的。
-		return fmt.Errorf("%w（额度记账失败，按保守策略拒发）: %v", ErrActiveQuota, err)
+		// 带上场景与 peer：日志里只有"记账失败"时定位不到是哪个会话
+		// 把账本写坏了（规则 7：错误必须指得回它发生在谁身上）。
+		return fmt.Errorf("%w（额度记账失败，按保守策略拒发；%s %s）: %v", ErrActiveQuota, scene, peerID, err)
 	} else if !ok {
 		return fmt.Errorf("%w（%s %s）", ErrActiveQuota, scene, peerID)
 	}
