@@ -41,7 +41,7 @@ import (
 //     前缀原文或正则源码，Args 是命令之后已 TrimSpace 的剩余原文；前缀匹配默认
 //     按词边界（`/md5` 不再命中 `/md`），确需裸前缀时在 Command 上声明 Loose，
 //     插件不再自己 CutPrefix / HasPrefix；
-//   - Event.Mentioned / Event.Raw 暴露"是否 @ 了机器人"与原始载荷。
+//   - Event.Mentioned / Event.Raw 暴露“是否 @ 了机器人”与原始载荷。
 //
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
 const APIVersion = "8"
