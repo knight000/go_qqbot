@@ -176,22 +176,23 @@ Manifest {
   name         唯一标识，同时是 KV 命名空间
   version      semver
   api_version  与核心的契约版本，不匹配则拒绝加载
-  capabilities 保留字段：核心从不读取，不构成任何门控（评审 §4.1）
+  capabilities 保留字段：核心从不读取，不构成任何门控；等出现第二个真实消费方再启用（评审 §4.1）
   intents      需要订阅的事件类型
   commands     匹配规则：前缀或正则二选一（Priority 越大越先）
   broadcast    中标者声明“同优先级的其它插件也执行”（默认 false，语义见 §3.4）
-  config_schema 保留字段：核心从不读取，不做启动校验（评审 §4.1）
+  config_schema 启动期校验，支持四种类型：string / bool / int / duration（评审 §4.1）
 }
 
 Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, JobSpec)]* → Close(ctx)
 ```
 
-`Manifest` 采用声明式而非“插件自己决定是否处理”，目的是把能用数据描述的规则放在启动期校验。**实际校验到的只有这些**：`name` 非空、`api_version` 与本核心一致、`intents` 可解析、`Permission` 位合法、每个 `Command` 恰好设置 `Prefix` 或 `Pattern` 之一、正则可编译、前缀不占用核心保留前缀。
+`Manifest` 采用声明式而非“插件自己决定是否处理”，目的是把能用数据描述的规则放在启动期校验。**实际校验到的只有这些**：`name` 非空、`api_version` 与本核心一致、`intents` 可解析、`Permission` 位合法、每个 `Command` 恰好设置 `Prefix` 或 `Pattern` 之一、正则可编译、前缀不占用核心保留前缀、`config_schema` 里每个键在 `[plugins.<name>]` 中存在且类型相符（装配期、插件 `Init` 之前）。
 
-以下四条**当前不成立**，读契约时不要据此推断保障：
+`config_schema` 的语义是**声明即必填**：写进去的键必须有值，缺一个就启动失败，所以有默认值的键不要写进 schema。类型只有四种，与 `Host.Config()` 的读取方法一一对应；`duration` 是字符串，必须能被 `time.ParseDuration` 解析。`key = ""` 对 `string` 是「存在但为空」，合法，与「缺失」可区分。
+
+以下三条**当前不成立**，读契约时不要据此推断保障：
 
 - `commands` 的 **@提及匹配当前未实现**：网关解出 `mentions` 后即丢弃，路由层只有前缀与正则两种方式（评审 §4.2，票 #13）。
-- `config_schema` 的启动期校验**当前未实现**：既无存在性校验也无类型校验，配置写错仍能启动（评审 §4.1，票 #10）。
 - 同优先级冲突的静态检测**当前未实现**：两条规则同时命中不会报错，启动期也发现不了。实际行为见 §3.4（评审 §4.7 第一行 / §2.3）。
 - `capabilities` 是**保留字段**，当前不参与任何门控；真正起门控作用的是哪三项，见 §3.3 末段（评审 §4.1）。
 
@@ -205,7 +206,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | `Store.Query` | 只读、参数化、行数上限 1000 | 不允许 DDL/写操作 |
 | `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝 |
 | `HTTPStatusError` | `{Status int, Body string}`；`HTTP` 的四个方法在非 2xx 时返回它，`Error()` 只含状态码 | 由 host 翻译 `*httpx.HTTPError` 而来，**插件不需要 import `internal/httpx`** 就能分辨 429 与普通失败；网络错误与 ctx 取消不包装 |
-| `Config()` | `[plugins.<name>]` 只读视图：`Str` / `Bool` / `Int` / `Duration` / `Decode(ptr)` | 只能读自己的配置段；`Decode` 把整段解成结构体，错误带段名与键名 |
+| `Config()` | `[plugins.<name>]` 只读视图：`Str` / `Bool` / `Int` / `Duration` / `Decode(ptr)` | 只能读自己的配置段；`Manifest.config_schema` 在装配期校验（声明即必填，四种类型）；`Decode` 把整段解成结构体，错误带段名与键名 |
 | `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
 | `Log` | 结构化日志，自动带 plugin 字段 | 敏感字段脱敏 |
 | `Renderer` | 把 markdown 画成图片（`Markdown(ctx, src) (Image, error)`），契约见 §3.8 | 未注入时返回拒绝性 stub（错误可被 `errors.Is` 分类为超时/超大/能力缺失），不是 nil |
