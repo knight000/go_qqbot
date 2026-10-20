@@ -57,6 +57,7 @@ type activeUsageStore interface {
 // 平台约束（§1.2）：
 //   - 群：同一 msg_id 5 分钟内最多 5 次；
 //   - 单聊：60 分钟内最多 4 次；
+//   - msg_seq 在同一 msg_id 下单调递增，window 过期只重置剩余次数、不回退序号；
 //   - msg_id + msg_seq 全局唯一，重试不得复用同一 seq。
 type Sender struct {
 	api    messageAPI
@@ -73,10 +74,18 @@ type Sender struct {
 }
 
 type passiveWindow struct {
+	// used 是当前窗口里已经用掉的次数；seq 是这个 msg_id 的累计序号。
+	// 两者必须分开：窗口过期只把 used 归零，seq 继续往上走。
+	// 合成一个计数器（旧的写法）会让同一 msg_id 的 seq 每 5 分钟从 1 重来，
+	// 而平台判重看的是 (msg_id, msg_seq) 全局唯一。
 	used    int
+	seq     int
 	limit   int
 	ttl     time.Duration
 	expires time.Time
+	// lastUsed 是 seqRetention 的依据：窗口过期了也只是"额度归零"，
+	// 条目本身要留到 msg_id 不可能再被重试之后才删。
+	lastUsed time.Time
 }
 
 func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore) *Sender {
@@ -188,11 +197,14 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
+	now := s.now()
 	s.gcLocked(now)
 
 	w, ok := s.windows[ev.MsgID]
 	if !ok {
+		if len(s.windows) >= seqCap {
+			s.evictOldestLocked()
+		}
 		limit, ttl := 4, 60*time.Minute
 		if ev.Scene == host.SceneGroup {
 			limit, ttl = 5, 5*time.Minute
@@ -201,6 +213,7 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 		s.windows[ev.MsgID] = w
 	}
 	if now.After(w.expires) {
+		// 只重置剩余次数。seq 不回退——见 passiveWindow 的注释。
 		w.used = 0
 		w.expires = now.Add(w.ttl)
 	}
@@ -208,19 +221,57 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 		return 0, ErrPassiveExhausted
 	}
 	w.used++
-	return w.used, nil
+	w.seq++
+	w.lastUsed = now
+	return w.seq, nil
 }
 
-// gcLocked 清掉过期窗口，避免 map 随会话数无限增长。调用方需持锁。
+// 序号条目的保留期与上限。窗口本身 5 分钟（群）/ 60 分钟（单聊）就过期，
+// 但序号必须活得更久：删早了，窗口过期后同一个 msg_id 的 seq 就从 1 重来。
+//
+// 这两个常量是"内存上界"的全部答案：
+//   - seqRetention 覆盖了平台任何合理的重试跨度（远大于 60 分钟窗口）；
+//   - seqCap 给条目数一个硬上界（每条 ~80 字节，8192 条约 0.6 MB）。
+//
+// 代价写清楚：超过上界时淘汰最久未用的 msg_id，它若再出现，seq 会从 1 重来。
+// 这个代价是刻意选的——无界增长换来的"绝对单调"会在长期运行里变成 OOM，
+// 而 8192 个活跃 msg_id 对当前规模（一天几十到几百条消息）来说够用两个数量级。
+const (
+	seqRetention = 24 * time.Hour
+	seqCap       = 8192
+)
+
+// gcLocked 清掉久未使用的窗口。调用方需持锁。
+//
+// 注意判据是 lastUsed + seqRetention，而不是 expires：
+// 过期窗口还要留着序号，删了序号就丢了。
 func (s *Sender) gcLocked(now time.Time) {
 	if now.Sub(s.lastGC) < time.Minute {
 		return
 	}
 	s.lastGC = now
 	for k, w := range s.windows {
-		if now.After(w.expires) {
+		if now.Sub(w.lastUsed) > seqRetention {
 			delete(s.windows, k)
 		}
+	}
+}
+
+// evictOldestLocked 在条目数达到 seqCap 时淘汰最久未用的那一条。
+// 只在新 msg_id 进来且已满时调用，所以 O(n) 的扫描是可控的（n=8192）。
+func (s *Sender) evictOldestLocked() {
+	var (
+		oldestKey string
+		oldestAt  time.Time
+		first     bool
+	)
+	for k, w := range s.windows {
+		if first || w.lastUsed.Before(oldestAt) {
+			oldestKey, oldestAt, first = k, w.lastUsed, false
+		}
+	}
+	if oldestKey != "" {
+		delete(s.windows, oldestKey)
 	}
 }
 

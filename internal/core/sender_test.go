@@ -204,6 +204,43 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 	}
 }
 
+// 窗口过期后序号不能回到 1：平台靠 (msg_id, msg_seq) 判重，
+// 窗口只该重置"还剩几次"，不该重置"第几条"。
+func TestSenderPassiveSeqKeepsRisingAfterWindowExpiry(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+	ctx := context.Background()
+
+	for i := 1; i <= 5; i++ {
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("第 %d 次回复不应失败: %v", i, err)
+		}
+		if got := f.bodyAt(i - 1).MsgSeq; got != i {
+			t.Fatalf("第 %d 条的 seq 应为 %d，实际 %d", i, i, got)
+		}
+	}
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrPassiveExhausted) {
+		t.Fatalf("窗口内第 6 次应耗尽，实际 err=%v", err)
+	}
+
+	// 群窗口是 5 分钟：跨过去只该拿回 5 格额度，序号连着数。
+	now = now.Add(6 * time.Minute)
+	for i := 6; i <= 10; i++ {
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("过期后第 %d 条不应失败: %v", i, err)
+		}
+		if got := f.bodyAt(i - 1).MsgSeq; got != i {
+			t.Fatalf("窗口过期后 seq 应继续递增到 %d，实际 %d", i, got)
+		}
+	}
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrPassiveExhausted) {
+		t.Fatalf("新窗口第 6 次仍应耗尽，实际 err=%v", err)
+	}
+}
+
 // 本地日预算必须在发 HTTP 之前扣除，用尽后不再打扰平台。
 func TestSenderActiveDailyBudget(t *testing.T) {
 	f := &fakeAPI{}
