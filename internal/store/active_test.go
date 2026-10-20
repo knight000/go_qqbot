@@ -11,7 +11,7 @@ func TestTakeActiveBudgetStopsAtLimit(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 1; i <= 2; i++ {
-		ok, err := db.TakeActiveBudget(ctx, "2026-10-20", "c2c", "u1", 2)
+		ok, err := db.TakeActiveBudget(ctx, ActiveUsageKey{Day: "2026-10-20", Scene: "c2c", Peer: "u1"}, 2)
 		if err != nil {
 			t.Fatalf("第 %d 次占额度出错: %v", i, err)
 		}
@@ -19,7 +19,7 @@ func TestTakeActiveBudgetStopsAtLimit(t *testing.T) {
 			t.Fatalf("第 %d 次应占额度成功", i)
 		}
 	}
-	ok, err := db.TakeActiveBudget(ctx, "2026-10-20", "c2c", "u1", 2)
+	ok, err := db.TakeActiveBudget(ctx, ActiveUsageKey{Day: "2026-10-20", Scene: "c2c", Peer: "u1"}, 2)
 	if err != nil {
 		t.Fatalf("超额占额度出错: %v", err)
 	}
@@ -28,14 +28,14 @@ func TestTakeActiveBudgetStopsAtLimit(t *testing.T) {
 	}
 
 	// 维度是 (day, scene, peer)：换一天、换场景、换 peer 都不受影响。
-	for _, c := range []struct{ day, scene, peer string }{
-		{"2026-10-21", "c2c", "u1"},
-		{"2026-10-20", "group", "u1"},
-		{"2026-10-20", "c2c", "u2"},
+	for _, k := range []ActiveUsageKey{
+		{Day: "2026-10-21", Scene: "c2c", Peer: "u1"},
+		{Day: "2026-10-20", Scene: "group", Peer: "u1"},
+		{Day: "2026-10-20", Scene: "c2c", Peer: "u2"},
 	} {
-		got, err := db.TakeActiveBudget(ctx, c.day, c.scene, c.peer, 2)
+		got, err := db.TakeActiveBudget(ctx, k, 2)
 		if err != nil || !got {
-			t.Fatalf("独立维度 %v 应可占额度: ok=%v err=%v", c, got, err)
+			t.Fatalf("独立维度 %v 应可占额度: ok=%v err=%v", k, got, err)
 		}
 	}
 }
@@ -48,7 +48,7 @@ func TestTakeActiveBudgetNonPositiveLimitRefuses(t *testing.T) {
 	ctx := context.Background()
 
 	for _, limit := range []int{0, -1} {
-		ok, err := db.TakeActiveBudget(ctx, "2026-10-20", "c2c", "u1", limit)
+		ok, err := db.TakeActiveBudget(ctx, ActiveUsageKey{Day: "2026-10-20", Scene: "c2c", Peer: "u1"}, limit)
 		if err != nil {
 			t.Fatalf("limit=%d 不该报错: %v", limit, err)
 		}
@@ -82,7 +82,7 @@ func TestActiveBudgetSurvivesReopen(t *testing.T) {
 	}
 
 	db := open()
-	if ok, err := db.TakeActiveBudget(ctx, "2026-10-20", "group", "g1", 1); err != nil || !ok {
+	if ok, err := db.TakeActiveBudget(ctx, ActiveUsageKey{Day: "2026-10-20", Scene: "group", Peer: "g1"}, 1); err != nil || !ok {
 		t.Fatalf("首次应可占额度: ok=%v err=%v", ok, err)
 	}
 	if err := db.Close(); err != nil {
@@ -91,7 +91,7 @@ func TestActiveBudgetSurvivesReopen(t *testing.T) {
 
 	db2 := open()
 	defer db2.Close()
-	if ok, err := db2.TakeActiveBudget(ctx, "2026-10-20", "group", "g1", 1); err != nil || ok {
+	if ok, err := db2.TakeActiveBudget(ctx, ActiveUsageKey{Day: "2026-10-20", Scene: "group", Peer: "g1"}, 1); err != nil || ok {
 		t.Fatalf("重开后额度应已用尽: ok=%v err=%v", ok, err)
 	}
 }
@@ -105,7 +105,7 @@ func TestResetLevelsAndActiveBudget(t *testing.T) {
 
 	take := func(peer string) bool {
 		t.Helper()
-		ok, err := db.TakeActiveBudget(ctx, day, "group", peer, 1)
+		ok, err := db.TakeActiveBudget(ctx, ActiveUsageKey{Day: day, Scene: "group", Peer: peer}, 1)
 		if err != nil {
 			t.Fatalf("占 %s 的额度: %v", peer, err)
 		}

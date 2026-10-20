@@ -11,6 +11,7 @@ import (
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/httpx"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 var (
@@ -49,7 +50,7 @@ type messageAPI interface {
 type activeUsageStore interface {
 	// TakeActiveBudget 原子地占一格当日额度；false 表示当日已满。
 	// 返回 error 表示账本不可用，调用方必须拒发（见 sendActiveOne）。
-	TakeActiveBudget(ctx context.Context, day, scene, peer string, limit int) (bool, error)
+	TakeActiveBudget(ctx context.Context, key store.ActiveUsageKey, limit int) (bool, error)
 }
 
 // Sender 负责 passive/active 两类出站。
@@ -378,6 +379,10 @@ func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID 
 		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
 		return false, errors.New("未配置主动消息额度账本")
 	}
-	day := s.now().Format("2006-01-02")
-	return s.usage.TakeActiveBudget(ctx, day, string(scene), peerID, s.active.DailyPerPeer)
+	key := store.ActiveUsageKey{
+		Day:   s.now().Format("2006-01-02"),
+		Scene: string(scene),
+		Peer:  peerID,
+	}
+	return s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
 }
