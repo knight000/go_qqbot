@@ -5,6 +5,18 @@ import (
 	"fmt"
 )
 
+// ActiveUsageKey 是主动消息日预算的维度：一天、一个场景、一个收件人。
+//
+// 三个字段都是 string，按位置传参时把 peer 和 scene 写反了编译器也看不出来，
+// 而后果是"另一个人的额度被扣掉"。绑成一个类型后调用点必须写字段名，
+// 记账与 R2 的"按 peer 清"也就用的是同一套坐标。
+type ActiveUsageKey struct {
+	// Day 是本地时区的日期（YYYY-MM-DD）：跨日换桶靠它，不靠墙钟。
+	Day   string
+	Scene string
+	Peer  string
+}
+
 // TakeActiveBudget 原子地占一格主动消息日预算。
 //
 // 返回 false 表示当日额度已满（不是错误）；返回 error 表示账本本身不可用，
@@ -21,14 +33,14 @@ import (
 //
 // 真传了 <= 0 就**显式拒发**，不能只靠 WHERE 恒假：upsert 的第一条
 // INSERT 分支不受 WHERE 约束，新 key 会被插进一行 used=1 并返回成功。
-func (db *DB) TakeActiveBudget(ctx context.Context, day, scene, peer string, limit int) (bool, error) {
+func (db *DB) TakeActiveBudget(ctx context.Context, key ActiveUsageKey, limit int) (bool, error) {
 	if limit <= 0 {
 		return false, nil
 	}
 	res, err := db.w.ExecContext(ctx,
 		`INSERT INTO active_usage(day, scene, peer, used) VALUES(?, ?, ?, 1)
 		 ON CONFLICT(day, scene, peer) DO UPDATE SET used = used + 1 WHERE used < ?`,
-		day, scene, peer, limit)
+		key.Day, key.Scene, key.Peer, limit)
 	if err != nil {
 		return false, fmt.Errorf("占用主动消息额度: %w", err)
 	}
