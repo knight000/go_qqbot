@@ -138,8 +138,8 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 	}
 
 	// 同 priority 组内按序执行，遇到不让位者就停在这个插件（§3.4）：
-	// "是否继续"是每个匹配者自己的声明（Manifest.Yield），不是排序第一名的属性。
-	// 组内无权限的候选跳过并记录，跳过本身不改变"是否继续"。
+	// “是否继续”是每个匹配者自己的声明（Manifest.Yield），不是排序第一名的属性。
+	// 组内无权限的候选跳过并记录，跳过本身不改变“是否继续”。
 	group := matches[first].Priority
 	for i := first; i < len(matches); i++ {
 		m := matches[i]

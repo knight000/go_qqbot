@@ -346,14 +346,14 @@ type Manifest struct {
 	Capabilities []string
 	Intents      []string // 订阅的事件：`message` 这样的大类，或 `group.message` 这样的场景限定
 	Commands     []Command
-	// Yield 声明"本插件处理完是否让位给同 priority 的下一个匹配者"。
+	// Yield 声明“本插件处理完是否让位给同 priority 的下一个匹配者”。
 	//
 	// 零值 false = 阻断，也是默认行为：只跑一个插件，避免两个插件同时回、
-	// 消耗两次被动额度。设 true 表示"我处理完，同组后面的插件接着处理"。
+	// 消耗两次被动额度。设 true 表示“我处理完，同组后面的插件接着处理”。
 	// 只在同 priority 组内生效，跨 priority 不扇出（§3.4）；让位链在第一个
 	// 不让位者处截止，被挡住的插件会出现在 full 级轨迹里。
 	//
-	// 它取代了旧字段 Broadcast：那时"是否继续"挂在排序第一的插件上，名字靠前的
+	// 它取代了旧字段 Broadcast：那时“是否继续”挂在排序第一的插件上，名字靠前的
 	// false 会压掉靠后的 true，且没有任何提示（评审 §2.3）。现在每个匹配者
 	// 只决定自己的让位，不再替别人做决定。
 	Yield          bool
