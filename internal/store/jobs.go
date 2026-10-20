@@ -88,7 +88,7 @@ func (db *DB) DueJobs(ctx context.Context, now int64, limit int, excludePlugins 
 		          WHERE g.group_openid = j.peer AND g.left_at = 0))`
 	args := []any{now}
 	if len(excludePlugins) > 0 {
-		query += ` AND j.plugin NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(excludePlugins)), ",") + `)`
+		query += ` AND j.plugin NOT IN (` + placeholders(len(excludePlugins)) + `)`
 		for _, p := range excludePlugins {
 			args = append(args, p)
 		}
@@ -157,8 +157,7 @@ func (db *DB) DisableJobsExcept(ctx context.Context, keep []string) error {
 	query := `UPDATE jobs SET enabled = 0`
 	var args []any
 	if len(keep) > 0 {
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keep)), ",")
-		query += ` WHERE id NOT IN (` + placeholders + `)`
+		query += ` WHERE id NOT IN (` + placeholders(len(keep)) + `)`
 		for _, id := range keep {
 			args = append(args, id)
 		}
@@ -167,4 +166,9 @@ func (db *DB) DisableJobsExcept(ctx context.Context, keep []string) error {
 		return fmt.Errorf("停用未注册任务: %w", err)
 	}
 	return nil
+}
+
+// placeholders 返回 n 个逗号分隔的 ?，供 IN (...) 使用。
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
