@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -433,9 +434,14 @@ func TestSenderActiveBudgetFailsClosedWhenStoreBroken(t *testing.T) {
 		DailyPerPeer: 5,
 	}, db)
 
-	if err := s.ForPlugin("digest").SendActive(context.Background(), host.SceneC2C, "u1",
-		host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+	err := s.ForPlugin("digest").SendActive(context.Background(), host.SceneC2C, "u1",
+		host.Reply{Content: "x"})
+	if !errors.Is(err, ErrActiveQuota) {
 		t.Fatalf("库不可用时应拒绝，实际 err=%v", err)
+	}
+	// 账本故障是运维问题，但错误必须指得回是哪个会话说起的（规则 7）。
+	if !strings.Contains(err.Error(), "c2c") || !strings.Contains(err.Error(), "u1") {
+		t.Fatalf("账本故障的错误缺少场景/peer: %v", err)
 	}
 	if n := f.callCount(); n != 0 {
 		t.Fatalf("库不可用时不该发 HTTP，实际 %d 次", n)
