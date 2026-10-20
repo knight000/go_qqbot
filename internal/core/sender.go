@@ -17,7 +17,9 @@ var (
 	ErrPassiveExhausted = errors.New("被动回复次数已用尽")
 	ErrActiveDisabled   = errors.New("主动消息未开启")
 	// ErrActiveQuota 是本地主动消息日额度用尽。平台每用户每天上限 1000 条，
-	// 本地把预算压到个位数，避免重启循环之类的异常把额度烧掉。
+	// 本地把预算压到个位数并**落库**（§4.1 active_usage）：重启不清零，
+	// 否则"重启循环不会烧额度"就只是注释里的一句空话。
+	// 额度账本不可用时也返回它（fail-closed），调用方只需判断这一个错误。
 	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
 	// ErrRateLimited 表示平台返回 429。官方只给状态码 + err_code + trace_id，
 	// 不提供剩余额度，也不承诺 Retry-After，因此退避策略必须由本地按维度决定。
@@ -39,6 +41,17 @@ type messageAPI interface {
 	UploadMedia(ctx context.Context, scene, peer string, up api.MediaUpload) (api.MediaUploadResult, error)
 }
 
+// activeUsageStore 是主动消息日预算的落库入口。核心不能写 plugin_kv
+// （那是插件命名空间），所以由 store 单独维护一张 active_usage 表。
+//
+// 抽成接口而不是直接用 *store.DB，是为了让"账本坏了"这条路径可测：
+// 关掉库、或者换一个只会报错的实现，就能验证 fail-closed 的行为。
+type activeUsageStore interface {
+	// TakeActiveBudget 原子地占一格当日额度；false 表示当日已满。
+	// 返回 error 表示账本不可用，调用方必须拒发（见 sendActiveOne）。
+	TakeActiveBudget(ctx context.Context, day, scene, peer string, limit int) (bool, error)
+}
+
 // Sender 负责 passive/active 两类出站。
 //
 // 平台约束（§1.2）：
@@ -50,13 +63,13 @@ type Sender struct {
 	log    *slog.Logger
 	active ActivePolicy
 	trace  *Trace
+	usage  activeUsageStore
+	// now 可注入：日切、窗口过期、序号保留期都要靠时间推进来测。
+	now func() time.Time
 
 	mu      sync.Mutex
 	windows map[string]*passiveWindow
 	lastGC  time.Time
-	// 主动消息日预算：key 为 scene|peer，日切时整体重置
-	activeUse map[string]int
-	activeDay string
 }
 
 type passiveWindow struct {
@@ -66,13 +79,14 @@ type passiveWindow struct {
 	expires time.Time
 }
 
-func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy) *Sender {
+func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore) *Sender {
 	return &Sender{
-		api:       api,
-		log:       log,
-		active:    active,
-		windows:   make(map[string]*passiveWindow),
-		activeUse: make(map[string]int),
+		api:     api,
+		log:     log,
+		active:  active,
+		usage:   usage,
+		now:     time.Now,
+		windows: make(map[string]*passiveWindow),
 	}
 }
 
@@ -265,7 +279,14 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	}
 	// 主动消息的日预算比被动窗口稀缺得多（按天计），所以先扣预算再上传：
 	// 额度已尽时不该再浪费一次上传。被动回复反过来——窗口 5 分钟就过期。
-	if !s.takeActiveBudget(scene, peerID) {
+	//
+	// 扣额度是库里的一次原子 upsert（§4.1 active_usage），因此不存在
+	// "内存清零"或"重启后从 0 重来"的问题：进程只是账本的读者之一。
+	if ok, err := s.takeActiveBudget(ctx, scene, peerID); err != nil {
+		// fail-closed：账本不可信时不发。宁可少发一条，也不能把平台
+		// 每天 1000 条的配额当成无限量烧掉——额度超发是不可撤回的。
+		return fmt.Errorf("%w（额度记账失败，按保守策略拒发）: %v", ErrActiveQuota, err)
+	} else if !ok {
 		return fmt.Errorf("%w（%s %s）", ErrActiveQuota, scene, peerID)
 	}
 
@@ -282,20 +303,18 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	return nil
 }
 
-// takeActiveBudget 扣一次日预算；返回 false 表示已用尽。
-func (s *Sender) takeActiveBudget(scene host.Scene, peerID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	day := time.Now().Format("2006-01-02")
-	if s.activeDay != day {
-		s.activeDay = day
-		s.activeUse = make(map[string]int)
+// takeActiveBudget 占一格日预算；ok=false 表示当日已用尽。
+// error 表示账本本身不可用（库没打开、写失败、ctx 取消），调用方必须拒发。
+func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID string) (bool, error) {
+	// 不限量时不必记账：DailyPerPeer<=0 是测试与"临时全开"的用法，
+	// 写库只会给一个永不读取的桶添行。注意这与"额度用尽"是两回事。
+	if s.active.DailyPerPeer <= 0 {
+		return true, nil
 	}
-	key := string(scene) + "|" + peerID
-	if s.active.DailyPerPeer > 0 && s.activeUse[key] >= s.active.DailyPerPeer {
-		return false
+	if s.usage == nil {
+		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
+		return false, errors.New("未配置主动消息额度账本")
 	}
-	s.activeUse[key]++
-	return true
+	day := s.now().Format("2006-01-02")
+	return s.usage.TakeActiveBudget(ctx, day, string(scene), peerID, s.active.DailyPerPeer)
 }

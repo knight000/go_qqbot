@@ -25,7 +25,7 @@ func tinyPNG() []byte {
 func imageSender(t *testing.T) (*Sender, *fakeAPI) {
 	t.Helper()
 	f := &fakeAPI{}
-	return NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}), f
+	return NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil), f
 }
 
 func msgEvent() *host.Event {
@@ -279,7 +279,7 @@ func TestActiveImageBudgetCheckedBeforeUpload(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"digest": true},
 		DailyPerPeer: 1,
-	})
+	}, newUsageStore(t))
 	p := s.ForPlugin("digest")
 	ctx := context.Background()
 

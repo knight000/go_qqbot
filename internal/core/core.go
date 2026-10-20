@@ -97,7 +97,13 @@ func New(o Options) (*Core, error) {
 			})
 		}
 	}
-	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config))
+	// 显式判空再赋给接口：nil 的 *store.DB 装进接口是个非 nil 接口，
+	// Sender 会以为有账本、调用时再 nil 解引用。
+	var usage activeUsageStore
+	if o.Store != nil {
+		usage = o.Store
+	}
+	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage)
 	sender.trace = trace
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
