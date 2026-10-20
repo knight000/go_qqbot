@@ -345,9 +345,13 @@ type Manifest struct {
 	// 已知缺陷，取舍与替代方案见评审 §2.3。
 	Broadcast      bool
 	AllowedDomains []string
-	// ConfigSchema 是**保留字段**：核心从不读取，启动期既不做存在性校验也不做
-	// 类型校验，配置写错仍能启动。必填项与类型要由插件自己在 Init 里检查
-	// （评审 §4.1）。
+	// ConfigSchema 声明本插件需要 [plugins.<name>] 里的哪些键、各是什么类型，
+	// 由核心在装配期（Init 之前）校验，见 Manifest.ValidateConfig（评审 §4.1）。
+	//
+	// 语义是**声明即必填**：写进来的键必须有值，缺一个就启动失败；有默认值的键
+	// 不要写进来，否则等于把默认值变成必填。类型只支持四种，与 Params 的读取
+	// 方法一一对应：string / bool / int / duration。空配置段 + 空 schema 依旧
+	// 能启动，所以不声明 schema 的插件行为与校验上线前完全一致。
 	ConfigSchema map[string]string
 
 	// Permission 是插件级默认权限：命令自身未声明时继承它。
