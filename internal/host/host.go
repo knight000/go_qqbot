@@ -34,8 +34,16 @@ import (
 // 版本 7：Host.HTTP 的非 2xx 统一返回 *HTTPStatusError，插件不必 import
 // internal/httpx 就能分辨 429 与普通失败。
 //
-// 版本 8：Event 新增 Mentioned（这条消息 @ 了机器人）与 Raw / RawTruncated
-// （平台原始 JSON 的 32 KiB 副本，所有事件都有）。
+// 版本 8：批内三张票共用这一个版本（#11 / #12 / #13），因为它们同期落地、
+// 插件本来就要一起改：
+//   - Manifest.Yield 取代 Broadcast：是否让位由每个匹配者自己声明（§3.4）；
+//   - Event.Command / Event.Args 由核心在调用 Handle 之前填好：Command 是命中的
+//     前缀原文或正则源码，Args 是命令之后已 TrimSpace 的剩余原文；前缀匹配默认
+//     按词边界（`/md5` 不再命中 `/md`），确需裸前缀时在 Command 上声明 Loose，
+//     插件不再自己 CutPrefix / HasPrefix；
+//   - Event.Mentioned / Event.Raw 暴露"是否 @ 了机器人"与原始载荷。
+//
+// 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
 const APIVersion = "8"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
@@ -96,6 +104,16 @@ type Event struct {
 	UnionID  string // 平台给的跨场景标识，可能为空
 	MsgID    string // 被动回复必须携带
 	Content  string
+	// Command 是本次投递命中的命令写法：前缀的原文，或正则的源码；未命中为空串。
+	// Args 是命中片段之后、已 TrimSpace 的剩余原文；未命中同样为空串。
+	//
+	// 两者都由核心在路由阶段填好（§3.4），插件不要再从 Content 里 CutPrefix：
+	// 命令词边界与参数切分只有一份实现，在路由层。Content 仍是 TrimSpace 过的
+	// 完整原文，两者并存——要判断"用户到底敲了什么"读 Content，要取参数读 Args。
+	//
+	// 一次派发执行多个插件时，每个插件拿到的是它自己命中那条命令的 Command/Args。
+	Command string
+	Args    string
 	// MsgType 是平台的 message_type：0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用。
 	MsgType int
 	// HasMedia 表示平台载荷里带附件。附件不会被下载（入站媒体不做），
@@ -353,7 +371,11 @@ type Host interface {
 // 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配。那个事实在
 // Event.Mentioned，要不要据此响应由插件自己判断（ARCHITECTURE §1.4 / 票 #13）。
 type Command struct {
-	Prefix      string
+	Prefix string
+	// Loose 只对 Prefix 生效，默认 false = 严格：前缀之后必须是空白或字符串结尾，
+	// 所以 `/md5 abc` 不命中 `/md`。置 true 退回裸 HasPrefix 语义，
+	// 只给"前缀本身就是完整词、后面紧跟内容"这类确有需要的写法用。
+	Loose       bool
 	Pattern     string
 	Priority    int
 	Description string
@@ -376,13 +398,17 @@ type Manifest struct {
 	Capabilities []string
 	Intents      []string // 订阅的事件：`message` 这样的大类，或 `group.message` 这样的场景限定
 	Commands     []Command
-	// Broadcast 让中标插件声明“同优先级的其它插件也执行”。
+	// Yield 声明“本插件处理完是否让位给同 priority 的下一个匹配者”。
 	//
-	// 它只对中标者生效：候选先按 priority 降序、同 priority 按插件名字典序升序
-	// 排序（Router.Match），再取第一个有权限的作为中标者（Dispatcher.handle）。
-	// 所以名字靠前的 Broadcast=false 会压掉靠后的 Broadcast=true，且没有提示——
-	// 已知缺陷，取舍与替代方案见评审 §2.3。
-	Broadcast      bool
+	// 零值 false = 阻断，也是默认行为：只跑一个插件，避免两个插件同时回、
+	// 消耗两次被动额度。设 true 表示“我处理完，同组后面的插件接着处理”。
+	// 只在同 priority 组内生效，跨 priority 不扇出（§3.4）；让位链在第一个
+	// 不让位者处截止，被挡住的插件会出现在 full 级轨迹里。
+	//
+	// 它取代了旧字段 Broadcast：那时“是否继续”挂在排序第一的插件上，名字靠前的
+	// false 会压掉靠后的 true，且没有任何提示（评审 §2.3）。现在每个匹配者
+	// 只决定自己的让位，不再替别人做决定。
+	Yield          bool
 	AllowedDomains []string
 	// ConfigSchema 声明本插件需要 [plugins.<name>] 里的哪些键、各是什么类型，
 	// 由核心在装配期（Init 之前）校验，见 Manifest.ValidateConfig（评审 §4.1）。

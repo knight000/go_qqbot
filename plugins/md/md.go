@@ -4,6 +4,9 @@
 //   - 与核心保留指令（/claim /reset /group …）同一形状，用户不必记两套约定；
 //   - `md` 在中文聊天里是常见的脏话缩写，宽松匹配会在线上的正常对话里误触。
 //
+// 命令词边界（`/md5 abc` 不算 `/md`）与参数切分都在路由层，插件只读
+// Event.Command / Event.Args；这里不再自己 CutPrefix。
+//
 // 两条实现约束值得复制到别的渲染类插件里：
 //  1. 渲染必须在 Handle 内同步完成。Sender.Reply 的错误在 dispatch 里才处理，
 //     那时 Handle 已经返回，插件拿不到"渲染失败"，所以"发送时再渲染"这条路不通。
@@ -24,8 +27,6 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/knight000/go_qqbot/internal/host"
 )
@@ -63,10 +64,9 @@ func (p *Plugin) Init(_ context.Context, h host.Host) error {
 }
 
 func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
-	src, ok := parse(ev.Content)
-	if !ok {
-		return nil, nil // 不是本指令，让给优先级更低的插件
-	}
+	// 命令词边界（/md5 不算 /md）与参数切分都在路由层：命中的事件才投递到
+	// 这里，正文已按 /md 之后的剩余原文 TrimSpace 好，插件不再判"是不是本指令"。
+	src := ev.Args
 	if src == "" {
 		return &host.Reply{Content: usage}, nil
 	}
@@ -96,21 +96,4 @@ func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error
 		p.log.Warn("markdown 渲染失败", "err", err, "len", len(src))
 		return &host.Reply{Content: "渲染失败，请稍后再试"}, nil
 	}
-}
-
-// parse 拆出"指令后剩下的部分"。ok=false 表示这条消息不是 md 指令。
-//
-// Manifest 的前缀匹配是裸的 HasPrefix，`/md5 abc` 也会命中，所以"指令词是否
-// 独立成词"只能在这里判。后半段整段原样交给渲染器——用 strings.Fields 会把
-// 换行压成空格，多行 markdown（表格、代码块）会被拼坏。
-func parse(content string) (src string, ok bool) {
-	rest, hit := strings.CutPrefix(strings.TrimSpace(content), "/md")
-	if !hit {
-		return "", false
-	}
-	// 紧跟的必须是空白或结尾：/md5、/mdx 不是本指令。
-	if r, _ := utf8.DecodeRuneInString(rest); rest != "" && !unicode.IsSpace(r) {
-		return "", false
-	}
-	return strings.TrimSpace(rest), true
 }
