@@ -43,12 +43,11 @@ func (p *Plugin) Manifest() host.Manifest {
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.active", "admin.directory", "kv", "log"},
 		// 不发消息事件：本插件只在启动时动作，不参与路由匹配。
-		ConfigSchema: map[string]string{
-			"enabled":      "bool",
-			"delay":        "duration",
-			"min_interval": "duration",
-			"retry_delay":  "duration",
-		},
+		//
+		// 本插件所有配置键都有默认值（enabled / delay / min_interval /
+		// retry_delay 都在 Init 里有代码默认值），因此不写进 config_schema：
+		// schema 是「声明即必填」，写进去等于要求既有部署把四个键全补齐，
+		// 否则升级即启动失败。
 	}
 }
 

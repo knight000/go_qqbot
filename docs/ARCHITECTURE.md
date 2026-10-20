@@ -1009,6 +1009,11 @@ WantedBy=multi-user.target
 2. 替换二进制 → `systemctl restart`。
 3. 启动后优先 **Resume**（带 `session_id` + `seq`），失败（4006/4009）才 Identify。这一步能避免每次发布都消耗一次 Identify 配额并丢失断线期间的事件。
 
+**契约 8 的额外一步**：`config_schema` 从这一版起真正在装配期生效（**声明即必填**，§3.2）。
+升级前先核对每个第三方插件声明的 `config_schema`：带代码默认值的键要么从 schema 里删掉
+（这些键本来就允许不写），要么在 `[plugins.<name>]` 里补齐值——否则本次升级会以「缺键」
+启动失败。本仓的 echo / bootnotice 已按此原则删掉了全部 schema 声明。
+
 ### 9.3 日志与磁盘
 
 - 结构化 JSON 日志到 stdout，由 journald 收集，`SystemMaxUse=200M`。
