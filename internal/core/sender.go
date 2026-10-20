@@ -57,7 +57,7 @@ type activeUsageStore interface {
 // 平台约束（§1.2）：
 //   - 群：同一 msg_id 5 分钟内最多 5 次；
 //   - 单聊：60 分钟内最多 4 次；
-//   - msg_seq 在同一 msg_id 下单调递增，window 过期只重置剩余次数、不回退序号；
+//   - msg_seq 在同一 msg_id 下单调递增，窗口过期只重置剩余次数、不回退序号；
 //   - msg_id + msg_seq 全局唯一，重试不得复用同一 seq。
 type Sender struct {
 	api    messageAPI
