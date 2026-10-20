@@ -5,12 +5,29 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
+
+// newUsageStore 开一个临时库，供主动消息日预算的测试使用（预算已落库）。
+func newUsageStore(t *testing.T) *store.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatalf("打开测试库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+	return db
+}
 
 // fakeAPI 记录每一次出站，并实现 groupInfoSource。
 //
@@ -117,7 +134,7 @@ func (f *fakeAPI) lastBody() (api.MessageBody, bool) {
 
 func TestSenderPassiveLimitGroup(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{})
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
 	ctx := context.Background()
 
@@ -139,7 +156,7 @@ func TestSenderPassiveLimitGroup(t *testing.T) {
 
 func TestSenderPassiveLimitC2C(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{})
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
 	ev := &host.Event{Scene: host.SceneC2C, PeerID: "u1", MsgID: "m2"}
 	ctx := context.Background()
 
@@ -154,7 +171,7 @@ func TestSenderPassiveLimitC2C(t *testing.T) {
 }
 
 func TestSenderActiveDisabled(t *testing.T) {
-	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{})
+	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
 	if err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
 		t.Fatalf("主动消息总开关关闭时应拒绝，实际 err=%v", err)
 	}
@@ -167,7 +184,7 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 5,
-	})
+	}, newUsageStore(t))
 
 	if err := s.ForPlugin("evil").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
 		t.Fatalf("非白名单插件应被拒绝，实际 err=%v", err)
@@ -187,6 +204,97 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 	}
 }
 
+// 窗口过期后序号不能回到 1：平台靠 (msg_id, msg_seq) 判重，
+// 窗口只该重置"还剩几次"，不该重置"第几条"。
+func TestSenderPassiveSeqKeepsRisingAfterWindowExpiry(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+	ctx := context.Background()
+
+	for i := 1; i <= 5; i++ {
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("第 %d 次回复不应失败: %v", i, err)
+		}
+		if got := f.bodyAt(i - 1).MsgSeq; got != i {
+			t.Fatalf("第 %d 条的 seq 应为 %d，实际 %d", i, i, got)
+		}
+	}
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrPassiveExhausted) {
+		t.Fatalf("窗口内第 6 次应耗尽，实际 err=%v", err)
+	}
+
+	// 群窗口是 5 分钟：跨过去只该拿回 5 格额度，序号连着数。
+	now = now.Add(6 * time.Minute)
+	for i := 6; i <= 10; i++ {
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("过期后第 %d 条不应失败: %v", i, err)
+		}
+		if got := f.bodyAt(i - 1).MsgSeq; got != i {
+			t.Fatalf("窗口过期后 seq 应继续递增到 %d，实际 %d", i, got)
+		}
+	}
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrPassiveExhausted) {
+		t.Fatalf("新窗口第 6 次仍应耗尽，实际 err=%v", err)
+	}
+}
+
+// 序号表的条目数必须有上界：map 随 msg_id 无限增长就是一次慢性 OOM。
+// 超过 seqCap 时淘汰最久未用的条目，代价是那条 msg_id 的序号从 1 重来——
+// 这是刻意的取舍，测试把它钉住，免得将来有人"顺手"去掉上限。
+func TestSenderPassiveSeqTableIsBounded(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	ctx := context.Background()
+
+	send := func(msgID string) int {
+		t.Helper()
+		ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: msgID}
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("%s 回复失败: %v", msgID, err)
+		}
+		body, _ := f.lastBody()
+		return body.MsgSeq
+	}
+
+	for i := 0; i < seqCap; i++ {
+		send(fmt.Sprintf("m%d", i))
+	}
+	if n := len(s.windows); n > seqCap {
+		t.Fatalf("序号表应被限制在 %d 条以内，实际 %d", seqCap, n)
+	}
+	// 新 msg_id 挤进来时淘汰最久未用的 m0；它再出现只能从 1 重来。
+	send("new")
+	if got := send("m0"); got != 1 {
+		t.Fatalf("被淘汰的 msg_id 重来时应从 1 开始，实际 seq=%d", got)
+	}
+}
+
+// 序号条目最终要被回收，而不是只靠 seqCap 兜底：一条消息的 msg_id 在
+// 窗口过期 24 小时后不可能再被重试，那时 seq 从头数就是安全的。
+func TestSenderPassiveSeqRetentionExpires(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+	ctx := context.Background()
+
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+		t.Fatalf("首次回复失败: %v", err)
+	}
+
+	now = now.Add(25 * time.Hour) // 窗口早已过期，序号保留期也过了
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+		t.Fatalf("保留期后回复失败: %v", err)
+	}
+	if got := f.bodyAt(1).MsgSeq; got != 1 {
+		t.Fatalf("保留期过后应重新从 1 计数，实际 seq=%d", got)
+	}
+}
+
 // 本地日预算必须在发 HTTP 之前扣除，用尽后不再打扰平台。
 func TestSenderActiveDailyBudget(t *testing.T) {
 	f := &fakeAPI{}
@@ -194,7 +302,7 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 2,
-	})
+	}, newUsageStore(t))
 	p := s.ForPlugin("bootnotice")
 	ctx := context.Background()
 
@@ -212,5 +320,125 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 	// 预算是按 peer 计的，换个收件人不受影响
 	if err := p.SendActive(ctx, host.SceneC2C, "u2", host.Reply{Content: "x"}); err != nil {
 		t.Fatalf("其他收件人不应受影响: %v", err)
+	}
+}
+
+// 日切按本地时区换桶：同一 peer 昨天用满，今天应该重新有一份完整预算。
+func TestSenderActiveBudgetResetsNextDay(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 1,
+	}, newUsageStore(t))
+	// 23:59 与 00:01 是同一个"日预算"问题里唯一值得卡住的边界。
+	now := time.Date(2026, 10, 20, 23, 59, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	p := s.ForPlugin("bootnotice")
+	ctx := context.Background()
+
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("当日第 1 次不应失败: %v", err)
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("当日第 2 次应超出日预算，实际 err=%v", err)
+	}
+
+	now = now.Add(2 * time.Minute) // 跨到 10-21 00:01
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("跨日后应重新有额度，实际 err=%v", err)
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("两天各应发出 1 条，实际 %d 次", n)
+	}
+}
+
+// 账本不可用时必须 fail-closed：宁可少发一条，也不能把平台配额当无限量烧。
+func TestSenderActiveBudgetFailsClosedWithoutStore(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"digest": true},
+		DailyPerPeer: 5,
+	}, nil)
+	p := s.ForPlugin("digest")
+
+	err := p.SendActive(context.Background(), host.SceneC2C, "u1",
+		host.Reply{Image: host.ImageFromBytes(tinyPNG())})
+	if !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("没有账本时应按额度不可用拒绝，实际 err=%v", err)
+	}
+	if n := f.callCount(); n != 0 {
+		t.Fatalf("账本不可用时不该发 HTTP，实际 %d 次", n)
+	}
+	if n := f.uploadCount(); n != 0 {
+		t.Fatalf("账本不可用时不该上传，实际上传 %d 次", n)
+	}
+}
+
+// 库已经关掉时同样拒发——这是"记账失败"最现实的一种形态。
+func TestSenderActiveBudgetFailsClosedWhenStoreBroken(t *testing.T) {
+	db := newUsageStore(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("关库: %v", err)
+	}
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"digest": true},
+		DailyPerPeer: 5,
+	}, db)
+
+	if err := s.ForPlugin("digest").SendActive(context.Background(), host.SceneC2C, "u1",
+		host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("库不可用时应拒绝，实际 err=%v", err)
+	}
+	if n := f.callCount(); n != 0 {
+		t.Fatalf("库不可用时不该发 HTTP，实际 %d 次", n)
+	}
+}
+
+// 日预算落库的全部意义：进程重启（关库、重开、换一个 Sender）不能清零，
+// 否则"重启循环不会烧额度"这句注释仍然是假的。
+func TestSenderActiveBudgetSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "restart.db")
+	open := func() *store.DB {
+		db, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("打开测试库: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		if err := db.Migrate(context.Background()); err != nil {
+			t.Fatalf("迁移: %v", err)
+		}
+		return db
+	}
+	policy := ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 2,
+	}
+	ctx := context.Background()
+
+	first := open()
+	f := &fakeAPI{}
+	p := NewSender(f, slog.New(slog.DiscardHandler), policy, first).ForPlugin("bootnotice")
+	for i := 0; i < 2; i++ {
+		if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+			t.Fatalf("第 %d 次不应失败: %v", i+1, err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("关库: %v", err)
+	}
+
+	second := open()
+	f2 := &fakeAPI{}
+	p2 := NewSender(f2, slog.New(slog.DiscardHandler), policy, second).ForPlugin("bootnotice")
+	if err := p2.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("重启后当日额度应仍是用尽的，实际 err=%v", err)
+	}
+	if n := f2.callCount(); n != 0 {
+		t.Fatalf("额度已尽时不应发 HTTP，实际 %d 次", n)
 	}
 }
