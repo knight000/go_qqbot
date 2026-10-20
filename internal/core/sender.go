@@ -71,7 +71,6 @@ type Sender struct {
 	mu      sync.Mutex
 	windows map[string]*passiveWindow
 	lastGC  time.Time
-	order   uint64
 }
 
 type passiveWindow struct {
@@ -84,10 +83,6 @@ type passiveWindow struct {
 	limit   int
 	ttl     time.Duration
 	expires time.Time
-	// lastOrder 是进程内的单调访问序号，只用于淘汰（seqCap 满时踢最旧的）。
-	// 不拿 expires 或墙钟当 LRU 依据：Windows 的时间戳粒度够粗，
-	// 同一毫秒里建的一批窗口会并列"最久未用"，淘汰谁就变成随机的。
-	lastOrder uint64
 }
 
 func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore) *Sender {
@@ -205,7 +200,7 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 	w, ok := s.windows[ev.MsgID]
 	if !ok {
 		if len(s.windows) >= seqCap {
-			s.evictOldestLocked()
+			s.evictExpiredLocked(now)
 		}
 		limit, ttl := 4, 60*time.Minute
 		if ev.Scene == host.SceneGroup {
@@ -224,22 +219,21 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 	}
 	w.used++
 	w.seq++
-	s.order++
-	w.lastOrder = s.order
 	return w.seq, nil
 }
 
 // 序号条目的保留期与上限。窗口本身 5 分钟（群）/ 60 分钟（单聊）就过期，
 // 但序号必须活得更久：删早了，窗口过期后同一个 msg_id 的 seq 就从 1 重来。
 //
-// 这两个常量是"内存上界"的全部答案：
-//   - seqRetention 是窗口过期后再留多久，覆盖平台任何合理的重试跨度
-//     （远大于 60 分钟的窗口上限）；
-//   - seqCap 给条目数一个硬上界（每条 ~64 字节，8192 条约 0.5 MB）。
+// seqRetention 是窗口过期后再留多久，覆盖平台任何合理的重试跨度
+// （远大于 60 分钟的窗口上限）。
 //
-// 代价写清楚：超过上界时淘汰最久未用的 msg_id，它若再出现，seq 会从 1 重来。
-// 这个代价是刻意选的——无界增长换来的"绝对单调"会在长期运行里变成 OOM，
-// 而 8192 个活跃 msg_id 对当前规模（一天几十到几百条消息）够用两个数量级。
+// seqCap 是**软上界**：条目数达到它时只清理已过期的窗口（见
+// evictExpiredLocked）。若一条过期的都没有，就允许暂时超出——超出的部分
+// 只可能来自"仍在窗口有效期内的活跃 msg_id"，群 5 分钟、单聊 60 分钟，
+// 本规模（一天几十到几百条消息）下离 8192 还有几个数量级；每条 ~64 字节，
+// 多占这一点内存远比淘汰一个仍在用的窗口便宜——后者会把 used 清零（同一
+// msg_id 可以超发）、把 seq 打回 1（(msg_id, msg_seq) 重复）。
 const (
 	seqRetention = 24 * time.Hour
 	seqCap       = 8192
@@ -261,21 +255,33 @@ func (s *Sender) gcLocked(now time.Time) {
 	}
 }
 
-// evictOldestLocked 在条目数达到 seqCap 时淘汰最久未用的那一条。
-// 只在新 msg_id 进来且已满时调用，所以 O(n) 的扫描是可控的（n=8192）。
-func (s *Sender) evictOldestLocked() {
+// evictExpiredLocked 在条目数达到 seqCap 时清掉一条**窗口已过期**的条目。
+//
+// 判据与 gcLocked 一致（now.After(expires) 才算过期）。不能只看 lastOrder：
+// 最久未用的那条往往仍在 5 分钟/60 分钟的被动窗口内，淘汰它等于把 used 清零
+// 并把 seq 打回 1，同一 msg_id 随后就会重复占用 (msg_id, msg_seq)。
+// 一条过期的都没有时什么也不删——seqCap 是软上界，见常量注释。
+//
+// 候选里挑 expires 最小的那条：过期最久的窗口最不可能再被重试，若它连
+// seqRetention 也过了，删除它连"序号重来"的代价都不存在。
+//
+// 只在新 msg_id 进来且已满时调用，所以 O(n) 的扫描是可控的（n≈8192）。
+func (s *Sender) evictExpiredLocked(now time.Time) {
 	var (
-		oldestKey   string
-		oldestOrder uint64
-		found       bool
+		victimKey string
+		victimExp time.Time
+		found     bool
 	)
 	for k, w := range s.windows {
-		if !found || w.lastOrder < oldestOrder {
-			oldestKey, oldestOrder, found = k, w.lastOrder, true
+		if !now.After(w.expires) {
+			continue // 仍在被动窗口内：绝不淘汰
+		}
+		if !found || w.expires.Before(victimExp) {
+			victimKey, victimExp, found = k, w.expires, true
 		}
 	}
 	if found {
-		delete(s.windows, oldestKey)
+		delete(s.windows, victimKey)
 	}
 }
 
