@@ -177,11 +177,6 @@ func Decode(t string, raw json.RawMessage) (*host.Event, error) {
 	return ev, nil
 }
 
-// copyRaw 生成原文副本并按上限截断。
-//
-// 副本而不是切片：入参 RawMessage 可能指向一整个 WS 帧的大 buffer，
-// 截一段留着会把整帧一起钉在内存里。截断时多分配一份上限大小的 buffer，
-// 但 RawTruncated 让下游知道它不完整。
 // mentionsBot 判定"这条消息 @ 了机器人"。
 //
 // 唯一可靠的口径是平台事件类型，不是载荷里的 mentions：官方文档对
@@ -195,6 +190,11 @@ func mentionsBot(t string) bool {
 	return t == platGroupAtMessage
 }
 
+// copyRaw 生成原文副本并按上限截断。
+//
+// 副本而不是切片：入参 RawMessage 可能指向一整个 WS 帧的大 buffer，
+// 截一段留着会把整帧一起钉在内存里。截断时多分配一份上限大小的 buffer，
+// 但 RawTruncated 让下游知道它不完整。
 func copyRaw(raw json.RawMessage) ([]byte, bool) {
 	if len(raw) <= host.MaxRawBytes {
 		return append([]byte(nil), raw...), false
