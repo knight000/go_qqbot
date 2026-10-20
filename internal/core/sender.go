@@ -258,7 +258,9 @@ func (s *Sender) gcLocked(now time.Time) {
 
 // evictExpiredLocked 在条目数达到 seqCap 时清掉一条**窗口已过期**的条目。
 //
-// 判据与 gcLocked 一致（now.After(expires) 才算过期）。不能只看 lastOrder：
+// 判据是"窗口过期"本身（now.After(expires)）。gcLocked 用的是更严的条件
+// （expires+seqRetention），那是为了连序号一起回收——拿它当淘汰判据就一条
+// 都删不掉，到了 seqCap 反而只能踢活跃窗口。不能只看 lastOrder：
 // 最久未用的那条往往仍在 5 分钟/60 分钟的被动窗口内，淘汰它等于把 used 清零
 // 并把 seq 打回 1，同一 msg_id 随后就会重复占用 (msg_id, msg_seq)。
 // 一条过期的都没有时什么也不删——seqCap 是软上界，见常量注释。
