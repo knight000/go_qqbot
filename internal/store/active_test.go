@@ -72,46 +72,45 @@ func TestActiveBudgetSurvivesReopen(t *testing.T) {
 }
 
 // 预算属于业务数据：R2 清该 peer、R3 清全表；R1（会话状态）与 R0（重连）不动它。
+// 断言一律用"再占一格能不能占到"——这正是 Sender 看到的那个语义。
 func TestResetLevelsAndActiveBudget(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	const day = "2026-10-20"
 
-	used := func(peer string) int {
+	take := func(peer string) bool {
 		t.Helper()
-		n, err := db.ActiveUsed(ctx, day, "group", peer)
+		ok, err := db.TakeActiveBudget(ctx, day, "group", peer, 1)
 		if err != nil {
-			t.Fatalf("读取 %s 的额度: %v", peer, err)
+			t.Fatalf("占 %s 的额度: %v", peer, err)
 		}
-		return n
+		return ok
 	}
-	for _, peer := range []string{"g1", "g2"} {
-		if ok, err := db.TakeActiveBudget(ctx, day, "group", peer, 1); err != nil || !ok {
-			t.Fatalf("占 %s 的额度失败: ok=%v err=%v", peer, ok, err)
-		}
+	if !take("g1") || !take("g2") {
+		t.Fatal("两个 peer 的额度都该占到第一次")
 	}
 
 	if _, err := db.ClearPeerSession(ctx, "g1"); err != nil {
 		t.Fatalf("R1: %v", err)
 	}
-	if got := used("g1"); got != 1 {
-		t.Fatalf("R1 不该清空主动消息预算，实际 used=%d", got)
+	if take("g1") {
+		t.Fatal("R1 不该清空主动消息预算")
 	}
 
 	if _, err := db.ClearPeerData(ctx, "g2"); err != nil {
 		t.Fatalf("R2: %v", err)
 	}
-	if got := used("g2"); got != 0 {
-		t.Fatalf("R2 应清掉该 peer 的预算，实际 used=%d", got)
+	if !take("g2") {
+		t.Fatal("R2 应清掉该 peer 的预算")
 	}
-	if got := used("g1"); got != 1 {
-		t.Fatalf("R2 不该动别的 peer 的预算，实际 used=%d", got)
+	if take("g1") {
+		t.Fatal("R2 不该动别的 peer 的预算")
 	}
 
 	if _, err := db.ClearAllData(ctx); err != nil {
 		t.Fatalf("R3: %v", err)
 	}
-	if got := used("g1"); got != 0 {
-		t.Fatalf("R3 应清空全部预算，实际 used=%d", got)
+	if !take("g1") {
+		t.Fatal("R3 应清空全部预算")
 	}
 }

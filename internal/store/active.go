@@ -16,17 +16,9 @@ import (
 // INSERT ... ON CONFLICT ... DO UPDATE ... WHERE used < ? 的 RowsAffected
 // 正好是"这次有没有占到"，等价于一次条件自增。
 //
-// limit <= 0 表示不限量，此时仍然记账（便于事后核对），只是永不拒绝。
+// limit 必须 > 0：不限量时调用方（core.Sender）根本不会调这里。
+// 真传了 <= 0，条件恒假、一行也不会占，方向仍然是"拒发"而不是"放开"。
 func (db *DB) TakeActiveBudget(ctx context.Context, day, scene, peer string, limit int) (bool, error) {
-	if limit <= 0 {
-		if _, err := db.w.ExecContext(ctx,
-			`INSERT INTO active_usage(day, scene, peer, used) VALUES(?, ?, ?, 1)
-			 ON CONFLICT(day, scene, peer) DO UPDATE SET used = used + 1`,
-			day, scene, peer); err != nil {
-			return false, fmt.Errorf("记录主动消息额度: %w", err)
-		}
-		return true, nil
-	}
 	res, err := db.w.ExecContext(ctx,
 		`INSERT INTO active_usage(day, scene, peer, used) VALUES(?, ?, ?, 1)
 		 ON CONFLICT(day, scene, peer) DO UPDATE SET used = used + 1 WHERE used < ?`,
@@ -39,16 +31,4 @@ func (db *DB) TakeActiveBudget(ctx context.Context, day, scene, peer string, lim
 		return false, fmt.Errorf("读取主动消息额度结果: %w", err)
 	}
 	return n == 1, nil
-}
-
-// ActiveUsed 读回某个桶的已用额度，给日志与排障用。
-func (db *DB) ActiveUsed(ctx context.Context, day, scene, peer string) (int, error) {
-	var used int
-	err := db.r.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(used), 0) FROM active_usage WHERE day = ? AND scene = ? AND peer = ?`,
-		day, scene, peer).Scan(&used)
-	if err != nil {
-		return 0, fmt.Errorf("读取主动消息额度: %w", err)
-	}
-	return used, nil
 }
