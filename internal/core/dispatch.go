@@ -158,9 +158,15 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 		}
 		// 不让位：组内后面的都不再执行。逐个写进 full 级轨迹——否则就是
 		// 「zzz 为什么没反应」永远查不出来的沉默（旧 Broadcast 的实现如此）。
+		// 但"没执行"有两种原因，不能混成一句话：无权限的候选本来就不会跑，
+		// 它该记「权限不足」；只有有权限、纯粹被挡住的才记「未让位」。
 		for _, rest := range matches[i+1:] {
 			if rest.Priority != group {
 				break
+			}
+			if !rest.Perm.Admits(ev.Actor) {
+				d.trace.Denied(rest, ev)
+				continue
 			}
 			d.trace.Blocked(m, rest)
 		}
