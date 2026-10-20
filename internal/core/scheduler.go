@@ -15,15 +15,27 @@ import (
 
 // Scheduler 采用「库表驱动 + 30 s 扫描」而不是每任务一个 timer：
 // 设备休眠/时钟跳变时 timer 会漂移，扫描式每轮按绝对时间重算，天然自愈（§5.1）。
+//
+// 执行模型是「按插件分桶串行、桶间并行」：同一插件的所有到期实例排成一个桶、
+// 桶内顺序执行，桶之间最多 jobParallel 个同时跑。分桶的粒度是插件而不是
+// (插件, 任务名)，因为插件实例是按「调度器一次只调一个 Job」写的——并发只
+// 允许发生在插件之间。
 type Scheduler struct {
 	db     *store.DB
 	log    *slog.Logger
 	tz     *time.Location
 	parser cron.Parser
 
+	// slots 是并行度信号量，桶启动前占用、结束后释放；容量即并行度。
+	slots chan struct{}
+	// idle 在 running 降到 0 时关闭，供 Wait 使用；running > 0 时才有值。
+	idle    chan struct{}
+	running int
+
 	mu      sync.Mutex
 	specs   map[string]host.JobSpec
 	runners map[string]host.JobRunner
+	busy    map[string]bool // plugin -> 该插件的桶正在执行
 	started bool
 }
 
@@ -31,6 +43,18 @@ const (
 	tickInterval = 30 * time.Second
 	missGrace    = 300 * time.Second // 停机超过 5 分钟不补跑
 	maxBackoff   = 16 * time.Minute
+
+	// dueJobLimit 是单轮扫描上限。旧值 20 在 per-peer 任务铺开到 20 个群时
+	// 刚好一轮扫不完（任务 3 s × 20 = 60 s > 30 s tick），下一轮必然迟到。
+	// 100 覆盖当前规模的 5 倍余量，同时不至于一次把内存里的桶撑爆。
+	dueJobLimit = 100
+
+	// jobParallel 是同时执行的桶数。调度任务是 I/O 型的（HTTP + SQLite 写），
+	// 低配机上真正的瓶颈是出站配额与单写连接而不是 CPU；4 与 dispatch 的
+	// 16 令牌、render 的 2 并发形成梯度，既能让慢任务不再挡住别人，又不会
+	// 把平台配额在瞬时打满。暂不做成配置项：没有实测依据的旋钮只会让
+	// 运维多一个可调错的地方。
+	jobParallel = 4
 )
 
 func NewScheduler(db *store.DB, log *slog.Logger) *Scheduler {
@@ -44,8 +68,10 @@ func NewScheduler(db *store.DB, log *slog.Logger) *Scheduler {
 		log:     log,
 		tz:      tz,
 		parser:  cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor),
+		slots:   make(chan struct{}, jobParallel),
 		specs:   make(map[string]host.JobSpec),
 		runners: make(map[string]host.JobRunner),
+		busy:    make(map[string]bool),
 	}
 }
 
@@ -199,16 +225,138 @@ func (s *Scheduler) loop(ctx context.Context) {
 
 func (s *Scheduler) runDue(ctx context.Context) {
 	now := time.Now()
-	jobs, err := s.db.DueJobs(ctx, now.Unix(), 20)
+	// 忙的插件必须在 SQL 里排除，不能取回来再在内存里丢：limit 是按
+	// next_run_at 取的，一个卡住的插件积压上百行 per-peer 实例时会占满
+	// 整个窗口，其他插件的到期任务永远轮不到。
+	jobs, err := s.db.DueJobs(ctx, now.Unix(), dueJobLimit, s.busyPlugins()...)
 	if err != nil {
 		s.log.Error("扫描任务失败", "err", err)
 		return
 	}
+	for _, bucket := range groupByPlugin(jobs) {
+		s.launch(ctx, bucket, now)
+	}
+}
+
+// busyPlugins 取当前正在执行的插件快照。调用方在 runDue 里只用于 SQL 排除，
+// 真正的"同一插件只有一个桶"由 launch 里的忙判重保证——两次快照之间可能有
+// 别的 tick 启动新桶，但那只会让我们多查几行，不会让同一插件跑两个桶。
+func (s *Scheduler) busyPlugins() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.busy) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.busy))
+	for p := range s.busy {
+		out = append(out, p)
+	}
+	return out
+}
+
+// groupByPlugin 把一批到期任务按插件分桶，桶的顺序按各插件首次到期的时间。
+//
+// jobs 已由 DueJobs 按 next_run_at 升序排好，按首次出现分组即可保持这个顺序；
+// 用 map 只做"桶归并"，不遍历 map 取值，避免顺序随机。
+func groupByPlugin(jobs []store.Job) [][]store.Job {
+	if len(jobs) == 0 {
+		return nil
+	}
+	index := make(map[string]int, len(jobs))
+	buckets := make([][]store.Job, 0, len(jobs))
 	for _, j := range jobs {
-		if ctx.Err() != nil {
+		i, ok := index[j.Plugin]
+		if !ok {
+			i = len(buckets)
+			index[j.Plugin] = i
+			buckets = append(buckets, nil)
+		}
+		buckets[i] = append(buckets[i], j)
+	}
+	return buckets
+}
+
+// launch 把一个桶交给协程执行，桶内顺序执行、桶间受 slots 限流。
+//
+// 异步而不是在 runDue 里等，是为了让"下一轮扫描"不被慢任务推迟：一个 60 s
+// 的任务如果同步阻塞 30 s 的 tick，其他插件在这一分钟内到期的任务全部要等到
+// 下一轮。异步之后，下一轮只会因为该插件还在忙而跳过它自己的行。
+//
+// 代价是没有行锁，靠进程内的 busy 表防止同一个插件被两轮同时领走；这也意味着
+// 多实例部署时保护失效（当前由单实例锁保证只有一个进程，见 §2.1）。
+func (s *Scheduler) launch(ctx context.Context, jobs []store.Job, now time.Time) {
+	if len(jobs) == 0 {
+		return
+	}
+	// 已取消就不再起新桶：关停时 Wait 可能正好观察到 running==0 而返回，
+	// 之后起桶会让任务在 db.Close 之后才跑起来。
+	if ctx.Err() != nil {
+		return
+	}
+	plugin := jobs[0].Plugin
+
+	s.mu.Lock()
+	if s.busy[plugin] {
+		s.mu.Unlock()
+		return
+	}
+	s.busy[plugin] = true
+	if s.running == 0 {
+		s.idle = make(chan struct{})
+	}
+	s.running++
+	s.mu.Unlock()
+
+	go func() {
+		defer s.finish(plugin)
+
+		// 拿不到槽位就等着：桶已经被标记为忙，这一轮不执行的话下一轮也不会
+		// 重复领它，等槽位比丢弃更划算。
+		select {
+		case s.slots <- struct{}{}:
+			defer func() { <-s.slots }()
+		case <-ctx.Done():
 			return
 		}
-		s.run(ctx, j, now)
+
+		for _, j := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+			s.run(ctx, j, now)
+		}
+	}()
+}
+
+// finish 清掉忙标记并维护 Wait 的收尾信号。
+func (s *Scheduler) finish(plugin string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.busy, plugin)
+	s.running--
+	if s.running == 0 {
+		close(s.idle)
+	}
+}
+
+// Wait 等在跑的任务收尾，返回 false 表示 ctx 先到期。
+//
+// 关停时必须先等这里：任务还要写库（job_runs、next_run_at），晚于 db.Close
+// 只会得到一串 "database is closed"，而且在插件 Close 之后回调插件同样是错的。
+func (s *Scheduler) Wait(ctx context.Context) bool {
+	s.mu.Lock()
+	if s.running == 0 {
+		s.mu.Unlock()
+		return true
+	}
+	idle := s.idle
+	s.mu.Unlock()
+
+	select {
+	case <-idle:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
