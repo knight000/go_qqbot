@@ -70,3 +70,48 @@ func TestActiveBudgetSurvivesReopen(t *testing.T) {
 		t.Fatalf("重开后额度应已用尽: ok=%v err=%v", ok, err)
 	}
 }
+
+// 预算属于业务数据：R2 清该 peer、R3 清全表；R1（会话状态）与 R0（重连）不动它。
+func TestResetLevelsAndActiveBudget(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const day = "2026-10-20"
+
+	used := func(peer string) int {
+		t.Helper()
+		n, err := db.ActiveUsed(ctx, day, "group", peer)
+		if err != nil {
+			t.Fatalf("读取 %s 的额度: %v", peer, err)
+		}
+		return n
+	}
+	for _, peer := range []string{"g1", "g2"} {
+		if ok, err := db.TakeActiveBudget(ctx, day, "group", peer, 1); err != nil || !ok {
+			t.Fatalf("占 %s 的额度失败: ok=%v err=%v", peer, ok, err)
+		}
+	}
+
+	if _, err := db.ClearPeerSession(ctx, "g1"); err != nil {
+		t.Fatalf("R1: %v", err)
+	}
+	if got := used("g1"); got != 1 {
+		t.Fatalf("R1 不该清空主动消息预算，实际 used=%d", got)
+	}
+
+	if _, err := db.ClearPeerData(ctx, "g2"); err != nil {
+		t.Fatalf("R2: %v", err)
+	}
+	if got := used("g2"); got != 0 {
+		t.Fatalf("R2 应清掉该 peer 的预算，实际 used=%d", got)
+	}
+	if got := used("g1"); got != 1 {
+		t.Fatalf("R2 不该动别的 peer 的预算，实际 used=%d", got)
+	}
+
+	if _, err := db.ClearAllData(ctx); err != nil {
+		t.Fatalf("R3: %v", err)
+	}
+	if got := used("g1"); got != 0 {
+		t.Fatalf("R3 应清空全部预算，实际 used=%d", got)
+	}
+}
