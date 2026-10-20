@@ -58,11 +58,27 @@ D5 的前提有两层，必须分清：
 |---|---|
 | 内存（核心） | 15–40 MB |
 | 内存（每插件，同进程） | +2–8 MB |
+| 内存（`Event.Raw` 副本） | 实测（`BenchmarkDecodeGroupMessage`，win/amd64 + Go 1.26.1）：真实群消息载荷 482 B → 单条 `Raw` 副本 482 B，整次解码 **约 1.7 KB/op、23 allocs/op**（测量条件见下）。dispatch 工作池 16 并发满载时在途 Raw 约 16×482 B ≈ 7.5 KiB，全部解码分配约 16×1.7 KB ≈ 27 KiB；最坏情况每条都撞上限 → 工作池 16 条 = 512 KiB，加上每 peer 队列（深 16）里排队事件持有的副本，10 个群同时刷屏约 10×17×32 KiB ≈ 5.3 MiB，占 `MemoryMax=256M` 的 2% |
 | 二进制磁盘 | 19 MB 量级（实测：windows 19.22 MB / linux 19.03 MB，其中内嵌字体 6.2 MB） |
 | SQLite（1000–10000 条/天，留 7 天） | 5–40 MB |
 | 媒体配额 | 0 —— 入站不下载；出站图片存在平台侧，不占本地盘 |
 | 日志（journald 限额） | 200 MB |
 | 结论 | 20 GB 盘余量充裕；1 GB 内存下与 TS3/WebDAV 共存可行，但需 `MemoryMax` 约束 |
+
+`Raw` 那一行的换算方式：`go test ./internal/gateway -run '^$' -bench BenchmarkDecode -benchmem`
+给出的 `B/op` 是**单次解码**的总分配字节数；每个 dispatch worker 同一时刻只处理
+一条事件，所以工作池这一层的峰值 ≈ 工作池上限（16）× B/op。但事件在进工作池之前
+会先排队（`queueDepth=16`/peer），排队的事件同样持有自己的 `Raw`，所以真实上界是
+**活跃 peer 数 × (queueDepth+1) × 32 KiB**——按上面的 10 群算就是 5.3 MiB，仍远在
+256 M 预算内。三个基准分别是：单条真实群消息
+（`BenchmarkDecodeGroupMessage`，约 1.7 KB/op）、同一载荷 16 协程并发
+（`BenchmarkDecodeGroupMessageConcurrent16`，仍是约 1.7 KB/op，说明并发不放大单条开销）、
+以及被截断的最坏载荷（`BenchmarkDecodeOversizeRaw`，约 65 KB/op，其中 32 KiB 是 `Raw` 副本本身）。
+真实消息的 `Raw` 平均占用就是载荷长度（482 B）；上限由 `host.MaxRawBytes` 钉死在 32 KiB。
+
+**测量条件**：上面这些数字取自 Win/amd64 + Go 1.26.1 的一次实测，只保留量级（`B/op`
+在不同机器、不同 Go 版本上会浮动几十到几百字节）。复现时用同一台机器、同一条命令，
+不要把某一版本的精确值当成契约——用来做换算的只有量级。
 
 ### 1.4 事件模型（三轴）
 
@@ -75,7 +91,11 @@ D5 的前提有两层，必须分清：
 | 平台事件名 | `Name` | 如 `GROUP_AT_MESSAGE_CREATE` | 只用于观测与解码表索引，插件不订阅它 |
 
 - 本地解码覆盖全部 12 个群与单聊事件（2 个群消息 + 1 个单聊消息 + 9 个通知/请求），另有 4 个跨场景事件：`FRIEND_ADD`、`FRIEND_DEL`、`INTERACTION_CREATE`、`SUBSCRIBE_MESSAGE_STATUS`。
-- `GROUP_AT_MESSAGE_CREATE`（@机器人）与 `GROUP_MESSAGE_CREATE`（全量模式：群主开启「接收所有消息」后群里每条消息都推）字段结构一致，**归一化为同一类 `message` 事件**，下游不区分。
+- `GROUP_AT_MESSAGE_CREATE`（@机器人）与 `GROUP_MESSAGE_CREATE`（全量模式：群主开启「接收所有消息」后群里每条消息都推）字段结构一致，**归一化不区分事件类**：`Kind`、`Scene`、路由与订阅完全一样，差异不用平台事件名表达（`Name` 只供观测）。**`Mentioned` 区分是否 @ 了机器人**——这是两者唯一的语义差异（票 #13）：
+  - `Mentioned=true` 仅当平台事件是 `GROUP_AT_MESSAGE_CREATE`。官方文档把 `mentions` 定义为「消息中@的用户列表（**不含@机器人自身**）」，数组里永远不会有机器人自己，所以**不得**用它反推「@ 了我」；`GROUP_MESSAGE_CREATE` 的载荷里没有任何「@ 了机器人」的标记，一律 `false`，不做猜测。单聊、通知、未知事件恒 `false`。
+  - 需要「@ 了别人」这一事实的插件自己读 `Raw` 里的 `mentions`——它原样躺在那里，核心不解析也不解释。
+- `Raw` 是所有事件（**含已知事件**）的原始 JSON 副本，上限 `host.MaxRawBytes` = 32 KiB；超出时截断并置 `RawTruncated=true`，截断状态因此可判定（不是静默切出半截 JSON 让插件误以为平台发了坏数据）。`Raw` **只在 dispatch 生命周期内有效**：不进 `messages` 表、不参与 `processed_events` 去重键、不被 GC 与 `/reset` 任何一级触碰。
+- `Payload` 的既有语义不变：**仅未知事件**、完整原文，供排障用。未知事件因此同时带一份完整 `Payload` 与一份 ≤32 KiB 的 `Raw` 副本，代价可以接受——未知事件本就罕见。
 - 解码表里没有的事件归为 `Kind=unknown`：进调试轨迹、可观测，**永不进入插件路由**。
 - 订阅语法：`Manifest.Intents` 写 `<kind>` 或 `<scene>.<kind>`，例如 `message`、`group.message`；写错在装配阶段即拒绝加载。
 
@@ -176,36 +196,72 @@ Manifest {
   name         唯一标识，同时是 KV 命名空间
   version      semver
   api_version  与核心的契约版本，不匹配则拒绝加载
-  capabilities 保留字段：核心从不读取，不构成任何门控（评审 §4.1）
+  capabilities 保留字段：核心从不读取，不构成任何门控；等出现第二个真实消费方再启用（评审 §4.1）
   intents      需要订阅的事件类型
-  commands     匹配规则：前缀或正则二选一（Priority 越大越先）
-  broadcast    中标者声明“同优先级的其它插件也执行”（默认 false，语义见 §3.4）
-  config_schema 保留字段：核心从不读取，不做启动校验（评审 §4.1）
+  commands     匹配规则：前缀或正则二选一（Priority 越大越先）；前缀默认要求词边界，
+               确需裸前缀时声明 loose=true（语义见下）
+  yield        处理完是否让位给同 priority 的下一个匹配者（零值 false = 阻断，语义见 §3.4）
+  config_schema 启动期校验，支持四种类型：string / bool / int / duration（评审 §4.1）
 }
 
 Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, JobSpec)]* → Close(ctx)
 ```
 
-`Manifest` 采用声明式而非“插件自己决定是否处理”，目的是把能用数据描述的规则放在启动期校验。**实际校验到的只有这些**：`name` 非空、`api_version` 与本核心一致、`intents` 可解析、`Permission` 位合法、每个 `Command` 恰好设置 `Prefix` 或 `Pattern` 之一、正则可编译、前缀不占用核心保留前缀。
+`Manifest` 采用声明式而非“插件自己决定是否处理”，目的是把能用数据描述的规则放在启动期校验。**实际校验到的只有这些**：`name` 非空、`api_version` 与本核心一致、`intents` 可解析、`Permission` 位合法、每个 `Command` 恰好设置 `Prefix` 或 `Pattern` 之一、正则可编译、前缀不占用核心保留前缀、`config_schema` 里每个键在 `[plugins.<name>]` 中存在且类型相符（装配期、插件 `Init` 之前）。
 
-以下四条**当前不成立**，读契约时不要据此推断保障：
+`config_schema` 的语义是**声明即必填**：写进去的键必须有值，缺一个就启动失败，所以有默认值的键不要写进 schema。类型只有四种，与 `Host.Config()` 的读取方法一一对应；`duration` 是字符串，必须能被 `time.ParseDuration` 解析。`key = ""` 对 `string` 是「存在但为空」，合法，与「缺失」可区分。
 
-- `commands` 的 **@提及匹配当前未实现**：网关解出 `mentions` 后即丢弃，路由层只有前缀与正则两种方式（评审 §4.2，票 #13）。
-- `config_schema` 的启动期校验**当前未实现**：既无存在性校验也无类型校验，配置写错仍能启动（评审 §4.1，票 #10）。
+`commands` 的匹配与回传（命令词边界与参数切分只有一份实现，在路由层）：
+
+- **前缀默认要求词边界**：命令词之后必须是空白（`unicode.IsSpace`）或字符串结尾，所以 `/md5 abc` 不命中 `/md`。确有需要裸前缀语义的写法显式声明 `loose=true`，退回 `strings.HasPrefix`；`loose` 只对前缀生效，只声明 `pattern` 时写了不报错，也不起作用。
+- **正则**按源码匹配（`FindStringIndex`），`Command` 回传的正是该正则源码。
+- 命中后核心把结果写进 `Event.Command` / `Event.Args` **再**调用 `Handle`。`Command` 是命中那条命令的写法（前缀原文或正则源码），未命中为空串；`Args` 是匹配片段之后、已 `TrimSpace` 的剩余原文——前缀按前缀的字节长度切，正则按匹配区间的结束位置切——未命中同样为空串。匹配前 `Content` 已 `TrimSpace` 过，所以 `/md 内容` 与 `/md\n内容` 的 `Args` 都是「内容」，只有 `/md` 是空串。
+- 插件**不再自己切分**：`md` 曾用 `CutPrefix` 加词边界判断兜住 `/md5`，`echo` 曾用 `HasPrefix` 链分派两条命令；现在两者都只读 `Event.Command` / `Event.Args`。一次派发执行多个插件时（§3.4 的扇出），每个插件拿到的是它自己命中那条命令的 `Command/Args`。
+
+以下三条**当前不成立**，读契约时不要据此推断保障：
+
+- `commands` 的 **@提及匹配仍不在路由层**：`Command` 只有前缀与正则两种方式，`@` 不参与匹配，路由不会因为「@ 了机器人」而放宽或收紧（评审 §4.2）。这个事实本身**可读**——`Event.Mentioned` 提供语义标记（§1.4），要不要据此响应由插件自己判定。
 - 同优先级冲突的静态检测**当前未实现**：两条规则同时命中不会报错，启动期也发现不了。实际行为见 §3.4（评审 §4.7 第一行 / §2.3）。
 - `capabilities` 是**保留字段**，当前不参与任何门控；真正起门控作用的是哪三项，见 §3.3 末段（评审 §4.1）。
+
+`Event` 是插件能看到的全部事件事实（字段语义见 `internal/host/host.go`）：
+
+| 字段 | 含义 | 备注 |
+|---|---|---|
+| `ID` | 平台事件/消息 ID | 幂等键，去重只看它 |
+| `Kind` / `Scene` / `Name` | 三轴（§1.4） | `Name` 只用于观测 |
+| `Notice` | 核心语义标签 | 仅入群/退群等少数通知非空 |
+| `PeerID` / `SenderID` / `UnionID` | 会话与发送者标识 | 判权用 `SenderID` 与 `Actor` |
+| `Username` / `Content` / `MsgType` / `HasMedia` | 消息正文与形态 | 单聊 `Username` 恒空 |
+| `Command` / `Args` | 命中的命令与其后参数 | 由核心在 `Handle` 之前填好；未命中为空串 |
+| `Mentioned` | 这条消息 **@ 了机器人** | 仅 `GROUP_AT_MESSAGE_CREATE` 为 `true`；由平台事件类型决定，与 `mentions` 数组无关（§1.4） |
+| `Raw` / `RawTruncated` | 平台原始 JSON 副本（≤32 KiB）与截断标记 | 含已知事件；不落库、不参与去重，只在 dispatch 生命周期内有效 |
+| `Payload` | 原始 JSON，**仅未知事件**、完整原文 | 与 `Raw` 的取舍见 §1.4 |
+| `Timestamp` / `Actor` | 时间与权限视图 | `Actor` 由核心在投递前填好，插件只读 |
+
+#### 契约版本历史（`api_version`）
+
+`api_version` 是**整体匹配**：`Manifest.APIVersion` 必须与本核心的 `host.APIVersion` 完全相等，没有“兼容上一版”的余地。所以同期落地的互不兼容改动共用一个版本号，下表每一行都是“插件要跟着改什么”的完整清单。
+
+| 版本 | 契约变化 | 票号 |
+|---|---|---|
+| 4 | 任务支持会话维度（`JobSpec.PerPeer` / `JobSpec.Peer`），`JobRunner` 可能收到非空的 `Peer` | — |
+| 5 | `Host` 新增 `Renderer()`，插件可把 markdown 文档源画成图片（§3.8） | — |
+| 6 | `Host.HTTP` 新增 `GetJSONWithHeader`（带鉴权头）、`GetJSONOnce`（不重试）、`WithTimeout`（按请求放宽超时，共享连接池与限流状态） | — |
+| 7 | `Host.HTTP` 的非 2xx 统一返回 `*HTTPStatusError`，插件不必 import `internal/httpx` 就能分辨 429 与普通失败 | — |
+| 8 | ① `Manifest.Yield` 取代 `Broadcast`：是否让位由每个匹配者自己声明（§3.4），`broadcast` 字段删除；② `Event.Command` / `Event.Args` 由核心填好，前缀匹配按词边界（`/md5` 不再命中 `/md`）；③ `Event.Mentioned` / `Event.Raw` 暴露“是否 @ 了机器人”与原始载荷 | #11 / #12 / #13 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
 | 能力 | 签名要点 | 门控 |
 |---|---|---|
-| `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq`；`Reply.Image` 非空时先上传再发 `msg_type=7` | 走频控；图文拆分后**消耗两格**被动配额；超出被动窗口直接失败并告警 |
-| `Sender.SendActive` | 主动消息 | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启 |
+| `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq`；`msg_seq` 在同一 `msg_id` 下**单调递增**，窗口过期只重置剩余次数、不回退序号；`Reply.Image` 非空时先上传再发 `msg_type=7` | 走频控；图文拆分后**消耗两格**被动配额；超出被动窗口直接失败并告警 |
+| `Sender.SendActive` | 主动消息；先扣本地日预算**再**发 HTTP，预算是**持久化**的（`active_usage` 表，重启不清零、跨日按本地时区自动换桶） | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启；每 peer 每日预算由 `active_usage` 承担 |
 | `KV` / `PeerKV(peer)` | 按插件命名空间隔离的 KV，支持 TTL；`PeerKV` 多一层会话维度 | 只能读写自己的命名空间；`/reset session` 只清 `PeerKV` 写入的部分 |
 | `Store.Query` | 只读、参数化、行数上限 1000 | 不允许 DDL/写操作 |
 | `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝 |
 | `HTTPStatusError` | `{Status int, Body string}`；`HTTP` 的四个方法在非 2xx 时返回它，`Error()` 只含状态码 | 由 host 翻译 `*httpx.HTTPError` 而来，**插件不需要 import `internal/httpx`** 就能分辨 429 与普通失败；网络错误与 ctx 取消不包装 |
-| `Config()` | `[plugins.<name>]` 只读视图：`Str` / `Bool` / `Int` / `Duration` / `Decode(ptr)` | 只能读自己的配置段；`Decode` 把整段解成结构体，错误带段名与键名 |
+| `Config()` | `[plugins.<name>]` 只读视图：`Str` / `Bool` / `Int` / `Duration` / `Decode(ptr)` | 只能读自己的配置段；`Manifest.config_schema` 在装配期校验（声明即必填，四种类型）；`Decode` 把整段解成结构体，错误带段名与键名 |
 | `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
 | `Log` | 结构化日志，自动带 plugin 字段 | 敏感字段脱敏 |
 | `Renderer` | 把 markdown 画成图片（`Markdown(ctx, src) (Image, error)`），契约见 §3.8 | 未注入时返回拒绝性 stub（错误可被 `errors.Is` 分类为超时/超大/能力缺失），不是 nil |
@@ -223,15 +279,18 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 ```
 事件 → 去重（event_id）→ 落库 → 按 intents 过滤 → 每个插件内取 priority 最高的命中命令
      → 候选按 priority 降序、同 priority 按插件名升序排列
-     → 跳过无权限的 → 第一个有权限的是中标者，默认只跑它
-     → 中标者的 broadcast=true 时，同 priority 且有权的一起跑
+     → 跳过无权限的 → 第一个有权限的候选是组内起点（中标者），默认只跑它
+     → 按 priority 分组，组内按上述顺序逐个执行；每个匹配者自己声明是否让位，
+       遇到不让位者就停在这个插件（跨 priority 不扇出）
      → 全未命中 → 静默：核心不回任何内容，也没有可配置的默认提示语
 ```
 
 - 路由在**插件的 matcher 表**上做，核心不解析业务语义。
-- 默认只跑一个插件，避免“两个插件同时回、消耗 5 次被动额度”。
-- **谁中标由排序决定**：`priority` 降序，同 `priority` 按**插件名字典序**升序。无权限的候选在排序后被跳过，不阻塞后续插件（权限先于优先级）。同一插件内多条命令同时命中时，取 `priority` **严格**最大的一条，并列则取声明在前的（比较用 `>` 而非 `>=`）。未声明 `commands` 的插件匹配该 intent 的全部事件，`priority` 按 0 计。
-- `broadcast` 是**中标插件自己的字段**，不是层级属性：`aaa`（priority 100，`broadcast=false`）与 `zzz`（priority 100，`broadcast=true`）同时命中时，`aaa` 中标且不扇出，`zzz` 永不执行，日志里没有任何提示。这是已知缺陷（评审 §2.3）——按层级声明扇出的语义**当前未实现**，“这一层要不要扇出”本应是层级属性，却被实现成排序第一名的个人属性。修正见票 #11（per-plugin `Yield`）；在那之前**不要用 `broadcast` 表达“同级的都要跑”**。
+- 默认只跑一个插件，避免“两个插件同时回、消耗 5 次被动额度”。这个默认由 `yield` 的零值承担：不写 `yield` 就是不让位，执行完即结束。
+- **谁先执行由排序决定**：`priority` 降序，同 `priority` 按**插件名字典序**升序。无权限的候选在排序后被跳过，不阻塞后续插件（权限先于优先级）。同一插件内多条命令同时命中时，取 `priority` **严格**最大的一条，并列则取声明在前的（比较用 `>` 而非 `>=`）。未声明 `commands` 的插件匹配该 intent 的全部事件，`priority` 按 0 计。
+- 命中结果随事件回传：核心在选定这个匹配者之后、调用它的 `Handle` 之前写入 `Event.Command` / `Event.Args`（语义见 §3.2），插件侧不再出现 `CutPrefix` / `HasPrefix` 分派。一次派发跑多个插件时（下面的让位链），每个插件拿到的是**它自己**命中那条命令的 `Command/Args`。
+- `yield` 是**每个匹配者自己的声明**，不是中标者的个人属性。同 priority 的候选按上面的顺序排队逐个执行：谁写 `yield=true`，谁处理完就让位给组内下一个；第一个 `yield=false` 的插件执行完，组内**剩下的一律不执行**（不是“跳过它继续”）。`aaa`（100，`yield=false`）与 `zzz`（100，`yield=true`）同时命中时只跑 `aaa`，`zzz` 因 `aaa` 阻断而未执行；反过来两者都跑。这个阻断关系在 full 级轨迹里每个被挡住的插件各占一行（`未执行 · 插件 … （… 未让位）`），不再有“静默不执行”。组内**无权限**的候选照旧跳过并记一行 `权限不足`，跳过本身不改变“是否继续”。
+- **跨 priority 不扇出**：`yield` 只在同 priority 组内生效。高优先级插件让位，去处是同组的下一个匹配者，不是低优先级插件——低优先级仍只在前者全部无权时才可能被考虑。
 - **核心保留前缀**：`/claim`、`/admin`、`/group`、`/reset`、`/reload`、`/restart` 由核心以最高优先级独占处理，插件在启动期若声明了相同前缀，**直接拒绝加载并报错**。否则一个第三方插件就能劫持重置指令，等于把第 8 章的鉴权整个绕过去。清单必须与 `handleReserved` 的 case 严格对应——多列一个会白占名字，少列一个会让核心静默遮蔽插件声明的同名命令。`/grant`、`/revoke` 的功能已由 `/admin add|rm` 取代，指令删除后名字一并释放。
 
 ### 3.5 插件目录与复用方式
@@ -417,6 +476,20 @@ CREATE TABLE plugin_kv (
   expires_at INTEGER,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (plugin, peer, k)
+);
+
+-- 主动消息的本地日预算（§3.3）。
+-- 为什么不复用 plugin_kv：那是插件命名空间，核心自己写进去等于往别人的
+-- 抽屉里塞东西，插件一 DeletePrefix 就把额度账抹了。
+-- 没有内存镜像：发送前用一条 upsert 原子地"检查 + 自增"，所以重启不清零、
+-- 并发与多进程都不会超发。day 是本地时区的 2006-01-02，跨日就是新主键，
+-- 换桶不需要任何重置动作。每会话每天 1 行，一年不到 400 行。
+CREATE TABLE active_usage (
+  day   TEXT NOT NULL,                  -- 本地时区 YYYY-MM-DD
+  scene TEXT NOT NULL,                  -- group | c2c
+  peer  TEXT NOT NULL,
+  used  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, scene, peer)
 );
 
 -- 管理员（Bot 角色：平台群角色只描述群内身份，不参与这里的授权）
@@ -654,8 +727,9 @@ rate_per_min = 100          # 未列出域名的默认额度
 - **被动回复**：群 5 min / 最多 5 次；单聊 60 min / 最多 4 次。核心为每个 `msg_id` 维护已用次数，插件拿到的 `Reply` 在第 6 次直接失败（不消耗 HTTP 调用）。
 - **幂等**：`msg_id + msg_seq` 全局唯一，重试不得复用同一 `msg_seq`；这也是“每 peer 串行”的原因。
 - **令牌桶**：Bot 维度（群 30/60 qpm，单聊 5 qps+30 qpm）+ 单关系维度（20 qpm、1000 条/天）。两层都要过，缺一即 429。
+- **主动消息日预算（本地记账）**：平台只给“每群/每用户每天 1000 条”这一个上限，也没有额度查询接口，所以本地把它压到个位数并按 `(day, scene, peer)` **落库**（`active_usage`，§3.3）：先扣预算再发 HTTP，额度用尽即拒发。`day` 取进程**本地时区**的日期，跨日自动换桶；预算行重启不清零，否则“重启循环不会烧额度”只是注释里的一句话。账本不可用（库没打开、写失败、ctx 取消）时 **fail-closed**：超发不可撤回，宁可少发一条。
 - **队列优先级**：被动回复插队到主动/批量之前，避免批量推送把对话消息饿死。
-- **主动消息默认关闭**（R 全部为查询类需求，本不需要）。若将来做推送，按 (插件 × 场景) 白名单逐项开启，并受每日 1000 条上限约束。
+- **主动消息默认关闭**（R 全部为查询类需求，本不需要）。若将来做推送，按 (插件 × 场景) 白名单逐项开启，并同时受平台每日 1000 条上限与上面的本地日预算约束。
 
 ---
 
@@ -702,8 +776,8 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 |---|---|---|---|---|
 | R0 重连 `/reset reconnect` | 断开当前 WSS 后**立即**重连（保留 session，走 Resume） | 无 | owner | 60 s |
 | R1 会话 `/reset session` | 清该 peer 的 `plugin_kv`（`peer` 非空的行） | 该群/该用户需重新开始对话 | Bot 管理员 | 10 min |
-| R2 数据 `/reset data` | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
-| R3 全量 `/reset all` | 清 `messages` / `media` / `processed_events` / `plugin_kv` / `job_runs` / `identities` | 全库业务数据不可恢复 | 仅 owner + 二次确认 + 短语 | 24 h |
+| R2 数据 `/reset data` | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` + `active_usage` | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
+| R3 全量 `/reset all` | 清 `messages` / `media` / `processed_events` / `plugin_kv` / `job_runs` / `identities` / `active_usage` | 全库业务数据不可恢复 | 仅 owner + 二次确认 + 短语 | 24 h |
 
 **四条硬约定**（每条都对应一类"重置完机器人就废了"的故障）：
 
@@ -715,6 +789,8 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 **冷却按 `(level, peer)` 计**。R1/R2 换个群不受上一个群的影响——连清两个群是正常运维动作；R0/R3 是全局操作，`peer` 记为 `*`，因此全局冷却。冷却起点取 `reset_audit.finished_at`，只认 `status=done` 的行。
 
 **R2 清 `job_runs` 但保留 `jobs`**：执行历史是该群的业务数据，任务定义（含 per-peer 实例行）是配置。这与“R2 不动 `qq_groups`”是同一条边界的两个方向。
+
+**`active_usage` 跟着业务数据走**：R2 清该 peer 的行，R3 清全表；R1 只清插件会话状态、R0 不动数据，都不碰它。理由是预算是平台配额账而不是会话状态——不过清数据就等于承认“这个会话重新开始”，额度也重开；反过来 R1/R0 只是让插件重来一遍或重连，凭什么免掉当天已烧的配额。预算行不计入重置摘要里的条数（那是给用户看的业务数据量，预算行属于记账）。
 
 ### 8.4 二次确认
 
@@ -937,6 +1013,11 @@ WantedBy=multi-user.target
 1. 进程收到 `SIGTERM` → 停止收新事件 → 落 `session_id`/`seq` → 关闭 WSS（不主动 Identify 关闭）。
 2. 替换二进制 → `systemctl restart`。
 3. 启动后优先 **Resume**（带 `session_id` + `seq`），失败（4006/4009）才 Identify。这一步能避免每次发布都消耗一次 Identify 配额并丢失断线期间的事件。
+
+**契约 8 的额外一步**：`config_schema` 从这一版起真正在装配期生效（**声明即必填**，§3.2）。
+升级前先核对每个第三方插件声明的 `config_schema`：带代码默认值的键要么从 schema 里删掉
+（这些键本来就允许不写），要么在 `[plugins.<name>]` 里补齐值——否则本次升级会以「缺键」
+启动失败。本仓的 echo / bootnotice 已按此原则删掉了全部 schema 声明。
 
 ### 9.3 日志与磁盘
 

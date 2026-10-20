@@ -248,7 +248,7 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 |---|---|---|
 | 总开关 | `[active] enabled` | 关闭后所有 `SendActive` 直接返回 `ErrActiveDisabled` |
 | 插件白名单 | `[active] plugins` | 只有名单内插件能发；插件拿到的 Sender 是带名字的包装 |
-| 每日预算 | `[active] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，先扣预算再发 HTTP |
+| 每日预算 | `[active] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按本地时区换桶），先扣预算再发 HTTP |
 | 重启抑制 | `[plugins.bootnotice] min_interval` | 距上次启动不足该间隔则整轮跳过，防崩溃重启刷屏 |
 | 重试 | `[plugins.bootnotice] retry_delay` | 失败只重试一次；主动消息没有 `msg_id` 幂等键，多试等于重复推送 |
 
@@ -341,7 +341,7 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 |---|---|---|---|
 | `/reset reconnect`（`r0`） | 不动数据，断开并立即重连（保留 session，走 Resume） | owner | 60 s |
 | `/reset session`（`r1`） | 本会话的插件状态（`plugin_kv` 里 `peer` 非空的行） | Bot 管理员 | 10 min |
-| `/reset data`（`r2`） | 本会话的消息与媒体文件 | Bot 管理员 + 确认码 | 1 h |
+| `/reset data`（`r2`） | 本会话的消息、媒体文件、任务记录与主动消息日额度（`active_usage` 按 peer 清） | Bot 管理员 + 确认码 | 1 h |
 | `/reset all`（`r3`） | 全部业务数据 | owner + 确认码 + 短语 | 24 h |
 | `/reset status` | 各档冷却与最近 5 条记录 | Bot 管理员 | — |
 
@@ -482,7 +482,7 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/b
 
 | 层 | 位置 | 职责 |
 |---|---|---|
-| 协议账本（必须本地） | `internal/core/sender.go` | 被动窗口与次数、`msg_id + msg_seq` 原子分配；文档明确同一 `msg_id + msg_seq` 重复发送会失败 |
+| 协议账本（必须本地） | `internal/core/sender.go` | 被动窗口与次数、`msg_id + msg_seq` 原子分配（同一 `msg_id` 下 seq 单调递增，窗口过期只重置次数）；文档明确同一 `msg_id + msg_seq` 重复发送会失败 |
 | 接口限流（粗粒度） | `internal/httpx` | 全进程出站令牌桶，可按域名分桶（`[http.domains]`）；发消息走 `PostJSONOnce`，不自动重试 |
 | 返回值校正 | `sender` / `dispatch` | 429 → `ErrRateLimited` 告警；401 → 刷新 token |
 

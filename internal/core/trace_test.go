@@ -64,7 +64,7 @@ func TestTraceEndToEnd(t *testing.T) {
 		t.Fatalf("装配路由: %v", err)
 	}
 	f := &fakeAPI{}
-	sender := NewSender(f, log, ActivePolicy{})
+	sender := NewSender(f, log, ActivePolicy{}, nil)
 	sender.trace = tr
 	disp := NewDispatcher(router, sender, log, time.Second)
 	disp.trace = tr
@@ -126,7 +126,7 @@ func TestTracePluginLevel(t *testing.T) {
 		t.Fatalf("装配路由: %v", err)
 	}
 	f := &fakeAPI{}
-	sender := NewSender(f, log, ActivePolicy{})
+	sender := NewSender(f, log, ActivePolicy{}, nil)
 	sender.trace = tr
 	disp := NewDispatcher(router, sender, log, time.Second)
 	disp.trace = tr
@@ -243,6 +243,51 @@ func TestRouterMatchReportsCommand(t *testing.T) {
 	}
 }
 
+// 被同组前序插件阻断的匹配者必须在 full 级轨迹里留痕：这是排查
+// "zzz 明明声明了 yield=true，为什么没反应"的唯一出口（阻断不是错误，不进 slog）。
+func TestTraceBlockedNamesBothPlugins(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out, LevelFull)
+	blocker := yieldStub("aaa", 100, false)
+	skipped := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, blocker, skipped)
+	d.trace = tr
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+
+	got := out.String()
+	for _, want := range []string{
+		" 未执行 · 插件 zzz", // 被挡住的是谁
+		`命令 "/cmd"`,     // 哪条命令命中了它
+		"（aaa 未让位）",     // 谁挡的
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("轨迹缺少 %q，实际输出:\n%s", want, got)
+		}
+	}
+}
+
+// 被不让位者挡下的候选有两种，「没执行」的原因不同：有权限的是被挡住，
+// 无权限的本就不会执行。后者必须记「权限不足」，否则排障会往让位链上找。
+func TestTraceBlockedDoesNotMislabelDenied(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out, LevelFull)
+	blocker := yieldStub("mmm", 100, false)
+	denied := newStub("zzz", "/cmd", host.PermBotAdmin, "")
+	d, _ := newTestDispatcher(t, blocker, denied)
+	d.trace = tr
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+
+	got := out.String()
+	if !strings.Contains(got, "权限不足 · 插件 zzz") {
+		t.Errorf("无权限的候选应记「权限不足」，实际输出:\n%s", got)
+	}
+	if strings.Contains(got, "未执行 · 插件 zzz") {
+		t.Errorf("无权限的候选不该记「未让位」，实际输出:\n%s", got)
+	}
+}
+
 func waitFor(t *testing.T, out *syncBuffer, want string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -342,7 +387,7 @@ func TestTraceReceivedShowsBotRole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("装配路由: %v", err)
 	}
-	sender := NewSender(&fakeAPI{}, log, ActivePolicy{})
+	sender := NewSender(&fakeAPI{}, log, ActivePolicy{}, nil)
 	disp := NewDispatcher(router, sender, log, time.Second)
 	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
 
