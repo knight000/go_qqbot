@@ -109,8 +109,9 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 	return r, nil
 }
 
-// Match 返回按 priority 降序排列的候选。同一优先级只应有一个插件处理，
-// 除非该插件显式声明 broadcast=true。
+// Match 返回按 priority 降序排列的候选：priority 降序，同 priority 按插件名升序。
+// 这个顺序就是 Dispatcher 的执行顺序——同组内逐个执行，遇到不让位者为止（§3.4），
+// 所以排序必须确定，不能依赖 map 遍历。
 type Match struct {
 	Plugin   host.Plugin
 	Manifest host.Manifest
