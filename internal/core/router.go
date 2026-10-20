@@ -210,8 +210,8 @@ func matchCommands(cmds []compiledCommand, ev *host.Event) (best *compiledComman
 
 // argsAfterPrefix 判断 content 是否以 prefix 开头，并返回其后的剩余原文（已 TrimSpace）。
 //
-// 词边界在这里收口：loose=false 要求 prefix 之后是空白或字符串结尾，所以 `/md5 abc`
-// 不命中 `/md`。这条规则曾经散在每个插件里（md 的 CutPrefix + IsSpace 判断），
+// 词边界在这里收口：loose=false 要求 prefix 之后是空白或字符串结尾，所以 `/foobar abc`
+// 不命中 `/foo`。这条规则曾经散在每个插件里（各自的 CutPrefix + IsSpace 判断），
 // 漏一个插件就多一处误命中，所以只有这一份实现。loose=true 退回裸 HasPrefix 语义，
 // 只给"前缀本身就是完整词、后面紧跟内容"的写法用。
 func argsAfterPrefix(content, prefix string, loose bool) (args string, ok bool) {
