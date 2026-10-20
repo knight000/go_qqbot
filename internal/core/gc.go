@@ -50,13 +50,19 @@ func (c *Core) runGC(ctx context.Context) {
 	if err != nil {
 		c.log.Warn("过期待确认重置失败", "err", err)
 	}
+	// 会话行的读路径会自己删过期行，这里只兜底"再也没有人来读过"的那些。
+	// 失败只告警：清不掉过期会话不影响任何正确性，下个周期还会再试。
+	sessN, err := c.store.PurgeExpiredSessions(ctx)
+	if err != nil {
+		c.log.Warn("清理过期会话失败", "err", err)
+	}
 
-	if msgN+evtN+runN+mediaN+kvN > 0 {
+	if msgN+evtN+runN+mediaN+kvN+sessN > 0 {
 		if err := c.store.IncrementalVacuum(ctx); err != nil {
 			c.log.Warn("incremental_vacuum 失败", "err", err)
 		}
 		c.log.Info("GC 完成",
-			"messages", msgN, "events", evtN, "job_runs", runN, "media", mediaN, "kv", kvN)
+			"messages", msgN, "events", evtN, "job_runs", runN, "media", mediaN, "kv", kvN, "sessions", sessN)
 	}
 	if expN > 0 {
 		c.log.Debug("已把过期的待确认重置标记为 expired", "count", expN)

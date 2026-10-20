@@ -131,7 +131,7 @@ D5 的前提有两层，必须分清：
 ### 2.1 进程与并发模型
 
 - **单进程**，三组长期协程：`ws-loop`、`dispatch-pool`、`scheduler-loop`；外加一个周期性 `gc-loop`。
-- **按 peer 串行**：同一 `peer_openid` 的事件进入同一队列，串行处理。理由有两个——① `msg_seq` 必须原子递增，否则并发回复同一 `msg_id` 会撞车；② 避免插件对同一用户并发查询。
+- **按 peer 串行**：同一 `peer_openid` 的事件进入同一队列，串行处理。理由有两个——① `msg_seq` 必须原子递增，否则并发回复同一 `msg_id` 会撞车；② 避免插件对同一用户并发查询。会话接管的判定与投递也在这个队列里（`Dispatcher.handle` 内，ADR-0004 决策 6），所以"推进会话"与"静态路由"不会并发打到同一个 peer。
 - **跨 peer 并行**：工作池上限默认 16，超限排队而非丢弃。
 - 全程无阻塞 IO 占用工作池：所有 HTTP 带 `context` 超时（默认 5 s）。
 - **单实例由文件锁保证**，不是靠部署纪律。锁文件 `<store.path>.lock` 用操作系统
@@ -235,7 +235,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | `Username` / `Content` / `MsgType` / `HasMedia` | 消息正文与形态 | 单聊 `Username` 恒空 |
 | `Command` / `Args` | 命中的命令与其后参数 | 由核心在 `Handle` 之前填好；未命中为空串 |
 | `Mentioned` | 这条消息 **@ 了机器人** | 仅 `GROUP_AT_MESSAGE_CREATE` 为 `true`；由平台事件类型决定，与 `mentions` 数组无关（§1.4） |
-| `Session` | 非 nil 表示这条消息是对**本插件** `Await` 的回应，`{Plugin, State}` | 命中会话接管时 `Command` / `Args` 恒为空（ADR-0004，**待实现 #16**） |
+| `Session` | 非 nil 表示这条消息是对**本插件** `Await` 的回应，`{Plugin, State}` | 命中会话接管时 `Command` / `Args` 恒为空（ADR-0004） |
 | `Raw` / `RawTruncated` | 平台原始 JSON 副本（≤32 KiB）与截断标记 | 含已知事件；不落库、不参与去重，只在 dispatch 生命周期内有效 |
 | `Payload` | 原始 JSON，**仅未知事件**、完整原文 | 与 `Raw` 的取舍见 §1.4 |
 | `Timestamp` / `Actor` | 时间与权限视图 | `Actor` 由核心在投递前填好，插件只读 |
@@ -251,7 +251,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 6 | `Host.HTTP` 新增 `GetJSONWithHeader`（带鉴权头）、`GetJSONOnce`（不重试）、`WithTimeout`（按请求放宽超时，共享连接池与限流状态） | — |
 | 7 | `Host.HTTP` 的非 2xx 统一返回 `*HTTPStatusError`，插件不必 import `internal/httpx` 就能分辨 429 与普通失败 | — |
 | 8 | ① `Manifest.Yield` 取代 `Broadcast`：是否让位由每个匹配者自己声明（§3.4），`broadcast` 字段删除；② `Event.Command` / `Event.Args` 由核心填好，前缀匹配按词边界（`/md5` 不再命中 `/md`）；③ `Event.Mentioned` / `Event.Raw` 暴露“是否 @ 了机器人”与原始载荷 | #11 / #12 / #13 |
-| 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16（**待实现**） |
+| 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
@@ -267,7 +267,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
 | `Log` | 结构化日志，自动带 plugin 字段 | 敏感字段脱敏 |
 | `Renderer` | 把 markdown 画成图片（`Markdown(ctx, src) (Image, error)`），契约见 §3.8 | 未注入时返回拒绝性 stub（错误可被 `errors.Is` 分类为超时/超大/能力缺失），不是 nil |
-| `Session()` | `Await(ctx, ev, state, ttl) error`：登记“该 peer 的下一条消息交给本插件”，并附带插件自定义 state（ADR-0004） | 同 peer 只允许一个持有者；被占用返回 `ErrSessionBusy`；state ≤ 8 KiB（超限报错，不截断）；TTL 默认 5 min、上限 1 h（**待实现 #16**） |
+| `Session()` | `Await(ctx, ev, state, ttl) error`：登记“该 peer 的下一条消息交给本插件”，并附带插件自定义 state（ADR-0004） | 同 peer 只允许一个持有者；被占用返回 `ErrSessionBusy`；state ≤ 8 KiB（超限报错，不截断）；TTL 默认 5 min、上限 1 h |
 
 **插件不直接持有 SQLite 连接、不直接持有 WS 连接、不读环境变量取密钥。** 这条边界决定了：插件可单测（Host 用 fake）、可复用（换核心只改 Host 适配层）、可审计（插件能做什么，读 Host 接口就够）。
 
@@ -290,7 +290,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
      → 全未命中 → 静默：核心不回任何内容，也没有可配置的默认提示语
 ```
 
-**会话接管（ADR-0004，待实现 #16）**：持有者通过 `Host.Session().Await` 把「该 peer 的下一条消息」登记到 `sessions` 表（主键 `peer`）。这条路由的落点是 **`Dispatcher.handle` 内**、per-peer 串行队列里，不是 `Core.Handle`——`Dispatch` 只做入队，在入队前查会话会让会话推进与静态路由并发打到同一个 peer，破坏 §2.1 的「同 peer 串行」保证（与评审稿 §2.1 的有意偏差，理由见 ADR-0004 决策 6）。三条细则：① **只对 `message` 生效**——notice、群生命周期与未知事件不消费会话，它们不是「用户说的话」；② **不检查 `Manifest.Intents`**——持有者在 `Await` 那一刻已显式要求这条消息，要求额外声明 intent 只会制造「登记成功但永远收不到」的静默故障；③ **权限不足不消费**——用持有者的 `Manifest.Permission` 判定（会话消息没有命令，因此没有 `Command.Permission`），无权时不删行、记一行 `权限不足` 轨迹、消息落回静态路由，不能吞掉。消费本身是**先删行、再调 `Handle`**；持有者已不在加载集合时删行 + warn 并落回静态路由。会话命中在轨迹里是一行独立的「会话接管」，`plugin` 级也打（这是「谁触发了我」的唯一答案）。
+**会话接管（ADR-0004）**：持有者通过 `Host.Session().Await` 把「该 peer 的下一条消息」登记到 `sessions` 表（主键 `peer`）。这条路由的落点是 **`Dispatcher.handle` 内**、per-peer 串行队列里，不是 `Core.Handle`——`Dispatch` 只做入队，在入队前查会话会让会话推进与静态路由并发打到同一个 peer，破坏 §2.1 的「同 peer 串行」保证（与评审稿 §2.1 的有意偏差，理由见 ADR-0004 决策 6）。三条细则：① **只对 `message` 生效**——notice、群生命周期与未知事件不消费会话，它们不是「用户说的话」；② **不检查 `Manifest.Intents`**——持有者在 `Await` 那一刻已显式要求这条消息，要求额外声明 intent 只会制造「登记成功但永远收不到」的静默故障；③ **权限不足不消费**——用持有者的 `Manifest.Permission` 判定（会话消息没有命令，因此没有 `Command.Permission`），无权时不删行、记一行 `权限不足` 轨迹、消息落回静态路由，不能吞掉。消费本身是**先删行、再调 `Handle`**；持有者已不在加载集合时删行 + warn 并落回静态路由。会话命中在轨迹里是一行独立的「会话接管」，`plugin` 级也打（这是「谁触发了我」的唯一答案）。
 
 - 路由在**插件的 matcher 表**上做，核心不解析业务语义。
 - 默认只跑一个插件，避免“两个插件同时回、消耗 5 次被动额度”。这个默认由 `yield` 的零值承担：不写 `yield` 就是不让位，执行完即结束。
@@ -576,7 +576,7 @@ CREATE TABLE job_runs (
 CREATE INDEX idx_job_runs      ON job_runs(job_id, started_at);
 CREATE INDEX idx_job_runs_peer ON job_runs(peer, started_at);
 
--- 会话接管（ADR-0004，待实现 #16）：一行 = 一个 peer 当前被某个插件占用。
+-- 会话接管（ADR-0004）：一行 = 一个 peer 当前被某个插件占用。
 -- 主键只有 peer：同 peer 同时只允许一个持有者，场景不参与"谁能接管"的判定。
 -- scene 是冗余列，只用于观测与消费时校验——群 openid 与用户 openid 是两个
 -- 平台命名空间，取值万一相同，单聊消息不得消费群会话。把它放进主键会得到
@@ -812,7 +812,7 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 - **任何级别都不删 `qq_groups`**。群名单是访问控制配置而不是业务数据；清掉它，白名单一开就等于对所有群静默拉黑，与删 `admins` 是同一类事故。
 - R2/R3 必须**先删媒体文件、再删行**。反过来会留下无引用的孤儿文件，只能靠扫盘才能发现，而扫盘在低配机上很贵。
 
-**`sessions` 跟着会话状态走，R1 就要清**（ADR-0004，待实现 #16）：不清就等于「重置完留下一个永远等不到输入的悬挂会话」——用户的下一步输入会被一个已经忘记上下文的插件接管，比直接不响应更难排查。R2 是「这个会话重新开始」，一并清；R3 清全表；R0 只重连，不动它。
+**`sessions` 跟着会话状态走，R1 就要清**（ADR-0004）：不清就等于「重置完留下一个永远等不到输入的悬挂会话」——用户的下一步输入会被一个已经忘记上下文的插件接管，比直接不响应更难排查。R2 是「这个会话重新开始」，一并清；R3 清全表；R0 只重连，不动它。
 
 **冷却按 `(level, peer)` 计**。R1/R2 换个群不受上一个群的影响——连清两个群是正常运维动作；R0/R3 是全局操作，`peer` 记为 `*`，因此全局冷却。冷却起点取 `reset_audit.finished_at`，只认 `status=done` 的行。
 

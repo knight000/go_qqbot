@@ -43,6 +43,9 @@ type Core struct {
 	plugins []host.Plugin
 	trace   *Trace
 	render  host.Renderer
+	// session 是插件可见的会话接管能力。nil 时 host 会换成拒绝性替身，
+	// 与 Renderer 同一条契约：插件不必写判空分支。
+	session host.SessionBackend
 
 	sender   *Sender
 	router   *Router
@@ -103,12 +106,21 @@ func New(o Options) (*Core, error) {
 	if o.Store != nil {
 		usage = o.Store
 	}
+	// 同理：会话的后端与读取入口都只在真库上成立。显式判空再赋给接口，
+	// 否则 nil 的 *store.DB 装进接口后 `d.sessions == nil` 永远不成立。
+	var session host.SessionBackend
+	var sessionRowsSrc sessionStore
+	if o.Store != nil {
+		session = sessionBackend{db: o.Store, router: router, log: logger.With("component", "session")}
+		sessionRowsSrc = sessionRows{o.Store}
+	}
 	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage)
 	sender.trace = trace
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
 	dispatch.trace = trace
 	dispatch.denyReply = o.Config.Permission.DenyReply
+	dispatch.sessions = sessionRowsSrc
 
 	// 显式判空再赋给接口：把 nil 的 *api.Client 存进接口会得到一个
 	// 非 nil 接口，后续 `c.api == nil` 就永远不成立。
@@ -126,6 +138,7 @@ func New(o Options) (*Core, error) {
 		plugins:   o.Plugins,
 		trace:     trace,
 		render:    o.Renderer,
+		session:   session,
 		sender:    sender,
 		router:    router,
 		dispatch:  dispatch,
@@ -166,6 +179,7 @@ func (c *Core) Start(ctx context.Context) error {
 			Log:      c.log,
 			Domains:  m.AllowedDomains,
 			Renderer: c.render,
+			Session:  c.session,
 		})
 		if err := p.Init(ctx, svc); err != nil {
 			return fmt.Errorf("初始化插件 %s: %w", m.Name, err)

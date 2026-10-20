@@ -23,6 +23,7 @@ func (f *fakeHost) HTTP() host.HTTP             { return nil }
 func (f *fakeHost) Scheduler() host.Scheduler   { return nil }
 func (f *fakeHost) Admins() host.AdminDirectory { return nil }
 func (f *fakeHost) Renderer() host.Renderer     { return nil }
+func (f *fakeHost) Session() host.Session       { return nil }
 func (f *fakeHost) IsAdmin(context.Context, host.Identity) (bool, error) {
 	return false, nil
 }

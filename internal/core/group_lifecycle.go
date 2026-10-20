@@ -132,10 +132,11 @@ func (c *Core) onBotLeftGroup(ctx context.Context, ev *host.Event) {
 	// 按 R1 语义清掉该群的会话状态：群都不在了，插件在这里攒的对话进度
 	// 没有任何意义，留着只会在机器人被重新拉回来时表现为"它还记着上次"。
 	// 失败不阻断——退群标记才是关键，KV 可以留给 /reset session 清。
-	if n, err := c.store.ClearPeerSession(ctx, groupID); err != nil {
+	if counts, err := c.store.ClearPeerSession(ctx, groupID); err != nil {
 		c.log.Warn("清理退群会话失败", "group", groupID, "err", err)
-	} else if n > 0 {
-		c.log.Info("已清理退群会话状态", "group", groupID, "rows", n)
+	} else if counts.Total() > 0 {
+		c.log.Info("已清理退群会话状态", "group", groupID,
+			"kv", counts.KVRows, "sessions", counts.Sessions)
 	}
 	c.log.Info("机器人已退出群", "group", groupID, "操作人", ev.SenderID)
 	c.trace.GroupLifecycle("退出群", groupID)

@@ -24,6 +24,9 @@ type Dispatcher struct {
 	// denyReply 为 false 时，权限不足一律静默（默认）。
 	// 拒绝语由插件 Manifest/Command 提供，是否发出由全局配置决定。
 	denyReply bool
+	// sessions 是会话接管的读取入口。为 nil 表示未装配（测试或未开库），
+	// 此时会话路由整体不发生——静态匹配是安全退路。
+	sessions sessionStore
 
 	sem chan struct{}
 
@@ -107,7 +110,28 @@ func (d *Dispatcher) peerLoop(ctx context.Context, key string, q *peerQueue) {
 	}
 }
 
+// sessionStore 是 Dispatcher 需要的最小会话视图。用窄接口而不是 *store.DB：
+// 单元测试要能构造"行还在但持有者已经不在"这类状态，而真库上很难摆。
+type sessionStore interface {
+	Session(ctx context.Context, peer string) (sessionRow, bool, error)
+	DeleteSession(ctx context.Context, peer string) error
+}
+
+// sessionRow 只带投递需要的四列。Peer / CreatedAt 故意不带：
+// 前者就是查询键，后者只用于排障，Dispatcher 用不到。
+type sessionRow struct {
+	Plugin    string
+	Scene     string
+	State     []byte
+	ExpiresAt time.Time
+}
+
 func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
+	// 会话接管必须在这里、不在 Core.Handle：这一层在 per-peer 串行队列里，
+	// 在入队前查会话会让会话推进与静态路由并发打到同一个 peer（ADR-0004 决策 6）。
+	if d.takeOverSession(ctx, ev) {
+		return
+	}
 	matches := d.router.Match(ev)
 	if len(matches) == 0 {
 		d.trace.NoMatch(ev)
@@ -172,6 +196,82 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 		}
 		break
 	}
+}
+
+// takeOverSession 尝试把这条消息交给会话持有者，返回 true 表示已投递、
+// 调用方不得再走静态匹配。
+//
+// 为什么每一步失败都落回静态路由：会话是**隐式路由**，用户并不知道自己
+// 正在某个插件的会话里。把消息丢掉造成的故障（"机器人不理我"）比多回一条
+// 严重得多，所以除了"成功投递"以外的所有分支都退回可见的静态匹配。
+func (d *Dispatcher) takeOverSession(ctx context.Context, ev *host.Event) bool {
+	// 只有"用户说的话"能推进会话。notice、群生命周期、未知事件都不是答案，
+	// 拿平台通知推进会话等于把系统事件当成用户输入。
+	if d.sessions == nil || ev.Kind != host.KindMessage {
+		return false
+	}
+
+	row, ok, err := d.sessions.Session(ctx, ev.PeerID)
+	if err != nil {
+		d.log.Error("读取会话失败，按无会话处理", "peer", ev.PeerID, "err", err)
+		return false
+	}
+	if !ok {
+		return false
+	}
+	// scene 是冗余列，存在只为了这一条校验：群 openid 与用户 openid 来自
+	// 两个平台命名空间，取值万一相同，单聊消息不得消费群会话。
+	if row.Scene != string(ev.Scene) {
+		d.log.Debug("会话场景不匹配，不接管",
+			"peer", ev.PeerID, "session_scene", row.Scene, "scene", ev.Scene)
+		return false
+	}
+	now := time.Now()
+	if !row.ExpiresAt.After(now) {
+		// 过期等于行不存在：读路径顺手删掉，GC 只是兜底。
+		if err := d.sessions.DeleteSession(ctx, ev.PeerID); err != nil {
+			d.log.Warn("清理过期会话失败", "peer", ev.PeerID, "err", err)
+		}
+		d.log.Info("会话已过期，落回静态路由", "peer", ev.PeerID, "plugin", row.Plugin)
+		return false
+	}
+
+	rt := d.router.Lookup(row.Plugin)
+	if rt == nil {
+		// 持有者卸载/重载后从路由表消失，这一行永远不会有人消费。
+		if err := d.sessions.DeleteSession(ctx, ev.PeerID); err != nil {
+			d.log.Warn("清理悬挂会话失败", "peer", ev.PeerID, "err", err)
+		}
+		d.log.Warn("会话持有者已不在，落回静态路由", "peer", ev.PeerID, "plugin", row.Plugin)
+		return false
+	}
+
+	m := Match{
+		Plugin:    rt.plugin,
+		Manifest:  rt.manifest,
+		Perm:      rt.manifest.Permission,
+		DenyReply: rt.manifest.DenyReply,
+	}
+	// 权限先于接管：会话消息没有命令，所以只能用持有者的插件级权限。
+	// 无权限**不删行**——否则一次越权尝试就能把管理员的会话顶掉；
+	// 消息也不能吞掉，普通成员在群里说的话必须有别的去处。
+	if !m.Perm.Admits(ev.Actor) {
+		d.trace.Denied(m, ev)
+		return false
+	}
+
+	// 先删后投（决策 3）：Handle 里再次 Await 写入的新行不会被这次清理吃掉。
+	// 删失败就整条放弃投递——宁可这条消息走静态路由，也不能让"一次性"失效。
+	if err := d.sessions.DeleteSession(ctx, ev.PeerID); err != nil {
+		d.log.Error("删除会话失败，放弃接管", "peer", ev.PeerID, "plugin", row.Plugin, "err", err)
+		return false
+	}
+
+	ev.Session = &host.SessionContext{Plugin: row.Plugin, State: row.State}
+	d.trace.Session(m, ev, time.Until(row.ExpiresAt))
+	d.run(ctx, m, ev)
+	// 不 yield、不进静态匹配：独占是结构性结果，不是一个可配开关。
+	return true
 }
 
 // replyDenied 发出插件声明的拒绝语。空串表示静默（默认），
