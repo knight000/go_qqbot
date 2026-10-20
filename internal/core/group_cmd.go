@@ -299,11 +299,11 @@ func (c *Core) sessionLine(ctx context.Context, peer string) string {
 		return "会话 读取失败"
 	}
 	// 过期的行还在库里（GC 还没跑）时对用户就是"没有会话"，与读路径同一口径。
-	remain := time.Until(row.ExpiresAt)
-	if !ok || remain <= 0 {
-		return "会话 无"
+	now := time.Now()
+	if !ok || sessionExpired(row.ExpiresAt, now) {
+		return "会话接管 无"
 	}
-	return fmt.Sprintf("会话 插件 %s｜剩余 %s", row.Plugin, humanRemain(remain))
+	return fmt.Sprintf("会话接管 插件 %s｜剩余 %s", row.Plugin, humanRemain(row.ExpiresAt.Sub(now)))
 }
 
 func (c *Core) groupOverview(ctx context.Context, ev *host.Event) {
@@ -321,7 +321,7 @@ func (c *Core) groupOverview(ctx context.Context, ev *host.Event) {
 	if n, err := c.store.CountSessions(ctx); err != nil {
 		c.log.Warn("统计会话失败", "err", err)
 	} else if n > 0 {
-		msg += fmt.Sprintf("\n会话中 %d", n)
+		msg += fmt.Sprintf("\n会话接管 %d 个", n)
 	}
 	if st.Left > 0 {
 		msg += fmt.Sprintf("\n已退出 %d（保留记录，不参与 refresh）", st.Left)

@@ -196,6 +196,15 @@ func TestCountSessions(t *testing.T) {
 	if n, err := db.CountSessions(ctx); err != nil || n != 3 {
 		t.Fatalf("应为 3，实际 %d err=%v", n, err)
 	}
+
+	// 过期等于行不存在（决策 4）：总览不能把一个已经没人等的 peer 算成"会话中"，
+	// 否则它与 /group status <群> 的「无」自相矛盾，最长虚报一个 GC 周期。
+	if err := db.CreateSession(ctx, sessionAt("stale", "group", "md", nil, -10*time.Minute, time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := db.CountSessions(ctx); err != nil || n != 3 {
+		t.Fatalf("过期行不得计入，应为 3，实际 %d err=%v", n, err)
+	}
 }
 
 // R1 / R2 / R3 都要带走会话，且 R1 只带走自己的。
