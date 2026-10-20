@@ -73,16 +73,30 @@ func (db *DB) InsertJobIfMissing(ctx context.Context, j Job) (bool, error) {
 // per-peer 行要求对应群仍在群（left_at = 0）：退群即停、重新入群即恢复，
 // 不需要另一份"该群任务已停用"的状态。熔断（enabled=0）与未注册是别的维度，
 // 两者互不覆盖——如果退群也写 enabled=0，入群恢复时就分不清该不该复活。
-func (db *DB) DueJobs(ctx context.Context, now int64, limit int) ([]Job, error) {
-	rows, err := db.r.QueryContext(ctx,
-		`SELECT j.id, j.peer, j.plugin, j.spec, j.timezone, j.enabled, j.next_run_at,
+//
+// excludePlugins 里的插件仍在执行上一轮任务（同一插件串行，见 ARCHITECTURE
+// §5.1），必须在 SQL 里排除而不是取回来再丢：limit 按 next_run_at 排序，
+// 一个积压了上百行 per-peer 实例的插件会把整个窗口占满，其他插件的到期
+// 任务永远轮不到——表现为"某个插件卡住时，所有定时任务一起停摆"。
+func (db *DB) DueJobs(ctx context.Context, now int64, limit int, excludePlugins ...string) ([]Job, error) {
+	query := `SELECT j.id, j.peer, j.plugin, j.spec, j.timezone, j.enabled, j.next_run_at,
 		        COALESCE(j.last_run_at, 0), COALESCE(j.last_status, ''), j.consecutive_failures, COALESCE(j.payload, '')
 		 FROM jobs j
 		 WHERE j.enabled = 1 AND j.next_run_at <= ?
 		   AND (j.peer = '' OR EXISTS (
 		         SELECT 1 FROM qq_groups g
-		          WHERE g.group_openid = j.peer AND g.left_at = 0))
-		 ORDER BY j.next_run_at LIMIT ?`, now, limit)
+		          WHERE g.group_openid = j.peer AND g.left_at = 0))`
+	args := []any{now}
+	if len(excludePlugins) > 0 {
+		query += ` AND j.plugin NOT IN (` + placeholders(len(excludePlugins)) + `)`
+		for _, p := range excludePlugins {
+			args = append(args, p)
+		}
+	}
+	query += ` ORDER BY j.next_run_at LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := db.r.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("扫描到期任务: %w", err)
 	}
@@ -143,8 +157,7 @@ func (db *DB) DisableJobsExcept(ctx context.Context, keep []string) error {
 	query := `UPDATE jobs SET enabled = 0`
 	var args []any
 	if len(keep) > 0 {
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keep)), ",")
-		query += ` WHERE id NOT IN (` + placeholders + `)`
+		query += ` WHERE id NOT IN (` + placeholders(len(keep)) + `)`
 		for _, id := range keep {
 			args = append(args, id)
 		}
@@ -153,4 +166,9 @@ func (db *DB) DisableJobsExcept(ctx context.Context, keep []string) error {
 		return fmt.Errorf("停用未注册任务: %w", err)
 	}
 	return nil
+}
+
+// placeholders 返回 n 个逗号分隔的 ?，供 IN (...) 使用。
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }

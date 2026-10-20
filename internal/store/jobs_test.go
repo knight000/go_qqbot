@@ -379,3 +379,58 @@ func TestMigrateLegacyJobs(t *testing.T) {
 		t.Fatal("迁移后缺少 idx_job_runs_peer")
 	}
 }
+
+// 正在跑的插件必须能在 SQL 层被排除，而不是取回来再在内存里丢掉。
+//
+// 只在内存里丢会饿死别人：limit 是按 next_run_at 排的，一个积压了上百行
+// per-peer 实例的插件会把整个窗口占满，其他插件的到期任务永远轮不到。
+func TestDueJobsExcludesBusyPlugins(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := nowUnix()
+
+	for _, peer := range []string{"a1", "a2", "a3"} {
+		if err := db.MarkGroupPresent(ctx, peer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 三个 digest 行都比 weather 行更早到期：limit=2 时窗口会被它独占。
+	for _, peer := range []string{"a1", "a2"} {
+		if err := db.UpsertJob(ctx, Job{
+			ID: "digest:daily", Peer: peer, Plugin: "digest",
+			Spec: "0 9 * * *", NextRunAt: now - 100,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.UpsertJob(ctx, Job{
+		ID: "weather:hourly", Peer: "a3", Plugin: "weather",
+		Spec: "0 * * * *", NextRunAt: now - 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := db.DueJobs(ctx, now, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("limit=2 应取两行，实际 %d", len(jobs))
+	}
+
+	jobs, err = db.DueJobs(ctx, now, 2, "digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].Plugin != "weather" {
+		t.Fatalf("排除了 digest 之后应只剩 weather: %+v", jobs)
+	}
+
+	jobs, err = db.DueJobs(ctx, now, 2, "digest", "weather")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("两个插件都忙时应取不到任务: %+v", jobs)
+	}
+}
