@@ -178,7 +178,8 @@ Manifest {
   api_version  与核心的契约版本，不匹配则拒绝加载
   capabilities 保留字段：核心从不读取，不构成任何门控；等出现第二个真实消费方再启用（评审 §4.1）
   intents      需要订阅的事件类型
-  commands     匹配规则：前缀或正则二选一（Priority 越大越先）
+  commands     匹配规则：前缀或正则二选一（Priority 越大越先）；前缀默认要求词边界，
+               确需裸前缀时声明 loose=true（语义见下）
   broadcast    中标者声明“同优先级的其它插件也执行”（默认 false，语义见 §3.4）
   config_schema 启动期校验，支持四种类型：string / bool / int / duration（评审 §4.1）
 }
@@ -189,6 +190,13 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 `Manifest` 采用声明式而非“插件自己决定是否处理”，目的是把能用数据描述的规则放在启动期校验。**实际校验到的只有这些**：`name` 非空、`api_version` 与本核心一致、`intents` 可解析、`Permission` 位合法、每个 `Command` 恰好设置 `Prefix` 或 `Pattern` 之一、正则可编译、前缀不占用核心保留前缀、`config_schema` 里每个键在 `[plugins.<name>]` 中存在且类型相符（装配期、插件 `Init` 之前）。
 
 `config_schema` 的语义是**声明即必填**：写进去的键必须有值，缺一个就启动失败，所以有默认值的键不要写进 schema。类型只有四种，与 `Host.Config()` 的读取方法一一对应；`duration` 是字符串，必须能被 `time.ParseDuration` 解析。`key = ""` 对 `string` 是「存在但为空」，合法，与「缺失」可区分。
+
+`commands` 的匹配与回传（命令词边界与参数切分只有一份实现，在路由层）：
+
+- **前缀默认要求词边界**：命令词之后必须是空白（`unicode.IsSpace`）或字符串结尾，所以 `/md5 abc` 不命中 `/md`。确有需要裸前缀语义的写法显式声明 `loose: true`，退回 `strings.HasPrefix`；`loose` 只对前缀生效，与正则同时写不报错，也不起作用。
+- **正则**按源码匹配（`FindStringIndex`），`Command` 回传的正是该正则源码。
+- 命中后核心把结果写进 `Event.Command` / `Event.Args` **再**调用 `Handle`。`Command` 是命中那条命令的写法（前缀原文或正则源码），未命中为空串；`Args` 是匹配片段之后、已 `TrimSpace` 的剩余原文——前缀按前缀的字节长度切，正则按匹配区间的结束位置切——未命中同样为空串。匹配前 `Content` 已 `TrimSpace` 过，所以 `/md 内容` 与 `/md\n内容` 的 `Args` 都是「内容」，只有 `/md` 是空串。
+- 插件**不再自己切分**：`md` 曾用 `CutPrefix` 加词边界判断兜住 `/md5`，`echo` 曾用 `HasPrefix` 链分派两条命令；现在两者都只读 `Event.Command` / `Event.Args`。一次派发执行多个插件时（§3.4 的扇出），每个插件拿到的是它自己命中那条命令的 `Command/Args`。
 
 以下三条**当前不成立**，读契约时不要据此推断保障：
 
@@ -230,6 +238,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 ```
 
 - 路由在**插件的 matcher 表**上做，核心不解析业务语义。
+- 命中结果随事件回传：核心在选定要执行的匹配者之后、调用 `Handle` 之前写入 `Event.Command` / `Event.Args`（语义见 §3.2），插件侧不再出现 `CutPrefix` / `HasPrefix` 分派。一次派发跑多个插件时，每个插件拿到的是它自己命中那条命令的参数。
 - 默认只跑一个插件，避免“两个插件同时回、消耗 5 次被动额度”。
 - **谁中标由排序决定**：`priority` 降序，同 `priority` 按**插件名字典序**升序。无权限的候选在排序后被跳过，不阻塞后续插件（权限先于优先级）。同一插件内多条命令同时命中时，取 `priority` **严格**最大的一条，并列则取声明在前的（比较用 `>` 而非 `>=`）。未声明 `commands` 的插件匹配该 intent 的全部事件，`priority` 按 0 计。
 - `broadcast` 是**中标插件自己的字段**，不是层级属性：`aaa`（priority 100，`broadcast=false`）与 `zzz`（priority 100，`broadcast=true`）同时命中时，`aaa` 中标且不扇出，`zzz` 永不执行，日志里没有任何提示。这是已知缺陷（评审 §2.3）——按层级声明扇出的语义**当前未实现**，“这一层要不要扇出”本应是层级属性，却被实现成排序第一名的个人属性。修正见票 #11（per-plugin `Yield`）；在那之前**不要用 `broadcast` 表达“同级的都要跑”**。

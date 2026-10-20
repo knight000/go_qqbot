@@ -33,7 +33,10 @@ import (
 //
 // 版本 7：Host.HTTP 的非 2xx 统一返回 *HTTPStatusError，插件不必 import
 // internal/httpx 就能分辨 429 与普通失败。
-const APIVersion = "7"
+//
+// 版本 8：Event 新增 Command/Args（路由命中的命令与已切好的参数），
+// 前缀命令默认要求词边界，插件不再自己解析指令（票 #12）。
+const APIVersion = "8"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -86,6 +89,16 @@ type Event struct {
 	UnionID  string // 平台给的跨场景标识，可能为空
 	MsgID    string // 被动回复必须携带
 	Content  string
+	// Command 是本次投递命中的命令写法：前缀的原文，或正则的源码；未命中为空串。
+	// Args 是命中片段之后、已 TrimSpace 的剩余原文；未命中同样为空串。
+	//
+	// 两者都由核心在路由阶段填好（§3.4），插件不要再从 Content 里 CutPrefix：
+	// 命令词边界与参数切分只有一份实现，在路由层。Content 仍是 TrimSpace 过的
+	// 完整原文，两者并存——要判断"用户到底敲了什么"读 Content，要取参数读 Args。
+	//
+	// 一次派发执行多个插件时，每个插件拿到的是它自己命中那条命令的 Command/Args。
+	Command string
+	Args    string
 	// MsgType 是平台的 message_type：0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用。
 	MsgType int
 	// HasMedia 表示平台载荷里带附件。附件不会被下载（入站媒体不做），
@@ -314,7 +327,11 @@ type Host interface {
 // 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配（网关解出 mentions 后即
 // 丢弃，见评审 §4.2）。
 type Command struct {
-	Prefix      string
+	Prefix string
+	// Loose 只对 Prefix 生效，默认 false = 严格：前缀之后必须是空白或字符串结尾，
+	// 所以 `/md5 abc` 不命中 `/md`。置 true 退回裸 HasPrefix 语义，
+	// 只给"前缀本身就是完整词、后面紧跟内容"这类确有需要的写法用。
+	Loose       bool
 	Pattern     string
 	Priority    int
 	Description string
