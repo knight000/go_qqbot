@@ -16,9 +16,15 @@ import (
 // INSERT ... ON CONFLICT ... DO UPDATE ... WHERE used < ? 的 RowsAffected
 // 正好是"这次有没有占到"，等价于一次条件自增。
 //
-// limit 必须 > 0：不限量时调用方（core.Sender）根本不会调这里。
-// 真传了 <= 0，条件恒假、一行也不会占，方向仍然是"拒发"而不是"放开"。
+// limit 必须 > 0：不限量时调用方（core.Sender）根本不会调这里，
+// 它在 DailyPerPeer <= 0 时直接放行、不碰账本。
+//
+// 真传了 <= 0 就**显式拒发**，不能只靠 WHERE 恒假：upsert 的第一条
+// INSERT 分支不受 WHERE 约束，新 key 会被插进一行 used=1 并返回成功。
 func (db *DB) TakeActiveBudget(ctx context.Context, day, scene, peer string, limit int) (bool, error) {
+	if limit <= 0 {
+		return false, nil
+	}
 	res, err := db.w.ExecContext(ctx,
 		`INSERT INTO active_usage(day, scene, peer, used) VALUES(?, ?, ?, 1)
 		 ON CONFLICT(day, scene, peer) DO UPDATE SET used = used + 1 WHERE used < ?`,
