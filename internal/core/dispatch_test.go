@@ -194,3 +194,86 @@ func TestRouterRejectsUnknownPermission(t *testing.T) {
 		t.Fatal("未定义的权限位应拒绝加载")
 	}
 }
+
+// yieldStub 是同 priority 多插件场景的夹具：名字决定组内顺序，Yield 决定是否让位。
+func yieldStub(name string, priority int, yield bool) *stubPlugin {
+	p := newStub(name, "/cmd", host.PermUser, "")
+	p.manifest.Yield = yield
+	p.manifest.Commands[0].Priority = priority
+	return p
+}
+
+// 不让位者执行完就停在它：名字靠前的插件不能因为字典序而永久压制靠后的插件，
+// 但这里的"压制"必须是它自己声明出来的（Yield=false），而不是中标名次的副作用。
+func TestDispatchStopsAtNonYieldingPlugin(t *testing.T) {
+	stop := yieldStub("aaa", 100, false)
+	next := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, stop, next)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if stop.callCount() != 1 {
+		t.Fatalf("aaa 应执行一次，实际 %d 次", stop.callCount())
+	}
+	if next.callCount() != 0 {
+		t.Fatalf("aaa 未让位，zzz 不应执行，实际 %d 次", next.callCount())
+	}
+}
+
+// 让位就是让位：前一个声明 Yield=true，组内后一个照常执行。
+func TestDispatchContinuesWhileYielding(t *testing.T) {
+	first := yieldStub("aaa", 100, true)
+	last := yieldStub("zzz", 100, false)
+	d, _ := newTestDispatcher(t, first, last)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if first.callCount() != 1 || last.callCount() != 1 {
+		t.Fatalf("两者都应执行，实际 aaa=%d zzz=%d", first.callCount(), last.callCount())
+	}
+}
+
+// 执行到第一个不让位者为止，不继续向后：让位链是"逐个人声明"，不是"整组投票"。
+func TestDispatchStopsAtFirstNonYielder(t *testing.T) {
+	first := yieldStub("aaa", 100, true)
+	middle := yieldStub("mmm", 100, false)
+	last := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, first, middle, last)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if first.callCount() != 1 || middle.callCount() != 1 {
+		t.Fatalf("aaa 与 mmm 应执行，实际 aaa=%d mmm=%d", first.callCount(), middle.callCount())
+	}
+	if last.callCount() != 0 {
+		t.Fatalf("mmm 未让位，zzz 不应执行，实际 %d 次", last.callCount())
+	}
+}
+
+// yield 只在同 priority 组内生效：高优先级让位不会把事件送给低优先级插件。
+func TestDispatchYieldDoesNotCrossPriority(t *testing.T) {
+	high := yieldStub("aaa", 200, true)
+	low := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, high, low)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if high.callCount() != 1 {
+		t.Fatalf("高优先级插件应执行，实际 %d 次", high.callCount())
+	}
+	if low.callCount() != 0 {
+		t.Fatalf("跨优先级不扇出，低优先级插件不应执行，实际 %d 次", low.callCount())
+	}
+}
+
+// 无权限的匹配者只是被跳过，不改变"组内是否继续"——它不该像不让位者那样截断后续。
+func TestDispatchDeniedDoesNotBlockGroup(t *testing.T) {
+	first := yieldStub("aaa", 100, true)
+	denied := newStub("bbb", "/cmd", host.PermBotAdmin, "")
+	last := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, first, denied, last)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if first.callCount() != 1 || last.callCount() != 1 {
+		t.Fatalf("无权者前后两个插件都应执行，实际 aaa=%d zzz=%d", first.callCount(), last.callCount())
+	}
+	if denied.callCount() != 0 {
+		t.Fatalf("无权限插件不应执行，实际 %d 次", denied.callCount())
+	}
+}

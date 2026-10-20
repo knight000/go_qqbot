@@ -137,24 +137,25 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 		return
 	}
 
-	top := matches[first]
-	chosen := matches[first : first+1]
-	if top.Manifest.Broadcast {
-		for _, m := range matches[first+1:] {
-			if m.Priority != top.Priority {
-				break
-			}
-			if !m.Perm.Admits(ev.Actor) {
-				d.trace.Denied(m, ev)
-				continue
-			}
-			chosen = append(chosen, m)
+	// 同 priority 组内按序执行，遇到不让位者就停在这个插件（§3.4）：
+	// "是否继续"是每个匹配者自己的声明（Manifest.Yield），不是排序第一名的属性。
+	// 组内无权限的候选跳过并记录，跳过本身不改变"是否继续"。
+	group := matches[first].Priority
+	for i := first; i < len(matches); i++ {
+		m := matches[i]
+		if m.Priority != group {
+			// 跨 priority 不扇出：低优先级插件不因高优先级让位而执行。
+			break
 		}
-	}
-
-	for _, m := range chosen {
+		if !m.Perm.Admits(ev.Actor) {
+			d.trace.Denied(m, ev)
+			continue
+		}
 		d.trace.Hit(m, ev)
 		d.run(ctx, m, ev)
+		if !m.Manifest.Yield {
+			break
+		}
 	}
 }
 
