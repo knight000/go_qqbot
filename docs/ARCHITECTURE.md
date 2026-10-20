@@ -58,7 +58,7 @@ D5 的前提有两层，必须分清：
 |---|---|
 | 内存（核心） | 15–40 MB |
 | 内存（每插件，同进程） | +2–8 MB |
-| 内存（`Event.Raw` 副本） | 实测（`BenchmarkDecodeGroupMessage`，win/amd64）：真实群消息载荷 482 B → 单条 `Raw` 副本 482 B，整次解码 **1680 B/op、23 allocs/op**。dispatch 工作池 16 并发满载时在途 Raw 约 16×482 B ≈ 7.5 KiB，全部解码分配约 16×1680 B ≈ 26 KiB；最坏情况每条都撞上限 → 16×32 KiB = 512 KiB，占 `MemoryMax=256M` 的 0.2% |
+| 内存（`Event.Raw` 副本） | 实测（`BenchmarkDecodeGroupMessage`，win/amd64）：真实群消息载荷 482 B → 单条 `Raw` 副本 482 B，整次解码 **1680 B/op、23 allocs/op**（复测 1712 B/op，同量级）。dispatch 工作池 16 并发满载时在途 Raw 约 16×482 B ≈ 7.5 KiB，全部解码分配约 16×1680 B ≈ 26 KiB；最坏情况每条都撞上限 → 工作池 16 条 = 512 KiB，加上每 peer 队列（深 16）里排队事件持有的副本，10 个群同时刷屏约 10×17×32 KiB ≈ 5.3 MiB，占 `MemoryMax=256M` 的 2% |
 | 二进制磁盘 | 19 MB 量级（实测：windows 19.22 MB / linux 19.03 MB，其中内嵌字体 6.2 MB） |
 | SQLite（1000–10000 条/天，留 7 天） | 5–40 MB |
 | 媒体配额 | 0 —— 入站不下载；出站图片存在平台侧，不占本地盘 |
@@ -67,7 +67,10 @@ D5 的前提有两层，必须分清：
 
 `Raw` 那一行的换算方式：`go test ./internal/gateway -run '^$' -bench BenchmarkDecode -benchmem`
 给出的 `B/op` 是**单次解码**的总分配字节数；每个 dispatch worker 同一时刻只处理
-一条事件，所以并发峰值 ≈ 工作池上限（16）× B/op。三个基准分别是：单条真实群消息
+一条事件，所以工作池这一层的峰值 ≈ 工作池上限（16）× B/op。但事件在进工作池之前
+会先排队（`queueDepth=16`/peer），排队的事件同样持有自己的 `Raw`，所以真实上界是
+**活跃 peer 数 × (queueDepth+1) × 32 KiB**——按上面的 10 群算就是 5.3 MiB，仍远在
+256 M 预算内。三个基准分别是：单条真实群消息
 （`BenchmarkDecodeGroupMessage`，1680 B/op）、同一载荷 16 协程并发
 （`BenchmarkDecodeGroupMessageConcurrent16`，仍是 1680 B/op，说明并发不放大单条开销）、
 以及被截断的最坏载荷（`BenchmarkDecodeOversizeRaw`，66368 B/op，其中 32 KiB 是 `Raw` 副本本身）。
@@ -84,7 +87,7 @@ D5 的前提有两层，必须分清：
 | 平台事件名 | `Name` | 如 `GROUP_AT_MESSAGE_CREATE` | 只用于观测与解码表索引，插件不订阅它 |
 
 - 本地解码覆盖全部 12 个群与单聊事件（2 个群消息 + 1 个单聊消息 + 9 个通知/请求），另有 4 个跨场景事件：`FRIEND_ADD`、`FRIEND_DEL`、`INTERACTION_CREATE`、`SUBSCRIBE_MESSAGE_STATUS`。
-- `GROUP_AT_MESSAGE_CREATE`（@机器人）与 `GROUP_MESSAGE_CREATE`（全量模式：群主开启「接收所有消息」后群里每条消息都推）字段结构一致，**归一化为同一类 `message` 事件**：`Kind` / `Scene`、路由与订阅都不区分来源。两者的差异只用**语义标记**表达，核心与插件都不比较平台事件名（票 #13）：
+- `GROUP_AT_MESSAGE_CREATE`（@机器人）与 `GROUP_MESSAGE_CREATE`（全量模式：群主开启「接收所有消息」后群里每条消息都推）字段结构一致，**归一化不区分事件类**：`Kind`、`Scene`、路由与订阅完全一样，差异不用平台事件名表达（`Name` 只供观测）。**`Mentioned` 区分是否 @ 了机器人**——这是两者唯一的语义差异（票 #13）：
   - `Mentioned=true` 仅当平台事件是 `GROUP_AT_MESSAGE_CREATE`。官方文档把 `mentions` 定义为「消息中@的用户列表（**不含@机器人自身**）」，数组里永远不会有机器人自己，所以**不得**用它反推「@ 了我」；`GROUP_MESSAGE_CREATE` 的载荷里没有任何「@ 了机器人」的标记，一律 `false`，不做猜测。单聊、通知、未知事件恒 `false`。
   - 需要「@ 了别人」这一事实的插件自己读 `Raw` 里的 `mentions`——它原样躺在那里，核心不解析也不解释。
 - `Raw` 是所有事件（**含已知事件**）的原始 JSON 副本，上限 `host.MaxRawBytes` = 32 KiB；超出时截断并置 `RawTruncated=true`，截断状态因此可判定（不是静默切出半截 JSON 让插件误以为平台发了坏数据）。`Raw` **只在 dispatch 生命周期内有效**：不进 `messages` 表、不参与 `processed_events` 去重键、不被 GC 与 `/reset` 任何一级触碰。
@@ -213,7 +216,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 
 以下三条**当前不成立**，读契约时不要据此推断保障：
 
-- `commands` 的 **@提及匹配当前未实现**：`Command` 只有前缀与正则两种方式，`@` 不参与匹配（评审 §4.2，票 #13）。「这条消息 @ 了机器人」这一事实本身**可读**——见 `Event.Mentioned`，但路由不会因此放宽或收紧；要不要据此响应是插件自己的判断。
+- `commands` 的 **@提及匹配仍不在路由层**：`Command` 只有前缀与正则两种方式，`@` 不参与匹配，路由不会因为「@ 了机器人」而放宽或收紧（评审 §4.2）。这个事实本身**可读**——`Event.Mentioned` 提供语义标记（§1.4），要不要据此响应由插件自己判定。
 - 同优先级冲突的静态检测**当前未实现**：两条规则同时命中不会报错，启动期也发现不了。实际行为见 §3.4（评审 §4.7 第一行 / §2.3）。
 - `capabilities` 是**保留字段**，当前不参与任何门控；真正起门控作用的是哪三项，见 §3.3 末段（评审 §4.1）。
 
