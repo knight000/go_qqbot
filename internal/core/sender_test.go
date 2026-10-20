@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
@@ -228,6 +229,81 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 	// 预算是按 peer 计的，换个收件人不受影响
 	if err := p.SendActive(ctx, host.SceneC2C, "u2", host.Reply{Content: "x"}); err != nil {
 		t.Fatalf("其他收件人不应受影响: %v", err)
+	}
+}
+
+// 日切按本地时区换桶：同一 peer 昨天用满，今天应该重新有一份完整预算。
+func TestSenderActiveBudgetResetsNextDay(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 1,
+	}, newUsageStore(t))
+	// 23:59 与 00:01 是同一个"日预算"问题里唯一值得卡住的边界。
+	now := time.Date(2026, 10, 20, 23, 59, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	p := s.ForPlugin("bootnotice")
+	ctx := context.Background()
+
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("当日第 1 次不应失败: %v", err)
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("当日第 2 次应超出日预算，实际 err=%v", err)
+	}
+
+	now = now.Add(2 * time.Minute) // 跨到 10-21 00:01
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("跨日后应重新有额度，实际 err=%v", err)
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("两天各应发出 1 条，实际 %d 次", n)
+	}
+}
+
+// 账本不可用时必须 fail-closed：宁可少发一条，也不能把平台配额当无限量烧。
+func TestSenderActiveBudgetFailsClosedWithoutStore(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"digest": true},
+		DailyPerPeer: 5,
+	}, nil)
+	p := s.ForPlugin("digest")
+
+	err := p.SendActive(context.Background(), host.SceneC2C, "u1",
+		host.Reply{Image: host.ImageFromBytes(tinyPNG())})
+	if !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("没有账本时应按额度不可用拒绝，实际 err=%v", err)
+	}
+	if n := f.callCount(); n != 0 {
+		t.Fatalf("账本不可用时不该发 HTTP，实际 %d 次", n)
+	}
+	if n := f.uploadCount(); n != 0 {
+		t.Fatalf("账本不可用时不该上传，实际上传 %d 次", n)
+	}
+}
+
+// 库已经关掉时同样拒发——这是"记账失败"最现实的一种形态。
+func TestSenderActiveBudgetFailsClosedWhenStoreBroken(t *testing.T) {
+	db := newUsageStore(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("关库: %v", err)
+	}
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"digest": true},
+		DailyPerPeer: 5,
+	}, db)
+
+	if err := s.ForPlugin("digest").SendActive(context.Background(), host.SceneC2C, "u1",
+		host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("库不可用时应拒绝，实际 err=%v", err)
+	}
+	if n := f.callCount(); n != 0 {
+		t.Fatalf("库不可用时不该发 HTTP，实际 %d 次", n)
 	}
 }
 
