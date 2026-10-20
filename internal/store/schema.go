@@ -39,6 +39,20 @@ const activeUsageTableDDL = `CREATE TABLE IF NOT EXISTS active_usage (
 		PRIMARY KEY (day, scene, peer)
 	)`
 
+// sessionTableDDL 单独提出来只为读得清楚：它是"隐式路由"的唯一事实源，
+// 主键选择本身就是 ADR-0004 决策 1 的落地。
+//
+// 主键只有 peer：同 peer 同时只允许一个持有者。scene 是冗余列，只用于观测
+// 与消费校验——把它放进主键会得到 (scene, peer) 两个持有者，直接推翻决策 1。
+const sessionTableDDL = `CREATE TABLE IF NOT EXISTS sessions (
+		peer       TEXT PRIMARY KEY,
+		scene      TEXT NOT NULL DEFAULT '',
+		plugin     TEXT NOT NULL,
+		state      BLOB NOT NULL,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL
+	)`
+
 // schema 与 ARCHITECTURE.md §4.1 完全一致。
 // 迁移采用「幂等 DDL 列表」而非版本号：当前是脚手架，表结构变更时
 // 追加新的 ALTER 语句并留下注释；正式上线后建议切换到版本化迁移。
@@ -159,6 +173,13 @@ var schema = []string{
 	// 旧库此时还没有 peer 列，建索引会直接失败（reset_audit 踩过同一个坑）。
 	jobRunsTableDDL,
 	`CREATE INDEX IF NOT EXISTS idx_job_runs ON job_runs(job_id, started_at)`,
+
+	// sessions 是新表，旧库升级不需要迁移：幂等 DDL 直接把它建出来。
+	// 两个索引各有明确用途——expires 给 GC 的 DELETE 走索引，
+	// plugin 只服务排障查询（"重载后留下了哪些行"），不在热路径。
+	sessionTableDDL,
+	`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_sessions_plugin  ON sessions(plugin)`,
 }
 
 // jobTableDDL 单独提出来：旧库要把 jobs 从 id 主键重建成 (id, peer) 复合主键。

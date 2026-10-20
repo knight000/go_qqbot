@@ -36,9 +36,9 @@ func TestKVPeerIsolation(t *testing.T) {
 		}
 	}
 
-	n, err := db.ClearPeerSession(ctx, "g1")
-	if err != nil || n != 1 {
-		t.Fatalf("清理 g1 应删 1 行，实际 %d err=%v", n, err)
+	counts, err := db.ClearPeerSession(ctx, "g1")
+	if err != nil || counts.KVRows != 1 {
+		t.Fatalf("清理 g1 应删 1 行 KV，实际 %d err=%v", counts.KVRows, err)
 	}
 	if _, ok, _ := db.KVGet(ctx, "echo", "g1", "state"); ok {
 		t.Fatal("g1 的键应已删除")

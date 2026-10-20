@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
@@ -279,11 +280,30 @@ func (c *Core) groupStatus(ctx context.Context, ev *host.Event, args []string) {
 	} else {
 		fmt.Fprintf(&b, "准入 丢弃（%s）", reason)
 	}
-	fmt.Fprintf(&b, "\n开关 白名单 %s｜黑名单 %s\n",
+	fmt.Fprintf(&b, "\n%s\n", c.sessionLine(ctx, id))
+	fmt.Fprintf(&b, "开关 白名单 %s｜黑名单 %s\n",
 		onOff(c.whitelistEnabled()), onOff(c.blacklistEnabled()))
 	fmt.Fprintf(&b, "活跃 最近 %s｜首次 %s",
 		g.LastSeenAt.Format("01-02 15:04"), g.FirstSeenAt.Format("01-02 15:04"))
 	c.replyText(ctx, ev, b.String())
+}
+
+// sessionLine 描述该群的会话接管状态。
+//
+// 查库失败只让这一行显示"读取失败"，不让整个 status 失败：其余字段仍然有用，
+// 而且"看不清会话"正是最需要看到准入与开关的时候。
+func (c *Core) sessionLine(ctx context.Context, peer string) string {
+	row, ok, err := c.store.Session(ctx, peer)
+	if err != nil {
+		c.log.Warn("读取群会话失败", "group", peer, "err", err)
+		return "会话 读取失败"
+	}
+	// 过期的行还在库里（GC 还没跑）时对用户就是"没有会话"，与读路径同一口径。
+	now := time.Now()
+	if !ok || sessionExpired(row.ExpiresAt, now) {
+		return "会话接管 无"
+	}
+	return fmt.Sprintf("会话接管 插件 %s｜剩余 %s", row.Plugin, humanRemain(row.ExpiresAt.Sub(now)))
 }
 
 func (c *Core) groupOverview(ctx context.Context, ev *host.Event) {
@@ -296,6 +316,13 @@ func (c *Core) groupOverview(ctx context.Context, ev *host.Event) {
 	msg := fmt.Sprintf("群准入\n白名单 %s｜黑名单 %s\n在群 %d｜白名单 %d｜黑名单 %d",
 		onOff(c.whitelistEnabled()), onOff(c.blacklistEnabled()),
 		st.InUse(), st.Allowed, st.Denied)
+	// 进行中的会话数：0 时整项省略，与下面「已退出」同风格——
+	// 一行恒为 0 的数字只是噪声。
+	if n, err := c.store.CountSessions(ctx); err != nil {
+		c.log.Warn("统计会话失败", "err", err)
+	} else if n > 0 {
+		msg += fmt.Sprintf("\n会话接管 %d 个", n)
+	}
 	if st.Left > 0 {
 		msg += fmt.Sprintf("\n已退出 %d（保留记录，不参与 refresh）", st.Left)
 	}

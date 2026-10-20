@@ -245,6 +245,28 @@ func (t *Trace) Denied(m Match, ev *host.Event) {
 		t.stamp(), m.Manifest.Name, cmd, m.Perm.String(), what))
 }
 
+// Session 打印一次会话接管。这是"谁触发了我"在会话路径上的唯一答案：
+// 消息没有命中任何命令就被某个插件拿走了，静态匹配那套轨迹（命中/未命中/
+// 未让位）全都不适用。
+//
+// 两个级别都打（ADR-0004 决策 11）：plugin 级只回答"谁触发了我"，
+// 而这条线上除了这行没有别的线索；full 级再补 peer 与剩余时间。
+func (t *Trace) Session(m Match, ev *host.Event, remaining time.Duration) {
+	if !t.enabled() {
+		return
+	}
+	name := m.Manifest.Name
+	if m.Manifest.Version != "" {
+		name += " v" + m.Manifest.Version
+	}
+	if t.full() {
+		t.emit(fmt.Sprintf("%s 会话接管 · 插件 %s · peer %s · 剩余 %s\n",
+			t.stamp(), name, dash(ev.PeerID), humanRemain(remaining)))
+		return
+	}
+	t.emit(fmt.Sprintf("%s 会话接管 · 插件 %s\n", t.stamp(), name))
+}
+
 // Blocked 打印"同组前序插件不让位，所以我没执行"的匹配者。
 //
 // 它只在 full 级别输出：plugin 级别只回答"谁触发了我"，被挡住的人没有触发任何人。

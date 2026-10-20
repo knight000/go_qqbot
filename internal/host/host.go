@@ -43,8 +43,14 @@ import (
 //     插件不再自己 CutPrefix / HasPrefix；
 //   - Event.Mentioned / Event.Raw 暴露“是否 @ 了机器人”与原始载荷。
 //
+// 版本 9：Host 新增 Session()：插件可接管某个 peer 的下一条消息（ADR-0004）。
+//   - Manifest/Command 无需任何改动，但 `Host` 是接口，自实现 Host 的测试替身
+//     必须补这个方法；
+//   - Event.Session 非 nil 表示这条消息是对本插件 Await 的回应，内容是
+//     Await 时写入的 state，此时 Command / Args 恒为空。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "8"
+const APIVersion = "9"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //
@@ -155,6 +161,11 @@ type Event struct {
 	// Actor 是调用者身份与权限，由核心在投递插件之前填好：网关填群内角色，
 	// 核心填 Bot 角色。插件只读——判权不落在插件里，插件漏写检查也不会越权。
 	Actor Principal
+
+	// Session 非 nil 表示这条消息是对本插件 Await 的回应，此时 Command / Args
+	// 恒为空。核心只在会话接管命中时填它，静态路由永不为它赋值——
+	// 所以插件用「Session != nil」判断"这是我的问题答案"，不必再看内容。
+	Session *SessionContext
 }
 
 func (e *Event) IsMessage() bool { return e.Kind == KindMessage }
@@ -365,6 +376,9 @@ type Host interface {
 	// Renderer 返回把 markdown 画成图片的能力。永不为 nil：未装配时返回
 	// 一个拒绝一切的替身，插件不必写判空分支。
 	Renderer() Renderer
+	// Session 返回接管"某个 peer 的下一条消息"的能力（ADR-0004）。
+	// 永不为 nil，理由同 Renderer。
+	Session() Session
 }
 
 // Command 是声明式路由规则：前缀或正则二选一。

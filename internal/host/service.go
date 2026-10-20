@@ -83,6 +83,8 @@ type Options struct {
 	Domains []string
 	// Renderer 为零值时由 NewService 换成拒绝性替身，见 Renderer()。
 	Renderer Renderer
+	// Session 为零值时同样换成拒绝性替身，见 Session()。
+	Session SessionBackend
 }
 
 // Service 是 Host 的实现，每个插件一份。
@@ -98,6 +100,7 @@ type Service struct {
 	sender    Sender
 	admin     AdminBackend
 	renderer  Renderer
+	session   Session
 }
 
 func NewService(o Options) *Service {
@@ -117,6 +120,7 @@ func NewService(o Options) *Service {
 		sender:    o.Sender,
 		admin:     o.Admin,
 		renderer:  resolveRenderer(o.Renderer),
+		session:   resolveSession(o.Session, o.Name),
 	}
 }
 
@@ -131,6 +135,9 @@ func (s *Service) Log() *slog.Logger    { return s.log }
 
 // Renderer 返回注入的渲染能力；未注入时是拒绝性替身，永不为 nil。
 func (s *Service) Renderer() Renderer { return s.renderer }
+
+// Session 返回会话接管能力；未注入时是拒绝性替身，永不为 nil。
+func (s *Service) Session() Session { return s.session }
 
 // PeerKV 返回该会话私有的 KV 命名空间。
 //
