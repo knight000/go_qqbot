@@ -241,6 +241,60 @@ func TestSenderPassiveSeqKeepsRisingAfterWindowExpiry(t *testing.T) {
 	}
 }
 
+// 序号表的条目数必须有上界：map 随 msg_id 无限增长就是一次慢性 OOM。
+// 超过 seqCap 时淘汰最久未用的条目，代价是那条 msg_id 的序号从 1 重来——
+// 这是刻意的取舍，测试把它钉住，免得将来有人"顺手"去掉上限。
+func TestSenderPassiveSeqTableIsBounded(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	ctx := context.Background()
+
+	send := func(msgID string) int {
+		t.Helper()
+		ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: msgID}
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("%s 回复失败: %v", msgID, err)
+		}
+		body, _ := f.lastBody()
+		return body.MsgSeq
+	}
+
+	for i := 0; i < seqCap; i++ {
+		send(fmt.Sprintf("m%d", i))
+	}
+	if n := len(s.windows); n > seqCap {
+		t.Fatalf("序号表应被限制在 %d 条以内，实际 %d", seqCap, n)
+	}
+	// 新 msg_id 挤进来时淘汰最久未用的 m0；它再出现只能从 1 重来。
+	send("new")
+	if got := send("m0"); got != 1 {
+		t.Fatalf("被淘汰的 msg_id 重来时应从 1 开始，实际 seq=%d", got)
+	}
+}
+
+// 序号条目最终要被回收，而不是只靠 seqCap 兜底：一条消息的 msg_id 在
+// 窗口过期 24 小时后不可能再被重试，那时 seq 从头数就是安全的。
+func TestSenderPassiveSeqRetentionExpires(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+	ctx := context.Background()
+
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+		t.Fatalf("首次回复失败: %v", err)
+	}
+
+	now = now.Add(25 * time.Hour) // 窗口早已过期，序号保留期也过了
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+		t.Fatalf("保留期后回复失败: %v", err)
+	}
+	if got := f.bodyAt(1).MsgSeq; got != 1 {
+		t.Fatalf("保留期过后应重新从 1 计数，实际 seq=%d", got)
+	}
+}
+
 // 本地日预算必须在发 HTTP 之前扣除，用尽后不再打扰平台。
 func TestSenderActiveDailyBudget(t *testing.T) {
 	f := &fakeAPI{}

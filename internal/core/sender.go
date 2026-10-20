@@ -71,6 +71,7 @@ type Sender struct {
 	mu      sync.Mutex
 	windows map[string]*passiveWindow
 	lastGC  time.Time
+	order   uint64
 }
 
 type passiveWindow struct {
@@ -83,9 +84,10 @@ type passiveWindow struct {
 	limit   int
 	ttl     time.Duration
 	expires time.Time
-	// lastUsed 是 seqRetention 的依据：窗口过期了也只是"额度归零"，
-	// 条目本身要留到 msg_id 不可能再被重试之后才删。
-	lastUsed time.Time
+	// lastOrder 是进程内的单调访问序号，只用于淘汰（seqCap 满时踢最旧的）。
+	// 不拿 expires 或墙钟当 LRU 依据：Windows 的时间戳粒度够粗，
+	// 同一毫秒里建的一批窗口会并列"最久未用"，淘汰谁就变成随机的。
+	lastOrder uint64
 }
 
 func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore) *Sender {
@@ -222,7 +224,8 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 	}
 	w.used++
 	w.seq++
-	w.lastUsed = now
+	s.order++
+	w.lastOrder = s.order
 	return w.seq, nil
 }
 
@@ -230,12 +233,13 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 // 但序号必须活得更久：删早了，窗口过期后同一个 msg_id 的 seq 就从 1 重来。
 //
 // 这两个常量是"内存上界"的全部答案：
-//   - seqRetention 覆盖了平台任何合理的重试跨度（远大于 60 分钟窗口）；
-//   - seqCap 给条目数一个硬上界（每条 ~80 字节，8192 条约 0.6 MB）。
+//   - seqRetention 是窗口过期后再留多久，覆盖平台任何合理的重试跨度
+//     （远大于 60 分钟的窗口上限）；
+//   - seqCap 给条目数一个硬上界（每条 ~64 字节，8192 条约 0.5 MB）。
 //
 // 代价写清楚：超过上界时淘汰最久未用的 msg_id，它若再出现，seq 会从 1 重来。
 // 这个代价是刻意选的——无界增长换来的"绝对单调"会在长期运行里变成 OOM，
-// 而 8192 个活跃 msg_id 对当前规模（一天几十到几百条消息）来说够用两个数量级。
+// 而 8192 个活跃 msg_id 对当前规模（一天几十到几百条消息）够用两个数量级。
 const (
 	seqRetention = 24 * time.Hour
 	seqCap       = 8192
@@ -243,15 +247,15 @@ const (
 
 // gcLocked 清掉久未使用的窗口。调用方需持锁。
 //
-// 注意判据是 lastUsed + seqRetention，而不是 expires：
-// 过期窗口还要留着序号，删了序号就丢了。
+// 判据是 expires + seqRetention 而不是 expires：过期窗口还要留着序号，
+// 按 expires 删等于把 seq 一起删掉，下一个同 msg_id 的回复又从 1 开始。
 func (s *Sender) gcLocked(now time.Time) {
 	if now.Sub(s.lastGC) < time.Minute {
 		return
 	}
 	s.lastGC = now
 	for k, w := range s.windows {
-		if now.Sub(w.lastUsed) > seqRetention {
+		if now.After(w.expires.Add(seqRetention)) {
 			delete(s.windows, k)
 		}
 	}
@@ -261,16 +265,16 @@ func (s *Sender) gcLocked(now time.Time) {
 // 只在新 msg_id 进来且已满时调用，所以 O(n) 的扫描是可控的（n=8192）。
 func (s *Sender) evictOldestLocked() {
 	var (
-		oldestKey string
-		oldestAt  time.Time
-		first     bool
+		oldestKey   string
+		oldestOrder uint64
+		found       bool
 	)
 	for k, w := range s.windows {
-		if first || w.lastUsed.Before(oldestAt) {
-			oldestKey, oldestAt, first = k, w.lastUsed, false
+		if !found || w.lastOrder < oldestOrder {
+			oldestKey, oldestOrder, found = k, w.lastOrder, true
 		}
 	}
-	if oldestKey != "" {
+	if found {
 		delete(s.windows, oldestKey)
 	}
 }
