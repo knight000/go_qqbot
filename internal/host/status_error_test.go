@@ -172,10 +172,10 @@ func TestHostHTTPContextTimeoutNotWrapped(t *testing.T) {
 	}
 }
 
-func TestAPIVersionIsSeven(t *testing.T) {
-	// 版本号就是「插件能依赖什么」的声明：新增 HTTPStatusError 必须体现在这里，
-	// 否则插件按 6 声明的能力去读新类型，核心却可能没提供。
-	if APIVersion != "7" {
-		t.Fatalf("APIVersion=%q，期望 \"7\"", APIVersion)
+func TestAPIVersionIsEight(t *testing.T) {
+	// 版本号就是「插件能依赖什么」的声明：Manifest.Yield 取代 Broadcast 等契约
+	// 变更必须体现在这里，否则插件按 7 声明的能力去读新字段，核心却可能没提供。
+	if APIVersion != "8" {
+		t.Fatalf("APIVersion=%q，期望 \"8\"", APIVersion)
 	}
 }

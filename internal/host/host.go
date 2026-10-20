@@ -33,7 +33,16 @@ import (
 //
 // 版本 7：Host.HTTP 的非 2xx 统一返回 *HTTPStatusError，插件不必 import
 // internal/httpx 就能分辨 429 与普通失败。
-const APIVersion = "7"
+//
+// 版本 8：批内三张票共用这一个版本（#11 / #12 / #13），因为它们同期落地、
+// 插件本来就要一起改：
+//   - Manifest.Yield 取代 Broadcast：是否让位由每个匹配者自己声明（§3.4）；
+//   - Event.Command / Event.Args 由核心填好，前缀匹配按词边界（`/md5` 不再
+//     命中 `/md`）；
+//   - Event.Mentioned / Event.Raw 暴露"是否 @ 了机器人"与原始载荷。
+//
+// 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
+const APIVersion = "8"
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -337,13 +346,17 @@ type Manifest struct {
 	Capabilities []string
 	Intents      []string // 订阅的事件：`message` 这样的大类，或 `group.message` 这样的场景限定
 	Commands     []Command
-	// Broadcast 让中标插件声明“同优先级的其它插件也执行”。
+	// Yield 声明"本插件处理完是否让位给同 priority 的下一个匹配者"。
 	//
-	// 它只对中标者生效：候选先按 priority 降序、同 priority 按插件名字典序升序
-	// 排序（Router.Match），再取第一个有权限的作为中标者（Dispatcher.handle）。
-	// 所以名字靠前的 Broadcast=false 会压掉靠后的 Broadcast=true，且没有提示——
-	// 已知缺陷，取舍与替代方案见评审 §2.3。
-	Broadcast      bool
+	// 零值 false = 阻断，也是默认行为：只跑一个插件，避免两个插件同时回、
+	// 消耗两次被动额度。设 true 表示"我处理完，同组后面的插件接着处理"。
+	// 只在同 priority 组内生效，跨 priority 不扇出（§3.4）；让位链在第一个
+	// 不让位者处截止，被挡住的插件会出现在 full 级轨迹里。
+	//
+	// 它取代了旧字段 Broadcast：那时"是否继续"挂在排序第一的插件上，名字靠前的
+	// false 会压掉靠后的 true，且没有任何提示（评审 §2.3）。现在每个匹配者
+	// 只决定自己的让位，不再替别人做决定。
+	Yield          bool
 	AllowedDomains []string
 	// ConfigSchema 声明本插件需要 [plugins.<name>] 里的哪些键、各是什么类型，
 	// 由核心在装配期（Init 之前）校验，见 Manifest.ValidateConfig（评审 §4.1）。
