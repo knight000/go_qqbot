@@ -33,9 +33,9 @@ func (p *Plugin) Manifest() host.Manifest {
 			{Prefix: "!ping", Priority: 100, Description: "连通性检查"},
 			{Prefix: "!echo", Priority: 100, Description: "回显文本"},
 		},
-		ConfigSchema: map[string]string{
-			"reply_prefix": "string",
-		},
+		// 本插件所有配置键都有默认值（reply_prefix 默认空串），因此不写进
+		// config_schema：schema 是「声明即必填」，写进去等于把它变成必填，
+		// 既有部署没写这一段就会在装配期启动失败。
 	}
 }
 
