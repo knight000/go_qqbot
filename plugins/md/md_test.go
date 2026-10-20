@@ -42,6 +42,10 @@ func (f *fakeHost) Renderer() host.Renderer {
 	return f.r
 }
 
+// Session 对本插件无用（md 不做多轮交互），返回 nil 即可：
+// 这里要的只是"接口完整"，与 Renderer 的契约测试不是一回事。
+func (f *fakeHost) Session() host.Session { return nil }
+
 type unavailable struct{}
 
 func (unavailable) Markdown(context.Context, string) (host.Image, error) {

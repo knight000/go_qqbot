@@ -114,6 +114,19 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 	return r, nil
 }
 
+// Lookup 按插件名取路由项，未加载时返回 nil。
+//
+// 线性查找而不是建 map：插件数量是个位数，而给 Router 加第二份索引意味着
+// 两处状态要保持一致；会话投递只在命中会话行时调用，不在每条消息的热路径上。
+func (r *Router) Lookup(name string) *route {
+	for _, rt := range r.routes {
+		if rt.manifest.Name == name {
+			return rt
+		}
+	}
+	return nil
+}
+
 // Match 返回按 priority 降序排列的候选：priority 降序，同 priority 按插件名升序。
 // 这个顺序就是 Dispatcher 的执行顺序——同组内逐个执行，遇到不让位者为止（§3.4），
 // 所以排序必须确定，不能依赖 map 遍历。

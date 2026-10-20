@@ -436,3 +436,29 @@ func TestNewWiresGroupNamesToTrace(t *testing.T) {
 		t.Fatalf("未登记的群不应编名字，实际 %q", got)
 	}
 }
+
+// 会话接管在 plugin 级也要有一行：这条路径没有命令命中，静态匹配那套轨迹
+// 全都不适用，不给这行的话"谁触发了我"就没有任何答案。
+func TestTraceSessionAtBothLevels(t *testing.T) {
+	m := Match{Manifest: host.Manifest{Name: "md", Version: "0.1"}}
+	ev := &host.Event{PeerID: "g1", Scene: host.SceneGroup}
+
+	full := &syncBuffer{}
+	NewTrace(full, LevelFull).Session(m, ev, 4*time.Minute+12*time.Second)
+	got := full.String()
+	for _, want := range []string{"会话接管", "md v0.1", "g1", "剩余 4 分 12 秒"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("full 级应包含 %q，实际: %q", want, got)
+		}
+	}
+
+	plugin := &syncBuffer{}
+	NewTrace(plugin, LevelPlugin).Session(m, ev, time.Minute)
+	got = plugin.String()
+	if !strings.Contains(got, "会话接管 · 插件 md v0.1") {
+		t.Errorf("plugin 级应有一行接管提示，实际: %q", got)
+	}
+	if strings.Contains(got, "g1") {
+		t.Errorf("plugin 级不该带 peer，实际: %q", got)
+	}
+}
