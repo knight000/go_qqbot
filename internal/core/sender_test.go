@@ -5,12 +5,28 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/store"
 )
+
+// newUsageStore 开一个临时库，供主动消息日预算的测试使用（预算已落库）。
+func newUsageStore(t *testing.T) *store.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatalf("打开测试库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+	return db
+}
 
 // fakeAPI 记录每一次出站，并实现 groupInfoSource。
 //
@@ -117,7 +133,7 @@ func (f *fakeAPI) lastBody() (api.MessageBody, bool) {
 
 func TestSenderPassiveLimitGroup(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{})
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
 	ctx := context.Background()
 
@@ -139,7 +155,7 @@ func TestSenderPassiveLimitGroup(t *testing.T) {
 
 func TestSenderPassiveLimitC2C(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{})
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
 	ev := &host.Event{Scene: host.SceneC2C, PeerID: "u1", MsgID: "m2"}
 	ctx := context.Background()
 
@@ -154,7 +170,7 @@ func TestSenderPassiveLimitC2C(t *testing.T) {
 }
 
 func TestSenderActiveDisabled(t *testing.T) {
-	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{})
+	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
 	if err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
 		t.Fatalf("主动消息总开关关闭时应拒绝，实际 err=%v", err)
 	}
@@ -167,7 +183,7 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 5,
-	})
+	}, newUsageStore(t))
 
 	if err := s.ForPlugin("evil").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
 		t.Fatalf("非白名单插件应被拒绝，实际 err=%v", err)
@@ -194,7 +210,7 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 2,
-	})
+	}, newUsageStore(t))
 	p := s.ForPlugin("bootnotice")
 	ctx := context.Background()
 
@@ -212,5 +228,50 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 	// 预算是按 peer 计的，换个收件人不受影响
 	if err := p.SendActive(ctx, host.SceneC2C, "u2", host.Reply{Content: "x"}); err != nil {
 		t.Fatalf("其他收件人不应受影响: %v", err)
+	}
+}
+
+// 日预算落库的全部意义：进程重启（关库、重开、换一个 Sender）不能清零，
+// 否则"重启循环不会烧额度"这句注释仍然是假的。
+func TestSenderActiveBudgetSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "restart.db")
+	open := func() *store.DB {
+		db, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("打开测试库: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		if err := db.Migrate(context.Background()); err != nil {
+			t.Fatalf("迁移: %v", err)
+		}
+		return db
+	}
+	policy := ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 2,
+	}
+	ctx := context.Background()
+
+	first := open()
+	f := &fakeAPI{}
+	p := NewSender(f, slog.New(slog.DiscardHandler), policy, first).ForPlugin("bootnotice")
+	for i := 0; i < 2; i++ {
+		if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+			t.Fatalf("第 %d 次不应失败: %v", i+1, err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("关库: %v", err)
+	}
+
+	second := open()
+	f2 := &fakeAPI{}
+	p2 := NewSender(f2, slog.New(slog.DiscardHandler), policy, second).ForPlugin("bootnotice")
+	if err := p2.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("重启后当日额度应仍是用尽的，实际 err=%v", err)
+	}
+	if n := f2.callCount(); n != 0 {
+		t.Fatalf("额度已尽时不应发 HTTP，实际 %d 次", n)
 	}
 }
