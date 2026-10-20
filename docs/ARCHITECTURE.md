@@ -179,7 +179,7 @@ Manifest {
   capabilities 保留字段：核心从不读取，不构成任何门控；等出现第二个真实消费方再启用（评审 §4.1）
   intents      需要订阅的事件类型
   commands     匹配规则：前缀或正则二选一（Priority 越大越先）
-  broadcast    中标者声明“同优先级的其它插件也执行”（默认 false，语义见 §3.4）
+  yield        处理完是否让位给同 priority 的下一个匹配者（零值 false = 阻断，语义见 §3.4）
   config_schema 启动期校验，支持四种类型：string / bool / int / duration（评审 §4.1）
 }
 
@@ -195,6 +195,18 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 - `commands` 的 **@提及匹配当前未实现**：网关解出 `mentions` 后即丢弃，路由层只有前缀与正则两种方式（评审 §4.2，票 #13）。
 - 同优先级冲突的静态检测**当前未实现**：两条规则同时命中不会报错，启动期也发现不了。实际行为见 §3.4（评审 §4.7 第一行 / §2.3）。
 - `capabilities` 是**保留字段**，当前不参与任何门控；真正起门控作用的是哪三项，见 §3.3 末段（评审 §4.1）。
+
+#### 契约版本历史（`api_version`）
+
+`api_version` 是**整体匹配**：`Manifest.APIVersion` 必须与本核心的 `host.APIVersion` 完全相等，没有“兼容上一版”的余地。所以同期落地的互不兼容改动共用一个版本号，下表每一行都是“插件要跟着改什么”的完整清单。
+
+| 版本 | 契约变化 | 票号 |
+|---|---|---|
+| 4 | 任务支持会话维度（`JobSpec.PerPeer` / `JobSpec.Peer`），`JobRunner` 可能收到非空的 `Peer` | — |
+| 5 | `Host` 新增 `Renderer()`，插件可把 markdown 文档源画成图片（§3.8） | — |
+| 6 | `Host.HTTP` 新增 `GetJSONWithHeader`（带鉴权头）、`GetJSONOnce`（不重试）、`WithTimeout`（按请求放宽超时，共享连接池与限流状态） | — |
+| 7 | `Host.HTTP` 的非 2xx 统一返回 `*HTTPStatusError`，插件不必 import `internal/httpx` 就能分辨 429 与普通失败 | — |
+| 8 | ① `Manifest.Yield` 取代 `Broadcast`：是否让位由每个匹配者自己声明（§3.4），`broadcast` 字段删除；② `Event.Command` / `Event.Args` 由核心填好，前缀匹配按词边界（`/md5` 不再命中 `/md`）；③ `Event.Mentioned` / `Event.Raw` 暴露“是否 @ 了机器人”与原始载荷 | #11 / #12 / #13 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
@@ -225,14 +237,17 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 事件 → 去重（event_id）→ 落库 → 按 intents 过滤 → 每个插件内取 priority 最高的命中命令
      → 候选按 priority 降序、同 priority 按插件名升序排列
      → 跳过无权限的 → 第一个有权限的是中标者，默认只跑它
-     → 中标者的 broadcast=true 时，同 priority 且有权的一起跑
+     → 按 priority 分组，组内按上述顺序逐个执行；每个匹配者自己声明是否让位，
+       遇到不让位者就停在这个插件（跨 priority 不扇出）
      → 全未命中 → 静默：核心不回任何内容，也没有可配置的默认提示语
 ```
 
 - 路由在**插件的 matcher 表**上做，核心不解析业务语义。
-- 默认只跑一个插件，避免“两个插件同时回、消耗 5 次被动额度”。
-- **谁中标由排序决定**：`priority` 降序，同 `priority` 按**插件名字典序**升序。无权限的候选在排序后被跳过，不阻塞后续插件（权限先于优先级）。同一插件内多条命令同时命中时，取 `priority` **严格**最大的一条，并列则取声明在前的（比较用 `>` 而非 `>=`）。未声明 `commands` 的插件匹配该 intent 的全部事件，`priority` 按 0 计。
-- `broadcast` 是**中标插件自己的字段**，不是层级属性：`aaa`（priority 100，`broadcast=false`）与 `zzz`（priority 100，`broadcast=true`）同时命中时，`aaa` 中标且不扇出，`zzz` 永不执行，日志里没有任何提示。这是已知缺陷（评审 §2.3）——按层级声明扇出的语义**当前未实现**，“这一层要不要扇出”本应是层级属性，却被实现成排序第一名的个人属性。修正见票 #11（per-plugin `Yield`）；在那之前**不要用 `broadcast` 表达“同级的都要跑”**。
+- 默认只跑一个插件，避免“两个插件同时回、消耗 5 次被动额度”。这个默认由 `yield` 的零值承担：不写 `yield` 就是不让位，执行完即结束。
+- **谁先执行由排序决定**：`priority` 降序，同 `priority` 按**插件名字典序**升序。无权限的候选在排序后被跳过，不阻塞后续插件（权限先于优先级）。同一插件内多条命令同时命中时，取 `priority` **严格**最大的一条，并列则取声明在前的（比较用 `>` 而非 `>=`）。未声明 `commands` 的插件匹配该 intent 的全部事件，`priority` 按 0 计。
+- `yield` 是**每个匹配者自己的声明**，不是中标者的个人属性。同 priority 的候选按上面的顺序排队逐个执行：谁写 `yield=true`，谁处理完就让位给组内下一个；第一个 `yield=false` 的插件执行完，组内**剩下的一律不执行**（不是“跳过它继续”）。`aaa`（100，`yield=false`）与 `zzz`（100，`yield=true`）同时命中时只跑 `aaa`，`zzz` 因 `aaa` 阻断而未执行；反过来两者都跑。这个阻断关系在 full 级轨迹里每个被挡住的插件各占一行（`未执行 · 插件 … （… 未让位）`），不再有“静默不执行”。组内**无权限**的候选照旧跳过并记一行 `权限不足`，跳过本身不改变“是否继续”。
+- **跨 priority 不扇出**：`yield` 只在同 priority 组内生效。高优先级插件让位，去处是同组的下一个匹配者，不是低优先级插件——低优先级仍只在前者全部无权时才可能被考虑。
+- **核心保留前缀**：`/claim`、`/admin`、`/group`、`/reset`、`/reload`、`/restart` 由核心以最高优先级独占处理，插件在启动期若声明了相同前缀，**直接拒绝加载并报错**。否则一个第三方插件就能劫持重置指令，等于把第 8 章的鉴权整个绕过去。清单必须与 `handleReserved` 的 case 严格对应——多列一个会白占名字，少列一个会让核心静默遮蔽插件声明的同名命令。`/grant`、`/revoke` 的功能已由 `/admin add|rm` 取代，指令删除后名字一并释放。
 - **核心保留前缀**：`/claim`、`/admin`、`/group`、`/reset`、`/reload`、`/restart` 由核心以最高优先级独占处理，插件在启动期若声明了相同前缀，**直接拒绝加载并报错**。否则一个第三方插件就能劫持重置指令，等于把第 8 章的鉴权整个绕过去。清单必须与 `handleReserved` 的 case 严格对应——多列一个会白占名字，少列一个会让核心静默遮蔽插件声明的同名命令。`/grant`、`/revoke` 的功能已由 `/admin add|rm` 取代，指令删除后名字一并释放。
 
 ### 3.5 插件目录与复用方式
