@@ -144,6 +144,11 @@ func TestRouterMatchPrefixArgs(t *testing.T) {
 		{in: "!echo5 hi", prefix: "!echo", hit: false, note: "默认要求词边界，不能吃掉 !echo5"},
 		{in: "!echox", prefix: "!echo", hit: false},
 		{in: "hello", prefix: "!echo", hit: false},
+		// 票 #12 的验收形状：/md、/md 内容、/md\n内容 命中且 Args 一致，/md5 不命中。
+		{in: "/md", prefix: "/md", command: "/md", args: "", hit: true},
+		{in: "/md 内容", prefix: "/md", command: "/md", args: "内容", hit: true},
+		{in: "/md\n内容", prefix: "/md", command: "/md", args: "内容", hit: true},
+		{in: "/md5 abc", prefix: "/md", hit: false, note: "未声明 Loose 时 /md5 不算 /md"},
 		// 显式放宽才退回裸前缀语义，参数从紧邻处开始。
 		{in: "!echo5 hi", prefix: "!echo", loose: true, command: "!echo", args: "5 hi", hit: true},
 	}
