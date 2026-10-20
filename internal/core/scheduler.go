@@ -28,15 +28,21 @@ type Scheduler struct {
 
 	// slots 是并行度信号量，桶启动前占用、结束后释放；容量即并行度。
 	slots chan struct{}
-	// idle 在 running 降到 0 时关闭，供 Wait 使用；running > 0 时才有值。
+	// idle 在 running 从 0 变 1 时重建、归零时关闭，供 Wait 使用。
 	idle    chan struct{}
 	running int
 
 	mu      sync.Mutex
 	specs   map[string]host.JobSpec
 	runners map[string]host.JobRunner
-	busy    map[string]bool // plugin -> 该插件的桶正在执行
+	busy    map[string]bool // plugin -> 该插件的桶已被领走（含还在等槽的）
 	started bool
+	stopped bool
+	// runCtx 是调度器自己的生命周期 ctx：在跑的任务与扫描都用它，Stop 取消它。
+	// 不能只依赖 Start 收到的 ctx：/reload 走 RestartRequests 分支，main 在
+	// Close 之前都没有取消那个 ctx。
+	runCtx  context.Context
+	stopRun context.CancelFunc
 }
 
 const (
@@ -63,12 +69,15 @@ func NewScheduler(db *store.DB, log *slog.Logger) *Scheduler {
 		log.Warn("加载时区失败，回退 UTC", "err", err)
 		tz = time.UTC
 	}
+	runCtx, stopRun := context.WithCancel(context.Background())
 	return &Scheduler{
 		db:      db,
 		log:     log,
 		tz:      tz,
 		parser:  cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor),
 		slots:   make(chan struct{}, jobParallel),
+		runCtx:  runCtx,
+		stopRun: stopRun,
 		specs:   make(map[string]host.JobSpec),
 		runners: make(map[string]host.JobRunner),
 		busy:    make(map[string]bool),
@@ -204,38 +213,76 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	// per-peer 数量必须单独打出来：只有一个群都没进时它是 0，
 	// 而"任务已注册"与"任务正跑在 0 个群上"在日志里长得一模一样。
 	s.log.Info("调度器启动", "任务", len(keep), "per_peer", perPeer)
-	go s.loop(ctx)
+
+	// 父 ctx 取消（信号退出）等价于 Stop；/reload 路径父 ctx 不会取消，
+	// 由 Core.Shutdown 显式调用 Stop。
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.Stop()
+		case <-s.runCtx.Done():
+		}
+	}()
+	go s.loop()
 	return nil
 }
 
-func (s *Scheduler) loop(ctx context.Context) {
+// Stop 停止调度：此后的扫描不再领任务，在跑的任务收到取消信号。
+//
+// 必须在 Wait 之前调用。只依赖 Start 收到的 ctx 是不够的：/reload 走
+// RestartRequests 分支，main 到 Close 之前都没有取消那个 ctx，此时不主动
+// 停就会在关插件、关库之后继续起新桶。
+func (s *Scheduler) Stop() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	cancel := s.stopRun
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Scheduler) loop() {
 	t := time.NewTicker(tickInterval)
 	defer t.Stop()
 
-	s.runDue(ctx)
+	s.runDue()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-s.runCtx.Done():
 			return
 		case <-t.C:
-			s.runDue(ctx)
+			s.runDue()
 		}
 	}
 }
 
-func (s *Scheduler) runDue(ctx context.Context) {
+func (s *Scheduler) runDue() {
+	if s.isStopped() {
+		return
+	}
 	now := time.Now()
 	// 忙的插件必须在 SQL 里排除，不能取回来再在内存里丢：limit 是按
 	// next_run_at 取的，一个卡住的插件积压上百行 per-peer 实例时会占满
 	// 整个窗口，其他插件的到期任务永远轮不到。
-	jobs, err := s.db.DueJobs(ctx, now.Unix(), dueJobLimit, s.busyPlugins()...)
+	jobs, err := s.db.DueJobs(s.runCtx, now.Unix(), dueJobLimit, s.busyPlugins()...)
 	if err != nil {
 		s.log.Error("扫描任务失败", "err", err)
 		return
 	}
 	for _, bucket := range groupByPlugin(jobs) {
-		s.launch(ctx, bucket, now)
+		s.launch(bucket, now)
 	}
+}
+
+func (s *Scheduler) isStopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopped
 }
 
 // busyPlugins 取当前正在执行的插件快照。调用方在 runDue 里只用于 SQL 排除，
@@ -254,16 +301,19 @@ func (s *Scheduler) busyPlugins() []string {
 	return out
 }
 
+// jobBucket 是一轮扫描里属于同一个插件的到期实例。
+type jobBucket []store.Job
+
 // groupByPlugin 把一批到期任务按插件分桶，桶的顺序按各插件首次到期的时间。
 //
 // jobs 已由 DueJobs 按 next_run_at 升序排好，按首次出现分组即可保持这个顺序；
 // 用 map 只做"桶归并"，不遍历 map 取值，避免顺序随机。
-func groupByPlugin(jobs []store.Job) [][]store.Job {
+func groupByPlugin(jobs []store.Job) []jobBucket {
 	if len(jobs) == 0 {
 		return nil
 	}
 	index := make(map[string]int, len(jobs))
-	buckets := make([][]store.Job, 0, len(jobs))
+	buckets := make([]jobBucket, 0, len(jobs))
 	for _, j := range jobs {
 		i, ok := index[j.Plugin]
 		if !ok {
@@ -284,19 +334,21 @@ func groupByPlugin(jobs []store.Job) [][]store.Job {
 //
 // 代价是没有行锁，靠进程内的 busy 表防止同一个插件被两轮同时领走；这也意味着
 // 多实例部署时保护失效（当前由单实例锁保证只有一个进程，见 §2.1）。
-func (s *Scheduler) launch(ctx context.Context, jobs []store.Job, now time.Time) {
+func (s *Scheduler) launch(jobs jobBucket, now time.Time) {
 	if len(jobs) == 0 {
 		return
 	}
-	// 已取消就不再起新桶：关停时 Wait 可能正好观察到 running==0 而返回，
-	// 之后起桶会让任务在 db.Close 之后才跑起来。
+	ctx := s.runCtx
+	// 已取消就不再起新桶：Stop 之后起的新桶会让任务在 db.Close 之后才跑起来。
 	if ctx.Err() != nil {
 		return
 	}
 	plugin := jobs[0].Plugin
 
 	s.mu.Lock()
-	if s.busy[plugin] {
+	// stopped 与 busy 一起判：Wait 的快路径（running==0）与这里必须是同一个
+	// 临界区，否则 Stop 之后仍可能有桶挤进来，Wait 提前返回。
+	if s.stopped || s.busy[plugin] {
 		s.mu.Unlock()
 		return
 	}
@@ -341,22 +393,27 @@ func (s *Scheduler) finish(plugin string) {
 
 // Wait 等在跑的任务收尾，返回 false 表示 ctx 先到期。
 //
-// 关停时必须先等这里：任务还要写库（job_runs、next_run_at），晚于 db.Close
-// 只会得到一串 "database is closed"，而且在插件 Close 之后回调插件同样是错的。
+// 关停顺序是 Stop → Wait → 关插件 → 关库。Stop 让在跑的任务收到取消（它们
+// 大多在等 HTTP 或写库，会立刻返回），Wait 只负责等它们真正退出。晚于
+// db.Close 的写入只会得到一串 "database is closed"，而在插件 Close 之后
+// 回调它同样是错的。
 func (s *Scheduler) Wait(ctx context.Context) bool {
-	s.mu.Lock()
-	if s.running == 0 {
+	for {
+		s.mu.Lock()
+		if s.running == 0 {
+			s.mu.Unlock()
+			return true
+		}
+		idle := s.idle
 		s.mu.Unlock()
-		return true
-	}
-	idle := s.idle
-	s.mu.Unlock()
 
-	select {
-	case <-idle:
-		return true
-	case <-ctx.Done():
-		return false
+		// 等到这一批清空之后要重新检查：清空的瞬间可能有新桶进来
+		// （测试与 /reload 的关停路径下 ctx 未必先取消），一次 select 不够。
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 
