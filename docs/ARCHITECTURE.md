@@ -193,7 +193,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 
 `commands` 的匹配与回传（命令词边界与参数切分只有一份实现，在路由层）：
 
-- **前缀默认要求词边界**：命令词之后必须是空白（`unicode.IsSpace`）或字符串结尾，所以 `/md5 abc` 不命中 `/md`。确有需要裸前缀语义的写法显式声明 `loose: true`，退回 `strings.HasPrefix`；`loose` 只对前缀生效，与正则同时写不报错，也不起作用。
+- **前缀默认要求词边界**：命令词之后必须是空白（`unicode.IsSpace`）或字符串结尾，所以 `/md5 abc` 不命中 `/md`。确有需要裸前缀语义的写法显式声明 `loose=true`，退回 `strings.HasPrefix`；`loose` 只对前缀生效，只声明 `pattern` 时写了不报错，也不起作用。
 - **正则**按源码匹配（`FindStringIndex`），`Command` 回传的正是该正则源码。
 - 命中后核心把结果写进 `Event.Command` / `Event.Args` **再**调用 `Handle`。`Command` 是命中那条命令的写法（前缀原文或正则源码），未命中为空串；`Args` 是匹配片段之后、已 `TrimSpace` 的剩余原文——前缀按前缀的字节长度切，正则按匹配区间的结束位置切——未命中同样为空串。匹配前 `Content` 已 `TrimSpace` 过，所以 `/md 内容` 与 `/md\n内容` 的 `Args` 都是「内容」，只有 `/md` 是空串。
 - 插件**不再自己切分**：`md` 曾用 `CutPrefix` 加词边界判断兜住 `/md5`，`echo` 曾用 `HasPrefix` 链分派两条命令；现在两者都只读 `Event.Command` / `Event.Args`。一次派发执行多个插件时（§3.4 的扇出），每个插件拿到的是它自己命中那条命令的 `Command/Args`。
