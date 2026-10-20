@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -38,7 +40,7 @@ func (f *fakeRunner) seen() []string {
 	return append([]string(nil), f.peers...)
 }
 
-func newTestScheduler(t *testing.T) (*Scheduler, *store.DB) {
+func newTestScheduler(t testing.TB) (*Scheduler, *store.DB) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "sched.db"))
 	if err != nil {
@@ -268,5 +270,377 @@ func TestFirstGroupMessageExpandsPerPeerJobs(t *testing.T) {
 	peers := jobPeers(t, c.store, "digest:daily")
 	if !peers["g-new"] {
 		t.Fatalf("首次群消息后应补建任务实例: %v", peers)
+	}
+}
+
+// probeRunner 是可编排的 JobRunner：记账并发峰值、可阻塞、可制造失败，
+// 用来验证"按插件分桶串行、桶间并行"的语义。
+type probeRunner struct {
+	plugin string
+	global *globalProbe
+
+	mu       sync.Mutex
+	inflight int
+	peak     int
+	calls    []string
+
+	hold     chan struct{} // 非 nil 时每个任务都等它关闭
+	delay    time.Duration
+	failPeer string
+}
+
+func (r *probeRunner) Manifest() host.Manifest               { return host.Manifest{Name: r.plugin} }
+func (r *probeRunner) Init(context.Context, host.Host) error { return nil }
+func (r *probeRunner) Handle(context.Context, *host.Event) (*host.Reply, error) {
+	return nil, nil
+}
+
+func (r *probeRunner) RunJob(ctx context.Context, spec host.JobSpec) error {
+	r.mu.Lock()
+	r.inflight++
+	if r.inflight > r.peak {
+		r.peak = r.inflight
+	}
+	r.calls = append(r.calls, spec.Peer)
+	r.mu.Unlock()
+
+	if r.global != nil {
+		r.global.enter()
+	}
+	defer func() {
+		if r.global != nil {
+			r.global.leave()
+		}
+		r.mu.Lock()
+		r.inflight--
+		r.mu.Unlock()
+	}()
+
+	if r.hold != nil {
+		select {
+		case <-r.hold:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if r.delay > 0 {
+		time.Sleep(r.delay)
+	}
+	if r.failPeer != "" && spec.Peer == r.failPeer {
+		return errors.New("boom")
+	}
+	return nil
+}
+
+func (r *probeRunner) max() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.peak
+}
+
+func (r *probeRunner) ran() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+// globalProbe 跨多个 runner 记账，用来验证并行度上限。
+type globalProbe struct {
+	mu       sync.Mutex
+	inflight int
+	peak     int
+}
+
+func (g *globalProbe) enter() {
+	g.mu.Lock()
+	g.inflight++
+	if g.inflight > g.peak {
+		g.peak = g.inflight
+	}
+	g.mu.Unlock()
+}
+
+func (g *globalProbe) leave() {
+	g.mu.Lock()
+	g.inflight--
+	g.mu.Unlock()
+}
+
+func (g *globalProbe) max() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.peak
+}
+
+func waitScheduler(t *testing.T, s *Scheduler) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if !s.Wait(ctx) {
+		t.Fatal("调度任务未在 10s 内收尾")
+	}
+}
+
+// registerPerPeer 让某插件按给定群展开 per-peer 任务，并让所有实例立即到期。
+func registerPerPeer(t testing.TB, s *Scheduler, db *store.DB, plugin, name string, peers []string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, p := range peers {
+		if err := db.MarkGroupPresent(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Register(host.JobSpec{
+		Plugin: plugin, Name: name, Cron: "0 9 * * *", PerPeer: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dueNow(t, db, plugin+":"+name, plugin, peers)
+}
+
+func dueNow(t testing.TB, db *store.DB, id, plugin string, peers []string) {
+	t.Helper()
+	ctx := context.Background()
+	at := time.Now().Unix() - 10
+	if len(peers) == 0 {
+		peers = []string{""}
+	}
+	for _, p := range peers {
+		if err := db.UpsertJob(ctx, store.Job{
+			ID: id, Peer: p, Plugin: plugin, Spec: "0 9 * * *", NextRunAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// 同一插件的多个实例必须串行：插件实例按"调度器一次只调一个 Job"写的，
+// 并行化只允许发生在插件之间。
+func TestRunDueSerializesJobsOfSamePlugin(t *testing.T) {
+	s, db := newTestScheduler(t)
+	// 必须让任务真的持续一段时间：不延时的话三个实例可能"看起来串行"
+	// 只是因为谁也来不及重叠，断言就验不出串行语义。
+	r := &probeRunner{plugin: "digest", delay: 20 * time.Millisecond}
+	s.Bind("digest", r)
+	registerPerPeer(t, s, db, "digest", "tick", []string{"g1", "g2", "g3"})
+
+	s.runDue(context.Background())
+	waitScheduler(t, s)
+
+	if got := len(r.ran()); got != 3 {
+		t.Fatalf("三个实例都应执行，实际 %d", got)
+	}
+	if got := r.max(); got != 1 {
+		t.Fatalf("同插件并发度应为 1，实际 %d", got)
+	}
+}
+
+// 不同插件必须能同时在跑：一个 60 s 的慢任务不能把别的插件挡在门外。
+func TestRunDueRunsDifferentPluginsInParallel(t *testing.T) {
+	s, db := newTestScheduler(t)
+	probe := &globalProbe{}
+	slow := &probeRunner{plugin: "digest", global: probe, delay: 200 * time.Millisecond}
+	fast := &probeRunner{plugin: "weather", global: probe, delay: 200 * time.Millisecond}
+	s.Bind("digest", slow)
+	s.Bind("weather", fast)
+	registerPerPeer(t, s, db, "digest", "tick", []string{"g1"})
+	registerPerPeer(t, s, db, "weather", "tick", []string{"g2"})
+
+	s.runDue(context.Background())
+	waitScheduler(t, s)
+
+	if len(slow.ran()) != 1 || len(fast.ran()) != 1 {
+		t.Fatalf("两个插件的任务都应执行: %v / %v", slow.ran(), fast.ran())
+	}
+	if got := probe.max(); got != 2 {
+		t.Fatalf("两个插件应同时执行（峰值并发 2），实际 %d", got)
+	}
+}
+
+// 并行度上限：不论有多少插件到期，同时执行的不超过 4 个。
+func TestRunDueCapsParallelismAtFour(t *testing.T) {
+	s, db := newTestScheduler(t)
+	probe := &globalProbe{}
+	peers := []string{"g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8"}
+	for i, peer := range peers {
+		plugin := "p" + string(rune('a'+i))
+		s.Bind(plugin, &probeRunner{plugin: plugin, global: probe, delay: 40 * time.Millisecond})
+		registerPerPeer(t, s, db, plugin, "tick", []string{peer})
+	}
+
+	s.runDue(context.Background())
+	waitScheduler(t, s)
+
+	if got := probe.max(); got != 4 {
+		t.Fatalf("并行度应为 4，实际 %d", got)
+	}
+}
+
+// 单轮扫描上限从 20 提到 100：20 个群的实例不该需要两轮才轮完。
+func TestRunDueDrainsUpToHundredJobsPerTick(t *testing.T) {
+	for _, n := range []int{20, 50, 100} {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			s, db := newTestScheduler(t)
+			r := &probeRunner{plugin: "digest"}
+			s.Bind("digest", r)
+			var id string
+			peers := make([]string, 0, n)
+			for i := 0; i < n; i++ {
+				peers = append(peers, "g"+strconv.Itoa(i))
+			}
+			id = "digest:tick"
+			registerPerPeer(t, s, db, "digest", "tick", peers)
+
+			s.runDue(context.Background())
+			waitScheduler(t, s)
+
+			if got := len(r.ran()); got != n {
+				t.Fatalf("%s 的实例应在一轮内全部执行，实际 %d（单轮上限仍是 20？）", id, got)
+			}
+		})
+	}
+}
+
+// 上一轮还没跑完的插件，这一轮不能再领一份活（同插件串行），
+// 但它的积压不能把别的插件挤掉。
+func TestRunDueSkipsBusyPlugin(t *testing.T) {
+	s, db := newTestScheduler(t)
+	hold := make(chan struct{})
+	slow := &probeRunner{plugin: "digest", hold: hold}
+	fast := &probeRunner{plugin: "weather"}
+	s.Bind("digest", slow)
+	s.Bind("weather", fast)
+	registerPerPeer(t, s, db, "digest", "tick", []string{"g1", "g2"})
+	registerPerPeer(t, s, db, "weather", "tick", []string{"g3"})
+
+	s.runDue(context.Background())
+	// 确认 digest 的实例已经开跑，此时再扫一轮。
+	deadline := time.Now().Add(5 * time.Second)
+	for len(slow.ran()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("digest 未开始执行")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 把 weather 重新拉成到期，模拟"慢任务横跨一个 tick"。
+	dueNow(t, db, "weather:tick", "weather", []string{"g3"})
+	s.runDue(context.Background())
+
+	if got := slow.max(); got != 1 {
+		t.Fatalf("digest 仍在执行时不该领第二个实例，并发度 %d", got)
+	}
+	if got := len(slow.ran()); got != 1 {
+		t.Fatalf("digest 这一轮只该跑一个实例，实际 %d", got)
+	}
+	// weather 上一轮已经跑过，这一轮因重新到期应再跑一次。
+	deadline = time.Now().Add(5 * time.Second)
+	for len(fast.ran()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("weather 应被执行两次，实际 %v", fast.ran())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(hold)
+	waitScheduler(t, s)
+	if got := len(slow.ran()); got != 2 {
+		t.Fatalf("恢复后 digest 的第二个实例应继续执行，实际 %d", got)
+	}
+}
+
+// 熔断按 (job, peer) 计：并行化不能把两个实例的失败计数搅在一起。
+func TestRunDueKeepsFailuresPerJobRow(t *testing.T) {
+	s, db := newTestScheduler(t)
+	r := &probeRunner{plugin: "digest", failPeer: "g1"}
+	s.Bind("digest", r)
+	registerPerPeer(t, s, db, "digest", "tick", []string{"g1", "g2"})
+
+	s.runDue(context.Background())
+	waitScheduler(t, s)
+
+	rows, err := db.QueryRows(context.Background(),
+		`SELECT peer, consecutive_failures, enabled FROM jobs WHERE id = 'digest:tick'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, row := range rows {
+		peer, _ := row["peer"].(string)
+		failures, _ := row["consecutive_failures"].(int64)
+		got[peer] = failures
+		if enabled, _ := row["enabled"].(int64); enabled != 1 {
+			t.Fatalf("%s 只失败一次不该被停用", peer)
+		}
+	}
+	if got["g1"] != 1 {
+		t.Fatalf("g1 应记一次失败，实际 %d", got["g1"])
+	}
+	if got["g2"] != 0 {
+		t.Fatalf("g2 成功不该被记失败，实际 %d", got["g2"])
+	}
+}
+
+// BenchmarkRunDue 量一轮扫描的端到端耗时（含取任务、执行、写回 jobs/job_runs）。
+//
+// 两组对照：
+//   - parallel/N：N 个插件各一行，走分桶并行（并行度 4）
+//   - single/N  ：一个插件 N 行，桶内串行——这是旧实现里"20 个群"的真实形态
+//
+// 每个任务模拟 20 ms 的 I/O 工作，量级接近一次 HTTP + 一次写库。
+func BenchmarkRunDue(b *testing.B) {
+	for _, n := range []int{20, 50, 100} {
+		b.Run("parallel/"+strconv.Itoa(n), func(b *testing.B) {
+			benchRunDue(b, n, 1, 20*time.Millisecond)
+		})
+		b.Run("single/"+strconv.Itoa(n), func(b *testing.B) {
+			benchRunDue(b, 1, n, 20*time.Millisecond)
+		})
+	}
+}
+
+// benchRunDue 建 plugins 个插件、每个 jobsPerPlugin 个实例。plugins=1 时
+// 退化成"一个插件 N 个群"的单桶串行，也就是旧实现里的真实形态。
+func benchRunDue(b *testing.B, plugins, jobsPerPlugin int, work time.Duration) {
+	b.Helper()
+	s, db := newTestScheduler(b)
+	ctx := context.Background()
+
+	type row struct{ id, peer, plugin string }
+	rows := make([]row, 0, plugins*jobsPerPlugin)
+	for i := 0; i < plugins; i++ {
+		plugin := "p" + strconv.Itoa(i)
+		s.Bind(plugin, &probeRunner{plugin: plugin, delay: work})
+		peers := make([]string, 0, jobsPerPlugin)
+		for k := 0; k < jobsPerPlugin; k++ {
+			peers = append(peers, "g"+strconv.Itoa(i)+"-"+strconv.Itoa(k))
+		}
+		registerPerPeer(b, s, db, plugin, "tick", peers)
+		for _, p := range peers {
+			rows = append(rows, row{plugin + ":tick", p, plugin})
+		}
+	}
+
+	runCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// 把上一轮推进过的 next_run_at 重新拉回"已到期"，不计量这部分。
+		b.StopTimer()
+		for _, r := range rows {
+			if err := db.UpsertJob(ctx, store.Job{
+				ID: r.id, Peer: r.peer, Plugin: r.plugin,
+				Spec: "0 9 * * *", NextRunAt: time.Now().Unix() - 10,
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StartTimer()
+
+		s.runDue(runCtx)
+		if !s.Wait(runCtx) {
+			b.Fatal("任务未在期限内收尾")
+		}
 	}
 }

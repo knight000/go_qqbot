@@ -213,6 +213,12 @@ func (c *Core) Start(ctx context.Context) error {
 func (c *Core) httpClient() *httpx.Client { return c.http }
 
 func (c *Core) Shutdown(ctx context.Context) {
+	// 先等调度任务收尾，再关插件：任务运行在插件的 JobRunner 里，先 Close
+	// 插件等于让任务往已经关掉的东西里写；而任务本身还要写库，必须早于
+	// main 里的 db.Close。调度协程已被 ctx 取消，正常情况下这里是毫秒级。
+	if c.sched != nil && !c.sched.Wait(ctx) {
+		c.log.Warn("调度任务未在关停期限内退出")
+	}
 	for i := len(c.plugins) - 1; i >= 0; i-- {
 		p := c.plugins[i]
 		if cl, ok := p.(host.Closer); ok {
