@@ -267,6 +267,27 @@ func TestTraceBlockedNamesBothPlugins(t *testing.T) {
 	}
 }
 
+// 被不让位者挡下的候选有两种，「没执行」的原因不同：有权限的是被挡住，
+// 无权限的本就不会执行。后者必须记「权限不足」，否则排障会往让位链上找。
+func TestTraceBlockedDoesNotMislabelDenied(t *testing.T) {
+	out := &syncBuffer{}
+	tr := NewTrace(out, LevelFull)
+	blocker := yieldStub("mmm", 100, false)
+	denied := newStub("zzz", "/cmd", host.PermBotAdmin, "")
+	d, _ := newTestDispatcher(t, blocker, denied)
+	d.trace = tr
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+
+	got := out.String()
+	if !strings.Contains(got, "权限不足 · 插件 zzz") {
+		t.Errorf("无权限的候选应记「权限不足」，实际输出:\n%s", got)
+	}
+	if strings.Contains(got, "未执行 · 插件 zzz") {
+		t.Errorf("无权限的候选不该记「未让位」，实际输出:\n%s", got)
+	}
+}
+
 func waitFor(t *testing.T, out *syncBuffer, want string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
