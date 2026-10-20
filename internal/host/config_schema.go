@@ -42,7 +42,7 @@ func (m Manifest) ValidateConfig(section map[string]any) error {
 		m.Name, m.Name, strings.Join(problems, "\n  - "))
 }
 
-// supportedConfigKindList 只用于错误文案，顺序与 ValidConfig 注释一致。
+// supportedConfigKindList 只用于错误文案，顺序与 ValidateConfig 注释一致。
 const supportedConfigKindList = "string / bool / int / duration"
 
 // supportedConfigKind 报告类型名是否属于四种受支持类型。
