@@ -194,3 +194,162 @@ func TestRouterRejectsUnknownPermission(t *testing.T) {
 		t.Fatal("未定义的权限位应拒绝加载")
 	}
 }
+
+// yieldStub 是同 priority 多插件场景的夹具：名字决定组内顺序，Yield 决定是否让位。
+func yieldStub(name string, priority int, yield bool) *stubPlugin {
+	p := newStub(name, "/cmd", host.PermUser, "")
+	p.manifest.Yield = yield
+	p.manifest.Commands[0].Priority = priority
+	return p
+}
+
+// 不让位者执行完就停在它：名字靠前的插件不能因为字典序而永久压制靠后的插件，
+// 但这里的"压制"必须是它自己声明出来的（Yield=false），而不是中标名次的副作用。
+func TestDispatchStopsAtNonYieldingPlugin(t *testing.T) {
+	stop := yieldStub("aaa", 100, false)
+	next := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, stop, next)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if stop.callCount() != 1 {
+		t.Fatalf("aaa 应执行一次，实际 %d 次", stop.callCount())
+	}
+	if next.callCount() != 0 {
+		t.Fatalf("aaa 未让位，zzz 不应执行，实际 %d 次", next.callCount())
+	}
+}
+
+// 让位就是让位：前一个声明 Yield=true，组内后一个照常执行。
+func TestDispatchContinuesWhileYielding(t *testing.T) {
+	first := yieldStub("aaa", 100, true)
+	last := yieldStub("zzz", 100, false)
+	d, _ := newTestDispatcher(t, first, last)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if first.callCount() != 1 || last.callCount() != 1 {
+		t.Fatalf("两者都应执行，实际 aaa=%d zzz=%d", first.callCount(), last.callCount())
+	}
+}
+
+// 执行到第一个不让位者为止，不继续向后：让位链是"逐个人声明"，不是"整组投票"。
+func TestDispatchStopsAtFirstNonYielder(t *testing.T) {
+	first := yieldStub("aaa", 100, true)
+	middle := yieldStub("mmm", 100, false)
+	last := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, first, middle, last)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if first.callCount() != 1 || middle.callCount() != 1 {
+		t.Fatalf("aaa 与 mmm 应执行，实际 aaa=%d mmm=%d", first.callCount(), middle.callCount())
+	}
+	if last.callCount() != 0 {
+		t.Fatalf("mmm 未让位，zzz 不应执行，实际 %d 次", last.callCount())
+	}
+}
+
+// yield 只在同 priority 组内生效：高优先级让位不会把事件送给低优先级插件。
+func TestDispatchYieldDoesNotCrossPriority(t *testing.T) {
+	high := yieldStub("aaa", 200, true)
+	low := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, high, low)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if high.callCount() != 1 {
+		t.Fatalf("高优先级插件应执行，实际 %d 次", high.callCount())
+	}
+	if low.callCount() != 0 {
+		t.Fatalf("跨优先级不扇出，低优先级插件不应执行，实际 %d 次", low.callCount())
+	}
+}
+
+// 无权限的匹配者只是被跳过，不改变"组内是否继续"——它不该像不让位者那样截断后续。
+func TestDispatchDeniedDoesNotBlockGroup(t *testing.T) {
+	first := yieldStub("aaa", 100, true)
+	denied := newStub("bbb", "/cmd", host.PermBotAdmin, "")
+	last := yieldStub("zzz", 100, true)
+	d, _ := newTestDispatcher(t, first, denied, last)
+
+	d.handle(context.Background(), groupEvent("/cmd", host.Principal{Role: host.RoleUser}))
+	if first.callCount() != 1 || last.callCount() != 1 {
+		t.Fatalf("无权者前后两个插件都应执行，实际 aaa=%d zzz=%d", first.callCount(), last.callCount())
+	}
+	if denied.callCount() != 0 {
+		t.Fatalf("无权限插件不应执行，实际 %d 次", denied.callCount())
+	}
+}
+
+// argsRecorder 记录 Handle 收到的 Command/Args：路由命中的结果必须回传给插件，
+// 否则每个插件都得自己从 Content 里再解析一遍。
+type argsRecorder struct {
+	manifest host.Manifest
+	mu       sync.Mutex
+	cmd      []string
+	args     []string
+}
+
+func (c *argsRecorder) Manifest() host.Manifest               { return c.manifest }
+func (c *argsRecorder) Init(context.Context, host.Host) error { return nil }
+func (c *argsRecorder) Handle(_ context.Context, ev *host.Event) (*host.Reply, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cmd = append(c.cmd, ev.Command)
+	c.args = append(c.args, ev.Args)
+	return nil, nil
+}
+
+func (c *argsRecorder) last() (cmd, args string, calls int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.cmd) == 0 {
+		return "", "", 0
+	}
+	return c.cmd[len(c.cmd)-1], c.args[len(c.args)-1], len(c.cmd)
+}
+
+func TestDispatchFillsCommandAndArgs(t *testing.T) {
+	p := &argsRecorder{manifest: host.Manifest{
+		Name:       "echoer",
+		APIVersion: host.APIVersion,
+		Intents:    []string{"message"},
+		Commands:   []host.Command{{Prefix: "!echo", Priority: 100}},
+	}}
+	d, _ := newTestDispatcher(t, p)
+
+	d.handle(context.Background(), groupEvent("!echo 你好 世界", host.Principal{}))
+	cmd, args, calls := p.last()
+	if calls != 1 {
+		t.Fatalf("插件应被调用 1 次，实际 %d", calls)
+	}
+	if cmd != "!echo" || args != "你好 世界" {
+		t.Fatalf("Handle 应收到 Command=%q Args=%q，实际 %q / %q", "!echo", "你好 世界", cmd, args)
+	}
+}
+
+// 一次派发跑多个插件时，每个插件必须拿到自己命中那条命令的参数：
+// 在 Match 里写会互相覆盖，写早了会串味。
+func TestDispatchFillsPerPluginArgs(t *testing.T) {
+	// aaa 用正则吃掉整个 "!x 1"，它的 Args 是空串；zzz 用前缀，Args 是 "1"。
+	// aaa 必须让位（Yield=true），#11 之后同组扇出靠的是每个匹配者自己的声明。
+	aaa := &argsRecorder{manifest: host.Manifest{
+		Name:       "aaa",
+		APIVersion: host.APIVersion,
+		Intents:    []string{"message"},
+		Yield:      true,
+		Commands:   []host.Command{{Pattern: `^!x 1`, Priority: 100}},
+	}}
+	zzz := &argsRecorder{manifest: host.Manifest{
+		Name:       "zzz",
+		APIVersion: host.APIVersion,
+		Intents:    []string{"message"},
+		Commands:   []host.Command{{Prefix: "!x", Priority: 100}},
+	}}
+	d, _ := newTestDispatcher(t, aaa, zzz)
+
+	d.handle(context.Background(), groupEvent("!x 1", host.Principal{}))
+	if cmd, args, calls := aaa.last(); calls != 1 || cmd != `^!x 1` || args != "" {
+		t.Fatalf("aaa 应收到自己的正则与空 Arg，实际 %d 次 %q / %q", calls, cmd, args)
+	}
+	if cmd, args, calls := zzz.last(); calls != 1 || cmd != "!x" || args != "1" {
+		t.Fatalf("zzz 应收到前缀与 Arg %q，实际 %d 次 %q / %q", "1", calls, cmd, args)
+	}
+}

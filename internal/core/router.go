@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/knight000/go_qqbot/internal/host"
 )
@@ -21,7 +23,9 @@ var reservedPrefixes = []string{
 }
 
 type compiledCommand struct {
-	prefix   string
+	prefix string
+	// loose 放宽前缀匹配：默认要求前缀之后是空白或结尾（/md5 不算 /md）。
+	loose    bool
 	re       *regexp.Regexp
 	priority int
 	// perm 是解析后的权限要求（已处理"命令级覆盖插件级"的继承）。
@@ -82,6 +86,7 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 			}
 			cc := compiledCommand{
 				prefix:   c.Prefix,
+				loose:    c.Loose,
 				priority: c.Priority,
 				label:    c.Prefix,
 				perm:     inheritPerm(m.Permission, c.Permission),
@@ -109,14 +114,18 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 	return r, nil
 }
 
-// Match 返回按 priority 降序排列的候选。同一优先级只应有一个插件处理，
-// 除非该插件显式声明 broadcast=true。
+// Match 返回按 priority 降序排列的候选：priority 降序，同 priority 按插件名升序。
+// 这个顺序就是 Dispatcher 的执行顺序——同组内逐个执行，遇到不让位者为止（§3.4），
+// 所以排序必须确定，不能依赖 map 遍历。
 type Match struct {
 	Plugin   host.Plugin
 	Manifest host.Manifest
 	Priority int
-	// Command 是命中的命令写法（前缀或正则），供调试输出定位"为什么是它"。
+	// Command 是命中的命令写法（前缀或正则），供调试输出定位"为什么是它"；
+	// 也是回传给插件的 Event.Command。
 	Command string
+	// Args 是命令之后、已 TrimSpace 的剩余原文，回传给插件的 Event.Args。
+	Args string
 	// Perm 是执行该命令所需的权限（已解析继承关系）；零值表示不限制。
 	Perm host.Perm
 	// DenyReply 是权限不足时的回复文本，空串表示静默丢弃。
@@ -129,7 +138,7 @@ func (r *Router) Match(ev *host.Event) []Match {
 		if !rt.intents.match(ev) {
 			continue
 		}
-		cmd, ok := matchCommands(rt.cmds, ev)
+		cmd, args, ok := matchCommands(rt.cmds, ev)
 		if !ok {
 			continue
 		}
@@ -138,7 +147,7 @@ func (r *Router) Match(ev *host.Event) []Match {
 			// 未声明命令 = 订阅该 intent 的全部事件，权限取插件级
 			m.Perm, m.DenyReply = rt.manifest.Permission, rt.manifest.DenyReply
 		} else {
-			m.Priority, m.Command = cmd.priority, cmd.label
+			m.Priority, m.Command, m.Args = cmd.priority, cmd.label, args
 			m.Perm, m.DenyReply = cmd.perm, cmd.deny
 		}
 		out = append(out, m)
@@ -168,29 +177,54 @@ func inheritDeny(plugin, cmd string) string {
 	return cmd
 }
 
-// matchCommands 返回命中的命令（nil 表示该插件没有声明命令，订阅全部事件）。
-func matchCommands(cmds []compiledCommand, ev *host.Event) (best *compiledCommand, ok bool) {
+// matchCommands 返回命中的命令（nil 表示该插件没有声明命令，订阅全部事件）
+// 以及命令之后的剩余原文。
+func matchCommands(cmds []compiledCommand, ev *host.Event) (best *compiledCommand, args string, ok bool) {
 	// 未声明命令 = 订阅该 intent 的全部事件
 	if len(cmds) == 0 {
-		return nil, true
+		return nil, "", true
 	}
 	if !ev.IsMessage() {
-		return nil, false
+		return nil, "", false
 	}
 	content := strings.TrimSpace(ev.Content)
 	for i := range cmds {
 		c := &cmds[i]
+		var rest string
 		hit := false
-		if c.prefix != "" {
-			hit = strings.HasPrefix(content, c.prefix)
-		} else if c.re != nil {
-			hit = c.re.MatchString(content)
+		switch {
+		case c.prefix != "":
+			rest, hit = argsAfterPrefix(content, c.prefix, c.loose)
+		case c.re != nil:
+			// 正则按源码找匹配区间，Args 取区间之后的剩余（不是整段内容）。
+			if loc := c.re.FindStringIndex(content); loc != nil {
+				rest, hit = strings.TrimSpace(content[loc[1]:]), true
+			}
 		}
 		if hit && (best == nil || c.priority > best.priority) {
-			best = c
+			best, args = c, rest
 		}
 	}
-	return best, best != nil
+	return best, args, best != nil
+}
+
+// argsAfterPrefix 判断 content 是否以 prefix 开头，并返回其后的剩余原文（已 TrimSpace）。
+//
+// 词边界在这里收口：loose=false 要求 prefix 之后是空白或字符串结尾，所以 `/md5 abc`
+// 不命中 `/md`。这条规则曾经散在每个插件里（md 的 CutPrefix + IsSpace 判断），
+// 漏一个插件就多一处误命中，所以只有这一份实现。loose=true 退回裸 HasPrefix 语义，
+// 只给"前缀本身就是完整词、后面紧跟内容"的写法用。
+func argsAfterPrefix(content, prefix string, loose bool) (args string, ok bool) {
+	rest, ok := strings.CutPrefix(content, prefix)
+	if !ok {
+		return "", false
+	}
+	if !loose {
+		if r, _ := utf8.DecodeRuneInString(rest); rest != "" && !unicode.IsSpace(r) {
+			return "", false
+		}
+	}
+	return strings.TrimSpace(rest), true
 }
 
 // intent 是解析后的订阅项：kind 必填，scene 为空表示"任意场景"。
