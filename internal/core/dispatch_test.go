@@ -53,7 +53,7 @@ func newTestDispatcher(t *testing.T, plugins ...host.Plugin) (*Dispatcher, *fake
 	}
 	f := &fakeAPI{}
 	log := slog.New(slog.DiscardHandler)
-	d := NewDispatcher(router, NewSender(f, log, ActivePolicy{}), log, time.Second)
+	d := NewDispatcher(router, NewSender(f, log, ActivePolicy{}, nil), log, time.Second)
 	return d, f
 }
 
