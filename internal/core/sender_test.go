@@ -241,10 +241,10 @@ func TestSenderPassiveSeqKeepsRisingAfterWindowExpiry(t *testing.T) {
 	}
 }
 
-// 序号表的条目数必须有上界：map 随 msg_id 无限增长就是一次慢性 OOM。
-// 超过 seqCap 时淘汰最久未用的条目，代价是那条 msg_id 的序号从 1 重来——
-// 这是刻意的取舍，测试把它钉住，免得将来有人"顺手"去掉上限。
-func TestSenderPassiveSeqTableIsBounded(t *testing.T) {
+// seqCap 是**软上界**：全部窗口都还在被动有效期内时，宁可暂时超出一条，
+// 也不淘汰任何一条。被淘汰的那条 used 会清零（同一 msg_id 可以超发）、
+// seq 会回到 1（(msg_id, msg_seq) 重复），比多占 ~64 字节严重得多。
+func TestSenderPassiveSeqCapYieldsToLiveWindows(t *testing.T) {
 	f := &fakeAPI{}
 	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
 	ctx := context.Background()
@@ -262,13 +262,57 @@ func TestSenderPassiveSeqTableIsBounded(t *testing.T) {
 	for i := 0; i < seqCap; i++ {
 		send(fmt.Sprintf("m%d", i))
 	}
-	if n := len(s.windows); n > seqCap {
-		t.Fatalf("序号表应被限制在 %d 条以内，实际 %d", seqCap, n)
+	// 这些窗口都刚建、5 分钟内不会过期，因此没有可淘汰的条目。
+	send("fresh")
+	if n := len(s.windows); n != seqCap+1 {
+		t.Fatalf("没有过期条目时不该淘汰，实际条目 %d（期望 %d）", n, seqCap+1)
 	}
-	// 新 msg_id 挤进来时淘汰最久未用的 m0；它再出现只能从 1 重来。
-	send("new")
-	if got := send("m0"); got != 1 {
-		t.Fatalf("被淘汰的 msg_id 重来时应从 1 开始，实际 seq=%d", got)
+	// m0 是最久未用的那条，但它仍在窗口内：seq 必须继续往上数。
+	if got := send("m0"); got != 2 {
+		t.Fatalf("仍在窗口内的 msg_id 被淘汰了：seq 从 1 重来（实际 %d）", got)
+	}
+}
+
+// 达到 seqCap 后淘汰的只能是**窗口已过期**的条目。踢掉一条仍在用的窗口会
+// 同时重置 passive 次数与 seq——那正是 #14 要消除的 (msg_id, msg_seq) 重复。
+func TestSenderPassiveEvictionSkipsLiveWindows(t *testing.T) {
+	f := &fakeAPI{}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	ctx := context.Background()
+	start := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	now := start
+	s.now = func() time.Time { return now }
+
+	send := func(scene host.Scene, peer, msgID string) int {
+		t.Helper()
+		ev := &host.Event{Scene: scene, PeerID: peer, MsgID: msgID}
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("%s 回复失败: %v", msgID, err)
+		}
+		body, _ := f.lastBody()
+		return body.MsgSeq
+	}
+
+	// live 是单聊（60 分钟窗口），故意让它成为"最久未用"的那一条：
+	// 旧实现按 lastOrder 淘汰，会先踢它，而不是踢真正该清的过期群窗口。
+	send(host.SceneC2C, "u1", "live")
+	// 再塞满 cap-1 条群会话（5 分钟窗口）。
+	for i := 0; i < seqCap-1; i++ {
+		send(host.SceneGroup, "g1", fmt.Sprintf("old%d", i))
+	}
+	if n := len(s.windows); n != seqCap {
+		t.Fatalf("前置条件不成立：条目应为 %d，实际 %d", seqCap, n)
+	}
+
+	// 群窗口早已过期，单聊窗口还剩 50 分钟。
+	now = start.Add(10 * time.Minute)
+	send(host.SceneGroup, "g1", "fresh") // 触发淘汰；候选只有已过期的 old*
+	if n := len(s.windows); n != seqCap {
+		t.Fatalf("淘汰应恰好删掉一条已过期条目，实际条目 %d", n)
+	}
+	// live 的 used/seq 一旦被清零，这里就会拿到 1。
+	if got := send(host.SceneC2C, "u1", "live"); got != 2 {
+		t.Fatalf("活跃窗口被淘汰：live 的 seq 从 1 重来（实际 %d）", got)
 	}
 }
 
