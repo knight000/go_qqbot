@@ -33,7 +33,25 @@ import (
 //
 // 版本 7：Host.HTTP 的非 2xx 统一返回 *HTTPStatusError，插件不必 import
 // internal/httpx 就能分辨 429 与普通失败。
-const APIVersion = "7"
+//
+// 版本 8：批内三张票共用这一个版本（#11 / #12 / #13），因为它们同期落地、
+// 插件本来就要一起改：
+//   - Manifest.Yield 取代 Broadcast：是否让位由每个匹配者自己声明（§3.4）；
+//   - Event.Command / Event.Args 由核心在调用 Handle 之前填好：Command 是命中的
+//     前缀原文或正则源码，Args 是命令之后已 TrimSpace 的剩余原文；前缀匹配默认
+//     按词边界（`/md5` 不再命中 `/md`），确需裸前缀时在 Command 上声明 Loose，
+//     插件不再自己 CutPrefix / HasPrefix；
+//   - Event.Mentioned / Event.Raw 暴露“是否 @ 了机器人”与原始载荷。
+//
+// 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
+const APIVersion = "8"
+
+// MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
+//
+// 一条真实群消息通常只有几百字节，只有平台塞进超长字段（超长昵称、卡片 JSON）
+// 时才会触顶。32 KiB 足够装下常见载荷的完整原文，同时让 dispatch 工作池
+// 满载（16 并发）时在途 Raw 的峰值停在 512 KiB 量级（见 ARCHITECTURE §1.3）。
+const MaxRawBytes = 32 << 10
 
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
@@ -86,12 +104,52 @@ type Event struct {
 	UnionID  string // 平台给的跨场景标识，可能为空
 	MsgID    string // 被动回复必须携带
 	Content  string
+	// Command 是本次投递命中的命令写法：前缀的原文，或正则的源码；未命中为空串。
+	// Args 是命中片段之后、已 TrimSpace 的剩余原文；未命中同样为空串。
+	//
+	// 两者都由核心在路由阶段填好（§3.4），插件不要再从 Content 里 CutPrefix：
+	// 命令词边界与参数切分只有一份实现，在路由层。Content 仍是 TrimSpace 过的
+	// 完整原文，两者并存——要判断"用户到底敲了什么"读 Content，要取参数读 Args。
+	//
+	// 一次派发执行多个插件时，每个插件拿到的是它自己命中那条命令的 Command/Args。
+	Command string
+	Args    string
 	// MsgType 是平台的 message_type：0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用。
 	MsgType int
 	// HasMedia 表示平台载荷里带附件。附件不会被下载（入站媒体不做），
 	// 所以它只是"这条消息有图/音视频"的标记，别指望能读到内容。
-	HasMedia  bool
-	Payload   []byte // 原始 JSON，仅未知事件保留（排查"平台到底推了什么"）
+	HasMedia bool
+	// Mentioned 表示这条消息 **@ 了机器人**。
+	//
+	// 口径只有平台事件类型一条：`GROUP_AT_MESSAGE_CREATE` 的语义就是「用户 @ 了
+	// 机器人」，该事件恒为 true；`GROUP_MESSAGE_CREATE`（全量模式）的载荷里没有
+	// 任何「@ 了机器人」的标记，一律 false——不做猜测。单聊、通知、未知事件恒 false。
+	//
+	// 不能用载荷里的 `mentions` 反推：官方文档对它的定义是「消息中@的用户列表
+	// （**不含@机器人自身**）」，数组里永远不会有机器人自己。需要「@ 了别人」
+	// 这一事实的插件，自己读 Raw 里的 mentions。
+	Mentioned bool
+	// Raw 是平台原始 JSON 的副本，**所有事件**（含已知事件）都有，最长 MaxRawBytes。
+	//
+	// 存在的理由：平台新增字段不该逼着核心改结构体、升契约版本才能被插件看见。
+	// 它只在 dispatch 生命周期内有效——不落库（messages 表没有这一列）、
+	// 不参与幂等键（去重只看 ID）、`/reset` 与 GC 都不触碰它；事件处理完
+	// 随 Event 一起被回收。
+	//
+	// 超过 MaxRawBytes 时截断为原文前缀，并置 RawTruncated=true。截断必须可判定：
+	// 不允许静默给出半截 JSON，让插件误以为平台发了坏数据。截断点退到最近的
+	// rune 边界，因此 Raw 始终是合法 UTF-8、且只比上限少几个字节。
+	// RawTruncated 为 false 时 Raw 与原文逐字节相等。
+	//
+	// 与 Payload 的关系：Payload 的既有语义不动（**仅未知事件**、完整原文）；
+	// 未知事件因此同时有一份完整 Payload 与一份 ≤32 KiB 的 Raw，代价可以接受
+	// ——未知事件本就罕见。
+	Raw []byte
+	// RawTruncated 报告 Raw 是否因超过 MaxRawBytes 被截断。
+	RawTruncated bool
+	// Payload 是原始 JSON，仅未知事件保留（排查"平台到底推了什么"）。
+	// 新代码优先用 Raw：它对所有事件都有，且带截断标记。
+	Payload   []byte
 	Timestamp time.Time
 
 	// Actor 是调用者身份与权限，由核心在投递插件之前填好：网关填群内角色，
@@ -311,10 +369,14 @@ type Host interface {
 
 // Command 是声明式路由规则：前缀或正则二选一。
 //
-// 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配（网关解出 mentions 后即
-// 丢弃，见评审 §4.2）。
+// 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配。那个事实在
+// Event.Mentioned，要不要据此响应由插件自己判断（ARCHITECTURE §1.4 / 票 #13）。
 type Command struct {
-	Prefix      string
+	Prefix string
+	// Loose 只对 Prefix 生效，默认 false = 严格：前缀之后必须是空白或字符串结尾，
+	// 所以 `/md5 abc` 不命中 `/md`。置 true 退回裸 HasPrefix 语义，
+	// 只给"前缀本身就是完整词、后面紧跟内容"这类确有需要的写法用。
+	Loose       bool
 	Pattern     string
 	Priority    int
 	Description string
@@ -337,17 +399,25 @@ type Manifest struct {
 	Capabilities []string
 	Intents      []string // 订阅的事件：`message` 这样的大类，或 `group.message` 这样的场景限定
 	Commands     []Command
-	// Broadcast 让中标插件声明“同优先级的其它插件也执行”。
+	// Yield 声明“本插件处理完是否让位给同 priority 的下一个匹配者”。
 	//
-	// 它只对中标者生效：候选先按 priority 降序、同 priority 按插件名字典序升序
-	// 排序（Router.Match），再取第一个有权限的作为中标者（Dispatcher.handle）。
-	// 所以名字靠前的 Broadcast=false 会压掉靠后的 Broadcast=true，且没有提示——
-	// 已知缺陷，取舍与替代方案见评审 §2.3。
-	Broadcast      bool
+	// 零值 false = 阻断，也是默认行为：只跑一个插件，避免两个插件同时回、
+	// 消耗两次被动额度。设 true 表示“我处理完，同组后面的插件接着处理”。
+	// 只在同 priority 组内生效，跨 priority 不扇出（§3.4）；让位链在第一个
+	// 不让位者处截止，被挡住的插件会出现在 full 级轨迹里。
+	//
+	// 它取代了旧字段 Broadcast：那时“是否继续”挂在排序第一的插件上，名字靠前的
+	// false 会压掉靠后的 true，且没有任何提示（评审 §2.3）。现在每个匹配者
+	// 只决定自己的让位，不再替别人做决定。
+	Yield          bool
 	AllowedDomains []string
-	// ConfigSchema 是**保留字段**：核心从不读取，启动期既不做存在性校验也不做
-	// 类型校验，配置写错仍能启动。必填项与类型要由插件自己在 Init 里检查
-	// （评审 §4.1）。
+	// ConfigSchema 声明本插件需要 [plugins.<name>] 里的哪些键、各是什么类型，
+	// 由核心在装配期（Init 之前）校验，见 Manifest.ValidateConfig（评审 §4.1）。
+	//
+	// 语义是**声明即必填**：写进来的键必须有值，缺一个就启动失败；有默认值的键
+	// 不要写进来，否则等于把默认值变成必填。类型只支持四种，与 Params 的读取
+	// 方法一一对应：string / bool / int / duration。空配置段 + 空 schema 依旧
+	// 能启动，所以不声明 schema 的插件行为与校验上线前完全一致。
 	ConfigSchema map[string]string
 
 	// Permission 是插件级默认权限：命令自身未声明时继承它。

@@ -11,13 +11,16 @@ import (
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/httpx"
+	"github.com/knight000/go_qqbot/internal/store"
 )
 
 var (
 	ErrPassiveExhausted = errors.New("被动回复次数已用尽")
 	ErrActiveDisabled   = errors.New("主动消息未开启")
 	// ErrActiveQuota 是本地主动消息日额度用尽。平台每用户每天上限 1000 条，
-	// 本地把预算压到个位数，避免重启循环之类的异常把额度烧掉。
+	// 本地把预算压到个位数并**落库**（§4.1 active_usage）：重启不清零，
+	// 否则"重启循环不会烧额度"就只是注释里的一句空话。
+	// 额度账本不可用时也返回它（fail-closed），调用方只需判断这一个错误。
 	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
 	// ErrRateLimited 表示平台返回 429。官方只给状态码 + err_code + trace_id，
 	// 不提供剩余额度，也不承诺 Retry-After，因此退避策略必须由本地按维度决定。
@@ -39,40 +42,58 @@ type messageAPI interface {
 	UploadMedia(ctx context.Context, scene, peer string, up api.MediaUpload) (api.MediaUploadResult, error)
 }
 
+// activeUsageStore 是主动消息日预算的落库入口。核心不能写 plugin_kv
+// （那是插件命名空间），所以由 store 单独维护一张 active_usage 表。
+//
+// 抽成接口而不是直接用 *store.DB，是为了让"账本坏了"这条路径可测：
+// 关掉库、或者换一个只会报错的实现，就能验证 fail-closed 的行为。
+type activeUsageStore interface {
+	// TakeActiveBudget 原子地占一格当日额度；false 表示当日已满。
+	// 返回 error 表示账本不可用，调用方必须拒发（见 sendActiveOne）。
+	TakeActiveBudget(ctx context.Context, key store.ActiveUsageKey, limit int) (bool, error)
+}
+
 // Sender 负责 passive/active 两类出站。
 //
 // 平台约束（§1.2）：
 //   - 群：同一 msg_id 5 分钟内最多 5 次；
 //   - 单聊：60 分钟内最多 4 次；
+//   - msg_seq 在同一 msg_id 下单调递增，窗口过期只重置剩余次数、不回退序号；
 //   - msg_id + msg_seq 全局唯一，重试不得复用同一 seq。
 type Sender struct {
 	api    messageAPI
 	log    *slog.Logger
 	active ActivePolicy
 	trace  *Trace
+	usage  activeUsageStore
+	// now 可注入：日切、窗口过期、序号保留期都要靠时间推进来测。
+	now func() time.Time
 
 	mu      sync.Mutex
 	windows map[string]*passiveWindow
 	lastGC  time.Time
-	// 主动消息日预算：key 为 scene|peer，日切时整体重置
-	activeUse map[string]int
-	activeDay string
 }
 
 type passiveWindow struct {
+	// used 是当前窗口里已经用掉的次数；seq 是这个 msg_id 的累计序号。
+	// 两者必须分开：窗口过期只把 used 归零，seq 继续往上走。
+	// 合成一个计数器（旧的写法）会让同一 msg_id 的 seq 每 5 分钟从 1 重来，
+	// 而平台判重看的是 (msg_id, msg_seq) 全局唯一。
 	used    int
+	seq     int
 	limit   int
 	ttl     time.Duration
 	expires time.Time
 }
 
-func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy) *Sender {
+func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore) *Sender {
 	return &Sender{
-		api:       api,
-		log:       log,
-		active:    active,
-		windows:   make(map[string]*passiveWindow),
-		activeUse: make(map[string]int),
+		api:     api,
+		log:     log,
+		active:  active,
+		usage:   usage,
+		now:     time.Now,
+		windows: make(map[string]*passiveWindow),
 	}
 }
 
@@ -174,11 +195,14 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
+	now := s.now()
 	s.gcLocked(now)
 
 	w, ok := s.windows[ev.MsgID]
 	if !ok {
+		if len(s.windows) >= seqCap {
+			s.evictExpiredLocked(now)
+		}
 		limit, ttl := 4, 60*time.Minute
 		if ev.Scene == host.SceneGroup {
 			limit, ttl = 5, 5*time.Minute
@@ -187,6 +211,7 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 		s.windows[ev.MsgID] = w
 	}
 	if now.After(w.expires) {
+		// 只重置剩余次数。seq 不回退——见 passiveWindow 的注释。
 		w.used = 0
 		w.expires = now.Add(w.ttl)
 	}
@@ -194,19 +219,72 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 		return 0, ErrPassiveExhausted
 	}
 	w.used++
-	return w.used, nil
+	w.seq++
+	return w.seq, nil
 }
 
-// gcLocked 清掉过期窗口，避免 map 随会话数无限增长。调用方需持锁。
+// 序号条目的保留期与上限。窗口本身 5 分钟（群）/ 60 分钟（单聊）就过期，
+// 但序号必须活得更久：删早了，窗口过期后同一个 msg_id 的 seq 就从 1 重来。
+//
+// seqRetention 是窗口过期后再留多久，覆盖平台任何合理的重试跨度
+// （远大于 60 分钟的窗口上限）。
+//
+// seqCap 是**软上界**：条目数达到它时只清理已过期的窗口（见
+// evictExpiredLocked）。若一条过期的都没有，就允许暂时超出——超出的部分
+// 只可能来自"仍在窗口有效期内的活跃 msg_id"，群 5 分钟、单聊 60 分钟，
+// 本规模（一天几十到几百条消息）下离 8192 还有几个数量级；每条 ~64 字节，
+// 多占这一点内存远比淘汰一个仍在用的窗口便宜——后者会把 used 清零（同一
+// msg_id 可以超发）、把 seq 打回 1（(msg_id, msg_seq) 重复）。
+const (
+	seqRetention = 24 * time.Hour
+	seqCap       = 8192
+)
+
+// gcLocked 清掉久未使用的窗口。调用方需持锁。
+//
+// 判据是 expires + seqRetention 而不是 expires：过期窗口还要留着序号，
+// 按 expires 删等于把 seq 一起删掉，下一个同 msg_id 的回复又从 1 开始。
 func (s *Sender) gcLocked(now time.Time) {
 	if now.Sub(s.lastGC) < time.Minute {
 		return
 	}
 	s.lastGC = now
 	for k, w := range s.windows {
-		if now.After(w.expires) {
+		if now.After(w.expires.Add(seqRetention)) {
 			delete(s.windows, k)
 		}
+	}
+}
+
+// evictExpiredLocked 在条目数达到 seqCap 时清掉一条**窗口已过期**的条目。
+//
+// 判据是"窗口过期"本身（now.After(expires)）。gcLocked 用的是更严的条件
+// （expires+seqRetention），那是为了连序号一起回收——拿它当淘汰判据就一条
+// 都删不掉，到了 seqCap 反而只能踢活跃窗口。不能只看 lastOrder：
+// 最久未用的那条往往仍在 5 分钟/60 分钟的被动窗口内，淘汰它等于把 used 清零
+// 并把 seq 打回 1，同一 msg_id 随后就会重复占用 (msg_id, msg_seq)。
+// 一条过期的都没有时什么也不删——seqCap 是软上界，见常量注释。
+//
+// 候选里挑 expires 最小的那条：过期最久的窗口最不可能再被重试，若它连
+// seqRetention 也过了，删除它连"序号重来"的代价都不存在。
+//
+// 只在新 msg_id 进来且已满时调用，所以 O(n) 的扫描是可控的（n≈8192）。
+func (s *Sender) evictExpiredLocked(now time.Time) {
+	var (
+		victimKey string
+		victimExp time.Time
+		found     bool
+	)
+	for k, w := range s.windows {
+		if !now.After(w.expires) {
+			continue // 仍在被动窗口内：绝不淘汰
+		}
+		if !found || w.expires.Before(victimExp) {
+			victimKey, victimExp, found = k, w.expires, true
+		}
+	}
+	if found {
+		delete(s.windows, victimKey)
 	}
 }
 
@@ -265,7 +343,16 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	}
 	// 主动消息的日预算比被动窗口稀缺得多（按天计），所以先扣预算再上传：
 	// 额度已尽时不该再浪费一次上传。被动回复反过来——窗口 5 分钟就过期。
-	if !s.takeActiveBudget(scene, peerID) {
+	//
+	// 扣额度是库里的一次原子 upsert（§4.1 active_usage），因此不存在
+	// "内存清零"或"重启后从 0 重来"的问题：进程只是账本的读者之一。
+	if ok, err := s.takeActiveBudget(ctx, scene, peerID); err != nil {
+		// fail-closed：账本不可信时不发。宁可少发一条，也不能把平台
+		// 每天 1000 条的配额当成无限量烧掉——额度超发是不可撤回的。
+		// 带上场景与 peer：日志里只有"记账失败"时定位不到是哪个会话
+		// 把账本写坏了（规则 7：错误必须指得回它发生在谁身上）。
+		return fmt.Errorf("%w（额度记账失败，按保守策略拒发；%s %s）: %v", ErrActiveQuota, scene, peerID, err)
+	} else if !ok {
 		return fmt.Errorf("%w（%s %s）", ErrActiveQuota, scene, peerID)
 	}
 
@@ -282,20 +369,22 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	return nil
 }
 
-// takeActiveBudget 扣一次日预算；返回 false 表示已用尽。
-func (s *Sender) takeActiveBudget(scene host.Scene, peerID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	day := time.Now().Format("2006-01-02")
-	if s.activeDay != day {
-		s.activeDay = day
-		s.activeUse = make(map[string]int)
+// takeActiveBudget 占一格日预算；ok=false 表示当日已用尽。
+// error 表示账本本身不可用（库没打开、写失败、ctx 取消），调用方必须拒发。
+func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID string) (bool, error) {
+	// 不限量时不必记账：DailyPerPeer<=0 是测试与"临时全开"的用法，
+	// 写库只会给一个永不读取的桶添行。注意这与"额度用尽"是两回事。
+	if s.active.DailyPerPeer <= 0 {
+		return true, nil
 	}
-	key := string(scene) + "|" + peerID
-	if s.active.DailyPerPeer > 0 && s.activeUse[key] >= s.active.DailyPerPeer {
-		return false
+	if s.usage == nil {
+		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
+		return false, errors.New("未配置主动消息额度账本")
 	}
-	s.activeUse[key]++
-	return true
+	key := store.ActiveUsageKey{
+		Day:   s.now().Format("2006-01-02"),
+		Scene: string(scene),
+		Peer:  peerID,
+	}
+	return s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
 }

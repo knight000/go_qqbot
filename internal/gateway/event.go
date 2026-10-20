@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/knight000/go_qqbot/internal/host"
 )
@@ -43,7 +44,8 @@ const (
 
 // messageEvents 是三个消息类事件到场景的映射。
 // GROUP_AT_MESSAGE_CREATE 与 GROUP_MESSAGE_CREATE 字段结构一致，
-// 归一化为同一类事件，下游不区分是"@了我"还是"全量模式收到的"。
+// 归一化为同一类事件：路由与订阅都不区分来源。两者的差异只落在语义标记上
+// （Name 供观测，Mentioned 表示"@ 了我"，见 mentionsBot）。
 var messageEvents = map[string]host.Scene{
 	platGroupAtMessage:  host.SceneGroup,
 	platGroupMessageAll: host.SceneGroup,
@@ -117,7 +119,10 @@ type messageData struct {
 	MsgType     int               `json:"message_type"`
 	Timestamp   string            `json:"timestamp"`
 	Attachments []json.RawMessage `json:"attachments"`
-	Mentions    []json.RawMessage `json:"mentions"`
+	// Mentions 是"@ 了别人"的列表，按官方文档**不含@机器人自身**。
+	// 因此它不参与 Mentioned 的判定（见 mentionsBot）；需要这些数据的插件
+	// 从 Event.Raw 里读，标准字段保持不变只为说明结构。
+	Mentions []json.RawMessage `json:"mentions"`
 }
 
 // genericData 覆盖通知/请求/元事件的公共字段。平台各事件的字段并不统一，
@@ -141,20 +146,71 @@ type genericData struct {
 //   - 解码表内的事件 → Kind=notice/request/meta；
 //   - 表外的事件 → Kind=unknown，保留原始 JSON 供观测，永不进入路由。
 //
+// 三个出口都会带上 Raw（≤ host.MaxRawBytes 的原文副本，超出则截断并置
+// RawTruncated）：已知事件解析后原文也要留给插件，否则平台加一个字段就得
+// 改核心 + 升契约版本，插件无法自救（票 #13）。
+//
 // 只有载荷 JSON 损坏时才返回 error——那说明本地结构体与平台不符，属于需要修代码的情况。
 func Decode(t string, raw json.RawMessage) (*host.Event, error) {
-	if scene, ok := messageEvents[t]; ok {
-		return decodeMessage(t, scene, raw)
+	var (
+		ev  *host.Event
+		err error
+	)
+	scene, isMessage := messageEvents[t]
+	spec, isKnown := eventTable[t]
+	switch {
+	case isMessage:
+		ev, err = decodeMessage(t, scene, raw)
+	case isKnown:
+		ev, err = decodeGeneric(t, spec, raw)
+	default:
+		ev = &host.Event{
+			Kind:      host.KindUnknown,
+			Name:      t,
+			Payload:   append([]byte(nil), raw...),
+			Timestamp: time.Now(),
+		}
 	}
-	if spec, ok := eventTable[t]; ok {
-		return decodeGeneric(t, spec, raw)
+	if err != nil {
+		return nil, err
 	}
-	return &host.Event{
-		Kind:      host.KindUnknown,
-		Name:      t,
-		Payload:   append([]byte(nil), raw...),
-		Timestamp: time.Now(),
-	}, nil
+	ev.Raw, ev.RawTruncated = copyRaw(raw)
+	return ev, nil
+}
+
+// mentionsBot 判定"这条消息 @ 了机器人"。
+//
+// 唯一可靠的口径是平台事件类型，不是载荷里的 mentions：官方文档对
+// GROUP_AT_MESSAGE_CREATE 的 mentions 字段原文是「消息中@的用户列表
+// （不含@机器人自身）」——数组里永远不会有机器人自己，反推必然错。
+// GROUP_MESSAGE_CREATE（全量模式）载荷里也没有任何「@ 了机器人」的标记，
+// 所以为 false；单聊与其它事件在一开始就不是消息路径，恒为 false。
+//
+// 平台事件名只在本包出现，核心与插件看到的是布尔语义（ARCHITECTURE §1.4）。
+func mentionsBot(t string) bool {
+	return t == platGroupAtMessage
+}
+
+// copyRaw 生成原文副本并按上限截断。
+//
+// 副本而不是切片：入参 RawMessage 可能指向一整个 WS 帧的大 buffer，
+// 截一段留着会把整帧一起钉在内存里。截断时多分配一份上限大小的 buffer，
+// 但 RawTruncated 让下游知道它不完整。
+//
+// 截断点退到最近的 rune 边界：按字节硬切可能落在一个多字节字符（中文 3 字节、
+// emoji 4 字节）中间，那样 Raw 连合法 UTF-8 都不是，插件会误判成平台发了坏
+// 编码。上限仍是 MaxRawBytes，最多少留 3 个字节。
+func copyRaw(raw json.RawMessage) ([]byte, bool) {
+	if len(raw) <= host.MaxRawBytes {
+		return append([]byte(nil), raw...), false
+	}
+	n := host.MaxRawBytes
+	for n > 0 && !utf8.RuneStart(raw[n]) {
+		n--
+	}
+	out := make([]byte, n)
+	copy(out, raw[:n])
+	return out, true
 }
 
 func decodeMessage(t string, scene host.Scene, raw json.RawMessage) (*host.Event, error) {
@@ -173,6 +229,7 @@ func decodeMessage(t string, scene host.Scene, raw json.RawMessage) (*host.Event
 		Content:   normalizeContent(d.Content),
 		MsgType:   d.MsgType,
 		HasMedia:  len(d.Attachments) > 0,
+		Mentioned: mentionsBot(t),
 		Timestamp: parseTime(d.Timestamp),
 	}
 	if scene == host.SceneGroup {

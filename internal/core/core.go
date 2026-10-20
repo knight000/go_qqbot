@@ -97,7 +97,13 @@ func New(o Options) (*Core, error) {
 			})
 		}
 	}
-	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config))
+	// 显式判空再赋给接口：nil 的 *store.DB 装进接口是个非 nil 接口，
+	// Sender 会以为有账本、调用时再 nil 解引用。
+	var usage activeUsageStore
+	if o.Store != nil {
+		usage = o.Store
+	}
+	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage)
 	sender.trace = trace
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
@@ -129,8 +135,19 @@ func New(o Options) (*Core, error) {
 	}, nil
 }
 
-// Start 依次完成：绑定任务执行者 → 插件 Init（注册 Job）→ 启动调度 → 启动插件 → 生成认领令牌。
+// Start 依次完成：校验插件配置 → 绑定任务执行者 → 插件 Init（注册 Job）
+// → 启动调度 → 启动插件 → 生成认领令牌。
 func (c *Core) Start(ctx context.Context) error {
+	// 配置校验整体先于任何 Init：Manifest.config_schema 是「声明即必填」的契约
+	// （评审 §4.1）。放到各自 Init 之前逐个做也不行——先校验先 Init 的话，后面
+	// 有插件配置写错时，前面的插件已经拿着零值跑起来了，报错就晚了。
+	for _, p := range c.plugins {
+		m := p.Manifest()
+		if err := m.ValidateConfig(c.cfg.Plugin(m.Name)); err != nil {
+			return err
+		}
+	}
+
 	for _, p := range c.plugins {
 		c.sched.Bind(p.Manifest().Name, p)
 	}

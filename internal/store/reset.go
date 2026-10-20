@@ -160,6 +160,12 @@ func (db *DB) ClearPeerData(ctx context.Context, peer string) (ResetCounts, erro
 	}
 	c.JobRuns, _ = res.RowsAffected()
 
+	// 主动消息的日预算跟着业务数据走（§8.3）：清了这个会话的数据，
+	// 等于承认它重新开始，额度也重开。R1/R0 不走这里，所以预算不受影响。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM active_usage WHERE peer = ?`, peer); err != nil {
+		return c, fmt.Errorf("清理主动消息预算: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return c, fmt.Errorf("提交清理事务: %w", err)
 	}
@@ -199,6 +205,12 @@ func (db *DB) ClearAllData(ctx context.Context) (ResetCounts, error) {
 			return c, fmt.Errorf("清空 %s: %w", t.table, err)
 		}
 		*t.into, _ = res.RowsAffected()
+	}
+
+	// active_usage 只清不计数：摘要里的条数是给用户看的业务数据量，
+	// 预算行属于记账，混进去只会让人多问一句"这是什么"。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM active_usage`); err != nil {
+		return c, fmt.Errorf("清空 active_usage: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

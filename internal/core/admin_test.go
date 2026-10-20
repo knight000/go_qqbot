@@ -31,7 +31,7 @@ func newAdminCore(t *testing.T) (*Core, *fakeAPI) {
 		store:     db,
 		cfg:       &config.Config{},
 		log:       slog.New(slog.DiscardHandler),
-		sender:    NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}),
+		sender:    NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil),
 		startedAt: time.Now(),
 		restart:   make(chan RestartRequest, 1),
 	}
