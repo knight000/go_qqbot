@@ -40,6 +40,31 @@ func TestTakeActiveBudgetStopsAtLimit(t *testing.T) {
 	}
 }
 
+// limit <= 0 必须直接拒发，连行都不该写。
+// 单靠 WHERE used < ? 拦不住：upsert 的 INSERT 分支不看 WHERE，
+// 新 key 会插进一行 used=1 并返回成功——那等于把"不限量"错读成"放开"。
+func TestTakeActiveBudgetNonPositiveLimitRefuses(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	for _, limit := range []int{0, -1} {
+		ok, err := db.TakeActiveBudget(ctx, "2026-10-20", "c2c", "u1", limit)
+		if err != nil {
+			t.Fatalf("limit=%d 不该报错: %v", limit, err)
+		}
+		if ok {
+			t.Fatalf("limit=%d 必须拒发", limit)
+		}
+	}
+	var n int
+	if err := db.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM active_usage`).Scan(&n); err != nil {
+		t.Fatalf("统计预算行: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("limit<=0 时不该写任何预算行，实际 %d 行", n)
+	}
+}
+
 // 落库的全部意义：换一个连接重开同一个库，额度还在。
 func TestActiveBudgetSurvivesReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.db")
