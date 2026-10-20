@@ -221,3 +221,21 @@ func TestRouterMatchWithoutCommandLeavesArgsEmpty(t *testing.T) {
 		t.Fatalf("未命中命令时 Command/Args 应为空，实际 %q / %q", ms[0].Command, ms[0].Args)
 	}
 }
+
+// Lookup 是会话投递的取人入口：会话行里只存插件名，重载/卸载之后
+// 名字可能已经不在路由表里，返回 nil 就是"悬挂会话"的判定依据。
+func TestRouterLookup(t *testing.T) {
+	p := &fakePlugin{m: manifest("md", 10, "/md")}
+	router, err := NewRouter([]host.Plugin{p})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := router.Lookup("md")
+	if rt == nil || rt.plugin != host.Plugin(p) || rt.manifest.Name != "md" {
+		t.Fatalf("应取到 md 的路由项: %+v", rt)
+	}
+	if router.Lookup("ghost") != nil {
+		t.Fatal("未加载的插件应返回 nil")
+	}
+}

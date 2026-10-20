@@ -295,27 +295,27 @@ func (c *Core) runReset(ctx context.Context, spec resetSpec, peer string) (strin
 		return "已断开，等待 Resume", nil
 
 	case store.ResetLevelSession:
-		n, err := c.store.ClearPeerSession(ctx, peer)
+		counts, err := c.store.ClearPeerSession(ctx, peer)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("会话状态 %d 条", n), nil
+		return fmt.Sprintf("会话状态 %d 条、会话接管 %d 个", counts.KVRows, counts.Sessions), nil
 
 	case store.ResetLevelData:
 		counts, files, err := c.clearPeerData(ctx, peer)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("消息 %d 条、媒体 %d 个（文件 %d）、任务记录 %d 条",
-			counts.Messages, counts.MediaRows, files, counts.JobRuns), nil
+		return fmt.Sprintf("消息 %d 条、媒体 %d 个（文件 %d）、任务记录 %d 条、会话接管 %d 个",
+			counts.Messages, counts.MediaRows, files, counts.JobRuns, counts.Sessions), nil
 
 	case store.ResetLevelAll:
 		counts, files, err := c.clearAllData(ctx)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("消息 %d 条、媒体 %d 个（文件 %d）、插件会话 %d 条、任务记录 %d 条、去重记录 %d 条、身份映射 %d 条",
-			counts.Messages, counts.MediaRows, files, counts.KVRows, counts.JobRuns, counts.Events, counts.Identities), nil
+		return fmt.Sprintf("消息 %d 条、媒体 %d 个（文件 %d）、插件会话 %d 条、任务记录 %d 条、去重记录 %d 条、身份映射 %d 条、会话接管 %d 个",
+			counts.Messages, counts.MediaRows, files, counts.KVRows, counts.JobRuns, counts.Events, counts.Identities, counts.Sessions), nil
 	}
 	return "", fmt.Errorf("未知级别 %q", spec.level)
 }
@@ -391,15 +391,15 @@ func (c *Core) resetPreview(ctx context.Context, spec resetSpec, peer string) (s
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("将清空该会话的消息、媒体文件与任务记录：当前消息 %d 条、媒体 %d 个、任务记录 %d 条",
-			counts.Messages, counts.MediaRows, counts.JobRuns), nil
+		return fmt.Sprintf("将清空该会话的消息、媒体文件与任务记录：当前消息 %d 条、媒体 %d 个、任务记录 %d 条、会话接管 %d 个",
+			counts.Messages, counts.MediaRows, counts.JobRuns, counts.Sessions), nil
 	case store.ResetLevelAll:
 		counts, err := c.store.DataStats(ctx)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("将清空全部业务数据：当前消息 %d 条、媒体 %d 个、插件会话 %d 条、任务记录 %d 条、去重记录 %d 条、身份映射 %d 条",
-			counts.Messages, counts.MediaRows, counts.KVRows, counts.JobRuns, counts.Events, counts.Identities), nil
+		return fmt.Sprintf("将清空全部业务数据：当前消息 %d 条、媒体 %d 个、插件会话 %d 条、任务记录 %d 条、去重记录 %d 条、身份映射 %d 条、会话接管 %d 个",
+			counts.Messages, counts.MediaRows, counts.KVRows, counts.JobRuns, counts.Events, counts.Identities, counts.Sessions), nil
 	}
 	return "将执行 " + spec.name + " 重置", nil
 }

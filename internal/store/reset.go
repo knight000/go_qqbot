@@ -44,6 +44,9 @@ type ResetCounts struct {
 	Identities int64
 	Events     int64
 	KVRows     int64
+	// Sessions 是被清掉的会话接管行数。它单独成列而不是并进 KVRows：
+	// 两者是不同的东西（谁接这条消息 vs 存了什么），摘要里也要分开说。
+	Sessions int64
 }
 
 func (c *ResetCounts) add(o ResetCounts) {
@@ -53,11 +56,12 @@ func (c *ResetCounts) add(o ResetCounts) {
 	c.Identities += o.Identities
 	c.Events += o.Events
 	c.KVRows += o.KVRows
+	c.Sessions += o.Sessions
 }
 
 // Total 表示这次到底动了多少行；0 时调用方可以回"没有可清理的数据"。
 func (c ResetCounts) Total() int64 {
-	return c.Messages + c.MediaRows + c.JobRuns + c.Identities + c.Events + c.KVRows
+	return c.Messages + c.MediaRows + c.JobRuns + c.Identities + c.Events + c.KVRows + c.Sessions
 }
 
 // --- 媒体文件 ---
@@ -109,21 +113,44 @@ func scanPaths(rows interface {
 
 // --- 分级清理 ---
 
-// ClearPeerSession 是 R1：只删该会话私有的插件 KV。
+// ClearPeerSession 是 R1：删该会话私有的插件 KV，以及该 peer 的会话接管行。
 // 插件级全局键（peer 为空串）不在此列——它们不属于任何一个会话。
-func (db *DB) ClearPeerSession(ctx context.Context, peer string) (int64, error) {
+//
+// 会话接管必须一起清（ADR-0004 决策 10）：不清就等于"重置完留下一个永远
+// 等不到输入的悬挂会话"，用户下一步输入会被一个已经忘记上下文的插件接管。
+// 退群也走这个函数，语义相同：群都不在了，谁在等它的下一条消息没有意义。
+func (db *DB) ClearPeerSession(ctx context.Context, peer string) (ResetCounts, error) {
+	var c ResetCounts
 	if peer == "" {
-		return 0, fmt.Errorf("清理会话状态需要 peer")
+		return c, fmt.Errorf("清理会话状态需要 peer")
 	}
-	res, err := db.w.ExecContext(ctx, `DELETE FROM plugin_kv WHERE peer = ?`, peer)
+	// 一个事务：两张表要么都清、要么都不动。否则失败时摘要报"失败"，
+	// 而 KV 其实已经没了。
+	tx, err := db.w.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("清理会话状态: %w", err)
+		return c, fmt.Errorf("开启清理事务: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM plugin_kv WHERE peer = ?`, peer)
+	if err != nil {
+		return c, fmt.Errorf("清理会话状态: %w", err)
+	}
+	c.KVRows, _ = res.RowsAffected()
+
+	res, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE peer = ?`, peer)
+	if err != nil {
+		return c, fmt.Errorf("清理会话接管: %w", err)
+	}
+	c.Sessions, _ = res.RowsAffected()
+
+	if err := tx.Commit(); err != nil {
+		return c, fmt.Errorf("提交清理事务: %w", err)
+	}
+	return c, nil
 }
 
-// ClearPeerData 是 R2：删该会话的消息、媒体行与任务执行历史。
+// ClearPeerData 是 R2：删该会话的消息、媒体行、任务执行历史与会话接管。
 // 文件由调用方在调用本函数之前删除（先文件、后行）。
 //
 // job_runs 按 peer 删：jobs 的实例行保留（那是任务定义，§8.3 的硬约定），
@@ -159,6 +186,14 @@ func (db *DB) ClearPeerData(ctx context.Context, peer string) (ResetCounts, erro
 		return c, fmt.Errorf("清理任务记录: %w", err)
 	}
 	c.JobRuns, _ = res.RowsAffected()
+
+	// 会话接管跟着业务数据一起清：R2 的语义是"这个会话重新开始"，
+	// 挂着一个正在等输入的会话是荒谬状态。
+	res, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE peer = ?`, peer)
+	if err != nil {
+		return c, fmt.Errorf("清理会话接管: %w", err)
+	}
+	c.Sessions, _ = res.RowsAffected()
 
 	// 主动消息的日预算跟着业务数据走（§8.3）：清了这个会话的数据，
 	// 等于承认它重新开始，额度也重开。R1/R0 不走这里，所以预算不受影响。
@@ -199,6 +234,7 @@ func (db *DB) ClearAllData(ctx context.Context) (ResetCounts, error) {
 		{"plugin_kv", &c.KVRows},
 		{"job_runs", &c.JobRuns},
 		{"identities", &c.Identities},
+		{"sessions", &c.Sessions},
 	} {
 		res, err := tx.ExecContext(ctx, `DELETE FROM `+t.table)
 		if err != nil {
@@ -247,6 +283,11 @@ func (db *DB) PeerStats(ctx context.Context, peer string) (ResetCounts, error) {
 		`SELECT COUNT(*) FROM job_runs WHERE peer = ?`, peer).Scan(&c.JobRuns); err != nil {
 		return c, fmt.Errorf("统计 peer 任务记录: %w", err)
 	}
+	// 会话行也进预览：R2 会删它，预览少算一项就是"说清 3 项、实际动了 4 项"。
+	if err := db.r.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions WHERE peer = ?`, peer).Scan(&c.Sessions); err != nil {
+		return c, fmt.Errorf("统计 peer 会话: %w", err)
+	}
 	return c, nil
 }
 
@@ -263,6 +304,7 @@ func (db *DB) DataStats(ctx context.Context) (ResetCounts, error) {
 		{"plugin_kv", &c.KVRows},
 		{"job_runs", &c.JobRuns},
 		{"identities", &c.Identities},
+		{"sessions", &c.Sessions},
 	} {
 		if err := db.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+t.table).Scan(t.into); err != nil {
 			return c, fmt.Errorf("统计 %s: %w", t.table, err)

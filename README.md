@@ -340,8 +340,8 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 | 指令 | 清什么 | 身份 | 冷却 |
 |---|---|---|---|
 | `/reset reconnect`（`r0`） | 不动数据，断开并立即重连（保留 session，走 Resume） | owner | 60 s |
-| `/reset session`（`r1`） | 本会话的插件状态（`plugin_kv` 里 `peer` 非空的行） | Bot 管理员 | 10 min |
-| `/reset data`（`r2`） | 本会话的消息、媒体文件、任务记录与主动消息日额度（`active_usage` 按 peer 清） | Bot 管理员 + 确认码 | 1 h |
+| `/reset session`（`r1`） | 本会话的插件状态（`plugin_kv` 里 `peer` 非空的行）与会话接管（`sessions` 该 peer 的行） | Bot 管理员 | 10 min |
+| `/reset data`（`r2`） | 本会话的消息、媒体文件、任务记录、主动消息日额度（`active_usage` 按 peer 清）与会话接管（`sessions` 按 peer 清） | Bot 管理员 + 确认码 | 1 h |
 | `/reset all`（`r3`） | 全部业务数据 | owner + 确认码 + 短语 | 24 h |
 | `/reset status` | 各档冷却与最近 5 条记录 | Bot 管理员 | — |
 
