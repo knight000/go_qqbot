@@ -227,7 +227,7 @@ func (d *Dispatcher) takeOverSession(ctx context.Context, ev *host.Event) bool {
 		return false
 	}
 	now := time.Now()
-	if !row.ExpiresAt.After(now) {
+	if sessionExpired(row.ExpiresAt, now) {
 		// 过期等于行不存在：读路径顺手删掉，GC 只是兜底。
 		if err := d.sessions.DeleteSession(ctx, ev.PeerID); err != nil {
 			d.log.Warn("清理过期会话失败", "peer", ev.PeerID, "err", err)

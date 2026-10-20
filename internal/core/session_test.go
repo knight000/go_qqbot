@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -92,6 +93,39 @@ func TestAwaitReplacesExpiredRow(t *testing.T) {
 	row, _, _ := db.Session(ctx, "g1")
 	if row.Plugin != "new" || string(row.State) != "fresh" {
 		t.Fatalf("应换成新持有者: %+v", row)
+	}
+}
+
+// 自己持有的行已过期：按"过期即不存在"处理，连同 created_at 一起重算。
+// 两条判定（过期 / 持有者是自己）的先后不影响成功与否，只决定这一列——
+// 留旧值会让排障读到上一个会话的接管时刻。
+func TestAwaitReplacesOwnExpiredRow(t *testing.T) {
+	db := newUsageStore(t)
+	backend := newSessionBackend(t, db, newStub("md", "/md", host.PermUser, ""))
+	ctx := context.Background()
+
+	past := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := db.ReplaceSession(ctx, store.Session{
+		Peer: "g1", Scene: "group", Plugin: "md",
+		State:     []byte("stale"),
+		CreatedAt: past,
+		ExpiresAt: past.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := backend.AwaitSession(ctx, "md", sessionEvent("g1"), []byte("next"), time.Minute); err != nil {
+		t.Fatalf("自己持有的过期行不该报错: %v", err)
+	}
+	row, _, _ := db.Session(ctx, "g1")
+	if string(row.State) != "next" {
+		t.Fatalf("state 应被覆盖，实际 %q", row.State)
+	}
+	if !row.CreatedAt.After(past) {
+		t.Fatalf("过期行的 created_at 应重算，实际仍是 %s", row.CreatedAt)
+	}
+	if !row.ExpiresAt.After(time.Now()) {
+		t.Fatalf("过期时间应被重算，实际 %s", row.ExpiresAt)
 	}
 }
 
@@ -269,6 +303,148 @@ func TestSessionTwoRounds(t *testing.T) {
 	}
 	if _, ok, _ := db.Session(ctx, "g1"); ok {
 		t.Fatal("消费后会话行应消失")
+	}
+}
+
+// chainingStub 在**消费轮里再登记下一步**：这是决策 3「先删后投」唯一的行为证据。
+// 现有 awaitingStub 拿到 SessionContext 后就不再 Await，于是"清理放在投递之后"
+// 这种改坏方式它一个用例都测不出来。
+//
+// 步数由 state 内容判断，不用插件内的外部计数器：计数器与"库里还有没有行"无关，
+// 存了就等于让测试自己记住进度，反而测不出行被吃掉。
+type chainingStub struct {
+	manifest host.Manifest
+	session  host.Session
+
+	mu    sync.Mutex
+	calls int
+	seen  [][]byte // 每轮拿到的 Session.State；无 Session 记 nil
+}
+
+func (p *chainingStub) Manifest() host.Manifest { return p.manifest }
+
+func (p *chainingStub) Init(_ context.Context, h host.Host) error {
+	p.session = h.Session()
+	return nil
+}
+
+func (p *chainingStub) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
+	var next []byte
+	var err error
+	switch {
+	case ev.Session == nil:
+		// 第一轮：登记第二步。
+		next = []byte("step2")
+	case string(ev.Session.State) == "step2":
+		// 第二轮：拿到上一轮写进去的字节，再登记第三步。
+		next = []byte("step3")
+	case string(ev.Session.State) == "step3":
+		// 最后一轮：不再登记，行应当彻底消失。
+	default:
+		err = fmt.Errorf("意外的会话 state: %q", ev.Session.State)
+	}
+
+	p.mu.Lock()
+	p.calls++
+	var seen []byte
+	if ev.Session != nil {
+		seen = append([]byte(nil), ev.Session.State...)
+	}
+	p.seen = append(p.seen, seen)
+	p.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	if next != nil {
+		if err := p.session.Await(ctx, ev, next, time.Minute); err != nil {
+			return nil, err
+		}
+		return &host.Reply{Content: p.manifest.Name + ":next"}, nil
+	}
+	return &host.Reply{Content: p.manifest.Name + ":done"}, nil
+}
+
+func (p *chainingStub) states() [][]byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([][]byte(nil), p.seen...)
+}
+
+func (p *chainingStub) callsN() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// 三轮链式会话：每条消息都在 Handle 里登记下一步。
+//
+// 关键断言是"第二轮消费之后行仍然存在"——清理若被挪到 d.run(...) 之后，
+// 第二轮 Handle 里登记的新行会被这一轮自己的清理吃掉，第三条消息就没人接了。
+// 这是"先删后投"（ADR-0004 决策 3）在测试里的唯一证据。
+func TestSessionChainsAcrossRounds(t *testing.T) {
+	db := newUsageStore(t)
+	a := &chainingStub{manifest: host.Manifest{
+		Name: "md", APIVersion: host.APIVersion, Intents: []string{"message"},
+		Commands: []host.Command{{Prefix: "/start", Priority: 10}},
+	}}
+	b := &awaitingStub{manifest: host.Manifest{
+		Name: "all", APIVersion: host.APIVersion, Intents: []string{"message"},
+	}}
+	d, _ := newSessionDispatcher(t, db, a, b)
+	ctx := context.Background()
+	round := func(content string) {
+		t.Helper()
+		ev := groupEvent(content, host.Principal{Role: host.RoleUser})
+		ev.ID = "e-" + content
+		ev.MsgID = "m-" + content
+		d.handle(ctx, ev)
+	}
+
+	round("/start")
+	if _, ok, _ := db.Session(ctx, "g1"); !ok {
+		t.Fatal("第一轮之后应留下会话行")
+	}
+
+	round("第二轮")
+	row, ok, err := db.Session(ctx, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("第二轮消费后行仍应在：Handle 里登记的下一步不得被本轮的清理吃掉")
+	}
+	if string(row.State) != "step3" {
+		t.Fatalf("第二轮应登记 step3，实际 %q", row.State)
+	}
+
+	round("第三轮")
+	if _, ok, _ := db.Session(ctx, "g1"); ok {
+		t.Fatal("最后一轮不再登记，行应消失")
+	}
+
+	if got := a.callsN(); got != 3 {
+		t.Fatalf("三轮都该投给持有者，实际 %d 次", got)
+	}
+	if b.calls() != 0 {
+		t.Fatalf("会话接管必须跳出静态匹配，实际 all 被调用 %d 次", b.calls())
+	}
+	want := []string{"<nil>", "step2", "step3"}
+	got := a.states()
+	if len(got) != len(want) {
+		t.Fatalf("应记录 %d 轮 state，实际 %d", len(want), len(got))
+	}
+	for i, sc := range got {
+		if sc == nil {
+			if want[i] != "<nil>" {
+				t.Fatalf("第 %d 轮不该带 SessionContext", i+1)
+			}
+			continue
+		}
+		// 逐字节比较：插件第二轮必须拿到第一轮写进去的字节。
+		if string(sc) != want[i] {
+			t.Fatalf("第 %d 轮 state = %q，期望 %q", i+1, sc, want[i])
+		}
 	}
 }
 
@@ -541,7 +717,7 @@ func TestResetLevelsClearSessions(t *testing.T) {
 	seedSession(t, c, "g1", "md", time.Now().Add(time.Minute))
 	seedSession(t, c, "g2", "md", time.Now().Add(time.Minute))
 	got := resetCall(t, c, f, ctx, "/reset session", "owner-1", host.SceneGroup, "g1")
-	if !strings.Contains(got, "接管 1 个") {
+	if !strings.Contains(got, "会话接管 1 个") {
 		t.Fatalf("R1 摘要应报出清掉的会话数，实际: %q", got)
 	}
 	if hasSession(t, c, "g1") {
@@ -586,6 +762,18 @@ func TestResetLevelsClearSessions(t *testing.T) {
 	if n, _ := c.store.CountSessions(ctx); n != 0 {
 		t.Fatalf("R3 后会话表应为空，实际 %d", n)
 	}
+
+	// R0 不碰 sessions：重连只换网关连接，会话是业务数据（ADR-0004 决策 10）。
+	seedSession(t, c, "g1", "md", time.Now().Add(time.Minute))
+	hook := &fakeReconnector{}
+	c.SetReconnector(hook)
+	got = resetCall(t, c, f, ctx, "/reset reconnect", "owner-1", host.SceneC2C, "owner-1")
+	if hook.calls != 1 {
+		t.Fatalf("R0 应触发一次重连，实际 %d 次: %q", hook.calls, got)
+	}
+	if !hasSession(t, c, "g1") {
+		t.Fatalf("R0 不得清会话行，实际: %q", got)
+	}
 }
 
 // GC 兜底清过期会话：再也没有人来读的那些行只靠它消失。
@@ -618,32 +806,32 @@ func TestGroupStatusShowsSession(t *testing.T) {
 	}
 
 	got := resetCall(t, c, f, ctx, "/group status", "owner-1", host.SceneGroup, "g1")
-	if !strings.Contains(got, "会话 无") {
-		t.Fatalf("无会话时应显示「会话 无」，实际: %q", got)
+	if !strings.Contains(got, "会话接管 无") {
+		t.Fatalf("无会话时应显示「会话接管 无」，实际: %q", got)
 	}
 
 	seedSession(t, c, "g1", "md", time.Now().Add(4*time.Minute+12*time.Second))
 	got = resetCall(t, c, f, ctx, "/group status", "owner-1", host.SceneGroup, "g1")
-	if !strings.Contains(got, "会话 插件 md") || !strings.Contains(got, "剩余") {
+	if !strings.Contains(got, "会话接管 插件 md") || !strings.Contains(got, "剩余") {
 		t.Fatalf("应显示持有者与剩余时间，实际: %q", got)
 	}
 }
 
-// 私聊总览给"有多少 peer 处于会话中"；0 时不输出这一项，与「已退出」同风格。
+// 私聊总览给"有多少 peer 被会话接管"；0 时不输出这一项，与「已退出」同风格。
 func TestGroupOverviewCountsSessions(t *testing.T) {
 	c, f := newAdminCore(t)
 	seedAdmin(t, c, "owner-1", "", store.RoleOwner)
 	ctx := context.Background()
 
 	got := resetCall(t, c, f, ctx, "/group status", "owner-1", host.SceneC2C, "owner-1")
-	if strings.Contains(got, "会话中") {
+	if strings.Contains(got, "会话接管") {
 		t.Fatalf("没有会话时不应输出这一项，实际: %q", got)
 	}
 
 	seedSession(t, c, "g1", "md", time.Now().Add(time.Minute))
 	seedSession(t, c, "g2", "md", time.Now().Add(time.Minute))
 	got = resetCall(t, c, f, ctx, "/group status", "owner-1", host.SceneC2C, "owner-1")
-	if !strings.Contains(got, "会话中 2") {
+	if !strings.Contains(got, "会话接管 2 个") {
 		t.Fatalf("应显示进行中的会话数，实际: %q", got)
 	}
 }

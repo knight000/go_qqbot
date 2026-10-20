@@ -299,7 +299,7 @@ func (c *Core) runReset(ctx context.Context, spec resetSpec, peer string) (strin
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("会话状态 %d 条、接管 %d 个", counts.KVRows, counts.Sessions), nil
+		return fmt.Sprintf("会话状态 %d 条、会话接管 %d 个", counts.KVRows, counts.Sessions), nil
 
 	case store.ResetLevelData:
 		counts, files, err := c.clearPeerData(ctx, peer)

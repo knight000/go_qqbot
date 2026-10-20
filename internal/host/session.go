@@ -75,9 +75,6 @@ type sessionStore struct {
 }
 
 func (s *sessionStore) Await(ctx context.Context, ev *Event, state []byte, ttl time.Duration) error {
-	if s.backend == nil {
-		return errSessionUnavailable
-	}
 	if ev == nil || ev.PeerID == "" {
 		return errors.New("没有 peer，无法登记会话")
 	}

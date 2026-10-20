@@ -147,9 +147,13 @@ func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {
 }
 
 // CountSessions 是"有多少 peer 正处于会话中"，供 /group status 总览用。
+//
+// 必须与读路径同一口径（ADR-0004 决策 4：过期等于行不存在），否则同一个 peer
+// 会在 /group status <群> 显示「无」，而私聊总览报「1」——最长虚报一个 GC 周期。
 func (db *DB) CountSessions(ctx context.Context) (int64, error) {
 	var n int64
-	if err := db.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&n); err != nil {
+	if err := db.r.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions WHERE expires_at > ?`, nowUnix()).Scan(&n); err != nil {
 		return 0, fmt.Errorf("统计会话: %w", err)
 	}
 	return n, nil
