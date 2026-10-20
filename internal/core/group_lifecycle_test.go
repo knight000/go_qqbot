@@ -22,7 +22,7 @@ func newLifecycleCore(t *testing.T) (*Core, *fakeAPI, context.Context) {
 	f.errs = map[string]error{}
 	c.api = f
 	// DailyPerPeer=0 表示不限：测试里要断言"发了 2 条"，不能被日预算截断。
-	c.sender = NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{Enabled: true})
+	c.sender = NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{Enabled: true}, c.store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
