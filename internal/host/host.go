@@ -2,7 +2,13 @@
 //
 // 核心原则（ARCHITECTURE.md §3.3）：
 //   - 插件只拿到 Host 暴露的能力，不直连 SQLite、不直连 WS、不读环境变量取密钥；
-//   - 能力清单即权限清单：HTTP 域名白名单来自 Manifest，KV 自动按插件命名空间隔离。
+//   - 隔离由核心承担：HTTP 域名白名单来自 Manifest.AllowedDomains，KV 按插件
+//     命名空间隔离，权限由 Manifest.Permission 在路由阶段拦截。
+//
+// Manifest.Capabilities 是保留字段：核心从不读取它，它只是插件作者的自述，
+// 既不构成授权也不构成拒绝。别把它当权限清单读（评审 §4.1）。
+//
+// 本文件里的「评审 §x.y」指 docs/reviews/2026-10-20-nonebot2-review.md 的对应小节。
 package host
 
 import (
@@ -304,6 +310,9 @@ type Host interface {
 }
 
 // Command 是声明式路由规则：前缀或正则二选一。
+//
+// 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配（网关解出 mentions 后即
+// 丢弃，见评审 §4.2）。
 type Command struct {
 	Prefix      string
 	Pattern     string
@@ -319,15 +328,27 @@ type Command struct {
 }
 
 type Manifest struct {
-	Name           string
-	Version        string
-	APIVersion     string
-	Capabilities   []string
-	Intents        []string // 订阅的事件：`message` 这样的大类，或 `group.message` 这样的场景限定
-	Commands       []Command
+	Name       string
+	Version    string
+	APIVersion string
+	// Capabilities 是**保留字段**：核心从不读取，不产生任何授权或拒绝。
+	// 门控是 Manifest 的另外三项——AllowedDomains、Permission、配置里的主动
+	// 消息白名单（评审 §4.1）。删字段要改所有插件的 Manifest，所以保留。
+	Capabilities []string
+	Intents      []string // 订阅的事件：`message` 这样的大类，或 `group.message` 这样的场景限定
+	Commands     []Command
+	// Broadcast 让中标插件声明“同优先级的其它插件也执行”。
+	//
+	// 它只对中标者生效：候选先按 priority 降序、同 priority 按插件名字典序升序
+	// 排序（Router.Match），再取第一个有权限的作为中标者（Dispatcher.handle）。
+	// 所以名字靠前的 Broadcast=false 会压掉靠后的 Broadcast=true，且没有提示——
+	// 已知缺陷，取舍与替代方案见评审 §2.3。
 	Broadcast      bool
 	AllowedDomains []string
-	ConfigSchema   map[string]string // 配置项声明，启动时做存在性校验
+	// ConfigSchema 是**保留字段**：核心从不读取，启动期既不做存在性校验也不做
+	// 类型校验，配置写错仍能启动。必填项与类型要由插件自己在 Init 里检查
+	// （评审 §4.1）。
+	ConfigSchema map[string]string
 
 	// Permission 是插件级默认权限：命令自身未声明时继承它。
 	// 零值 = 不限制（等价 PermUser）。
