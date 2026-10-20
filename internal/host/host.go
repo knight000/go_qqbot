@@ -37,8 +37,10 @@ import (
 // 版本 8：批内三张票共用这一个版本（#11 / #12 / #13），因为它们同期落地、
 // 插件本来就要一起改：
 //   - Manifest.Yield 取代 Broadcast：是否让位由每个匹配者自己声明（§3.4）；
-//   - Event.Command / Event.Args 由核心填好，前缀匹配按词边界（`/md5` 不再
-//     命中 `/md`）；
+//   - Event.Command / Event.Args 由核心在调用 Handle 之前填好：Command 是命中的
+//     前缀原文或正则源码，Args 是命令之后已 TrimSpace 的剩余原文；前缀匹配默认
+//     按词边界（`/md5` 不再命中 `/md`），确需裸前缀时在 Command 上声明 Loose，
+//     插件不再自己 CutPrefix / HasPrefix；
 //   - Event.Mentioned / Event.Raw 暴露"是否 @ 了机器人"与原始载荷。
 //
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
@@ -95,6 +97,16 @@ type Event struct {
 	UnionID  string // 平台给的跨场景标识，可能为空
 	MsgID    string // 被动回复必须携带
 	Content  string
+	// Command 是本次投递命中的命令写法：前缀的原文，或正则的源码；未命中为空串。
+	// Args 是命中片段之后、已 TrimSpace 的剩余原文；未命中同样为空串。
+	//
+	// 两者都由核心在路由阶段填好（§3.4），插件不要再从 Content 里 CutPrefix：
+	// 命令词边界与参数切分只有一份实现，在路由层。Content 仍是 TrimSpace 过的
+	// 完整原文，两者并存——要判断"用户到底敲了什么"读 Content，要取参数读 Args。
+	//
+	// 一次派发执行多个插件时，每个插件拿到的是它自己命中那条命令的 Command/Args。
+	Command string
+	Args    string
 	// MsgType 是平台的 message_type：0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用。
 	MsgType int
 	// HasMedia 表示平台载荷里带附件。附件不会被下载（入站媒体不做），
@@ -323,7 +335,11 @@ type Host interface {
 // 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配（网关解出 mentions 后即
 // 丢弃，见评审 §4.2）。
 type Command struct {
-	Prefix      string
+	Prefix string
+	// Loose 只对 Prefix 生效，默认 false = 严格：前缀之后必须是空白或字符串结尾，
+	// 所以 `/md5 abc` 不命中 `/md`。置 true 退回裸 HasPrefix 语义，
+	// 只给"前缀本身就是完整词、后面紧跟内容"这类确有需要的写法用。
+	Loose       bool
 	Pattern     string
 	Priority    int
 	Description string

@@ -72,40 +72,27 @@ func newPlugin(t *testing.T, r host.Renderer) (*Plugin, *fakeHost) {
 	return p, h
 }
 
-func msg(content string) *host.Event {
-	return &host.Event{ID: "e1", Kind: host.KindMessage, Scene: host.SceneGroup, Content: content}
+// ev 构造一条"路由已判过命中"的事件：Command 与 Args 由路由层填好
+// （命令词边界与参数切分不在插件里，见 core/router.go 的 argsAfterPrefix）。
+func ev(args string) *host.Event {
+	return &host.Event{
+		ID: "e1", Kind: host.KindMessage, Scene: host.SceneGroup,
+		Content: "/md " + args, Command: "/md", Args: args,
+	}
 }
 
-// 指令判定是插件自己的事：Manifest 里的前缀只是粗筛（裸 HasPrefix 会命中 /md5）。
-func TestParse(t *testing.T) {
-	cases := []struct {
-		in   string
-		src  string
-		ok   bool
-		note string
-	}{
-		{in: "/md # 标题", src: "# 标题", ok: true},
-		{in: "  /md   两侧空格  ", src: "两侧空格", ok: true},
-		{in: "/md", src: "", ok: true, note: "只有指令 -> 回用法"},
-		{in: "  /md  ", src: "", ok: true},
-		{in: "/md\n# 标题", src: "# 标题", ok: true, note: "换行也算分隔"},
-		{in: "/md\n    indented code", src: "indented code", ok: true},
-		{in: "md # 标题", ok: false, note: "裸写不触发"},
-		{in: "md", ok: false},
-		{in: "/md5 abc", ok: false, note: "不能吃掉 /md5"},
-		{in: "/mdx", ok: false},
-		{in: "md5sum foo", ok: false},
-		{in: "hello", ok: false},
-		{in: "", ok: false},
+// 参数只认 Event.Args：插件不再从 Content 里 CutPrefix，Content 全长也不影响渲染。
+func TestHandleUsesArgs(t *testing.T) {
+	var got string
+	p, _ := newPlugin(t, &stubRenderer{img: host.ImageFromBytes([]byte("png")), got: &got})
+
+	e := ev("**加粗**")
+	e.Content = "/md 这段正文不该进渲染器"
+	if _, err := p.Handle(context.Background(), e); err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
-	for _, c := range cases {
-		src, ok := parse(c.in)
-		if ok != c.ok {
-			t.Fatalf("parse(%q) ok=%v, want %v（%s）", c.in, ok, c.ok, c.note)
-		}
-		if ok && src != c.src {
-			t.Fatalf("parse(%q) src=%q, want %q", c.in, src, c.src)
-		}
+	if got != "**加粗**" {
+		t.Fatalf("渲染器应收到 Args，实际 %q", got)
 	}
 }
 
@@ -114,7 +101,7 @@ func TestHandleKeepsNewlines(t *testing.T) {
 	var got string
 	p, _ := newPlugin(t, &stubRenderer{img: host.ImageFromBytes([]byte("png")), got: &got})
 	src := "# 标题\n\n| a | b |\n| - | - |\n| 1 | 2 |"
-	if _, err := p.Handle(context.Background(), msg("/md "+src)); err != nil {
+	if _, err := p.Handle(context.Background(), ev(src)); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if got != src {
@@ -124,7 +111,7 @@ func TestHandleKeepsNewlines(t *testing.T) {
 
 func TestHandleRendersImage(t *testing.T) {
 	p, _ := newPlugin(t, &stubRenderer{img: host.ImageFromBytes([]byte("png"))})
-	reply, err := p.Handle(context.Background(), msg("/md **加粗**"))
+	reply, err := p.Handle(context.Background(), ev("**加粗**"))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -139,10 +126,10 @@ func TestHandleRendersImage(t *testing.T) {
 	}
 }
 
-// 空内容回用法，且不碰渲染器——传 nil 渲染器也不会 panic。
+// 空参数回用法，且不碰渲染器——传 nil 渲染器也不会 panic。
 func TestHandleUsage(t *testing.T) {
 	p, _ := newPlugin(t, nil)
-	reply, err := p.Handle(context.Background(), msg("/md"))
+	reply, err := p.Handle(context.Background(), ev(""))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -167,7 +154,7 @@ func TestHandleErrors(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			p, _ := newPlugin(t, c.r)
-			reply, err := p.Handle(context.Background(), msg("/md x"))
+			reply, err := p.Handle(context.Background(), ev("x"))
 			if err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
@@ -194,7 +181,7 @@ func TestHandleKeepsBackslashes(t *testing.T) {
 	p, _ := newPlugin(t, &stubRenderer{img: host.ImageFromBytes([]byte("png")), got: &got})
 
 	src := "```\npath := `C:\\new\\test.md`\nre := `\\d+\\s`\n```"
-	if _, err := p.Handle(context.Background(), msg("/md "+src)); err != nil {
+	if _, err := p.Handle(context.Background(), ev(src)); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if got != src {
@@ -217,16 +204,8 @@ func TestManifestIsLoadable(t *testing.T) {
 	if len(m.Commands) != 1 || m.Commands[0].Prefix != "/md" || m.Commands[0].Pattern != "" {
 		t.Fatalf("应只声明 /md 一条前缀命令，实际 %+v", m.Commands)
 	}
-}
-
-// 不是本指令时返回 (nil, nil)：让出给优先级更低的插件。
-// 裸写 md 必须安静放行——这是刻意的取舍，不是漏判。
-func TestHandlePassThrough(t *testing.T) {
-	p, _ := newPlugin(t, &stubRenderer{img: host.ImageFromBytes([]byte("png"))})
-	for _, in := range []string{"hello", "/ping", "/md5 abc", "/mdx", "md5sum x", "md # 标题", "md"} {
-		reply, err := p.Handle(context.Background(), msg(in))
-		if err != nil || reply != nil {
-			t.Fatalf("Handle(%q) 应放行，实际 %+v, %v", in, reply, err)
-		}
+	// 词边界是路由层的默认行为：核心已保证 /md5 不命中 /md，插件不必声明 Loose。
+	if m.Commands[0].Loose {
+		t.Fatal("/md 不该放宽词边界")
 	}
 }

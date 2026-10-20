@@ -196,6 +196,11 @@ func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {
 	hctx, cancel := context.WithTimeout(ctx, d.handler)
 	defer cancel()
 
+	// 命中的命令与参数按"当前匹配者"写入，位置只能在这里：Match 返回的是全部候选，
+	// 在 Match 里写会被后面的候选覆盖；一次派发跑多个插件时（broadcast），每个插件
+	// 也必须拿到自己命中那条命令的 Command/Args，所以每个 m 各写一次。
+	ev.Command, ev.Args = m.Command, m.Args
+
 	start := time.Now()
 	reply, err := d.invoke(hctx, m, ev)
 	cost := time.Since(start)

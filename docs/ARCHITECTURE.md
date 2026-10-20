@@ -178,7 +178,8 @@ Manifest {
   api_version  与核心的契约版本，不匹配则拒绝加载
   capabilities 保留字段：核心从不读取，不构成任何门控；等出现第二个真实消费方再启用（评审 §4.1）
   intents      需要订阅的事件类型
-  commands     匹配规则：前缀或正则二选一（Priority 越大越先）
+  commands     匹配规则：前缀或正则二选一（Priority 越大越先）；前缀默认要求词边界，
+               确需裸前缀时声明 loose=true（语义见下）
   yield        处理完是否让位给同 priority 的下一个匹配者（零值 false = 阻断，语义见 §3.4）
   config_schema 启动期校验，支持四种类型：string / bool / int / duration（评审 §4.1）
 }
@@ -189,6 +190,13 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 `Manifest` 采用声明式而非“插件自己决定是否处理”，目的是把能用数据描述的规则放在启动期校验。**实际校验到的只有这些**：`name` 非空、`api_version` 与本核心一致、`intents` 可解析、`Permission` 位合法、每个 `Command` 恰好设置 `Prefix` 或 `Pattern` 之一、正则可编译、前缀不占用核心保留前缀、`config_schema` 里每个键在 `[plugins.<name>]` 中存在且类型相符（装配期、插件 `Init` 之前）。
 
 `config_schema` 的语义是**声明即必填**：写进去的键必须有值，缺一个就启动失败，所以有默认值的键不要写进 schema。类型只有四种，与 `Host.Config()` 的读取方法一一对应；`duration` 是字符串，必须能被 `time.ParseDuration` 解析。`key = ""` 对 `string` 是「存在但为空」，合法，与「缺失」可区分。
+
+`commands` 的匹配与回传（命令词边界与参数切分只有一份实现，在路由层）：
+
+- **前缀默认要求词边界**：命令词之后必须是空白（`unicode.IsSpace`）或字符串结尾，所以 `/md5 abc` 不命中 `/md`。确有需要裸前缀语义的写法显式声明 `loose: true`，退回 `strings.HasPrefix`；`loose` 只对前缀生效，与正则同时写不报错，也不起作用。
+- **正则**按源码匹配（`FindStringIndex`），`Command` 回传的正是该正则源码。
+- 命中后核心把结果写进 `Event.Command` / `Event.Args` **再**调用 `Handle`。`Command` 是命中那条命令的写法（前缀原文或正则源码），未命中为空串；`Args` 是匹配片段之后、已 `TrimSpace` 的剩余原文——前缀按前缀的字节长度切，正则按匹配区间的结束位置切——未命中同样为空串。匹配前 `Content` 已 `TrimSpace` 过，所以 `/md 内容` 与 `/md\n内容` 的 `Args` 都是「内容」，只有 `/md` 是空串。
+- 插件**不再自己切分**：`md` 曾用 `CutPrefix` 加词边界判断兜住 `/md5`，`echo` 曾用 `HasPrefix` 链分派两条命令；现在两者都只读 `Event.Command` / `Event.Args`。一次派发执行多个插件时（§3.4 的扇出），每个插件拿到的是它自己命中那条命令的 `Command/Args`。
 
 以下三条**当前不成立**，读契约时不要据此推断保障：
 
@@ -245,6 +253,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 - 路由在**插件的 matcher 表**上做，核心不解析业务语义。
 - 默认只跑一个插件，避免“两个插件同时回、消耗 5 次被动额度”。这个默认由 `yield` 的零值承担：不写 `yield` 就是不让位，执行完即结束。
 - **谁先执行由排序决定**：`priority` 降序，同 `priority` 按**插件名字典序**升序。无权限的候选在排序后被跳过，不阻塞后续插件（权限先于优先级）。同一插件内多条命令同时命中时，取 `priority` **严格**最大的一条，并列则取声明在前的（比较用 `>` 而非 `>=`）。未声明 `commands` 的插件匹配该 intent 的全部事件，`priority` 按 0 计。
+- 命中结果随事件回传：核心在选定这个匹配者之后、调用它的 `Handle` 之前写入 `Event.Command` / `Event.Args`（语义见 §3.2），插件侧不再出现 `CutPrefix` / `HasPrefix` 分派。一次派发跑多个插件时（下面的让位链），每个插件拿到的是**它自己**命中那条命令的 `Command/Args`。
 - `yield` 是**每个匹配者自己的声明**，不是中标者的个人属性。同 priority 的候选按上面的顺序排队逐个执行：谁写 `yield=true`，谁处理完就让位给组内下一个；第一个 `yield=false` 的插件执行完，组内**剩下的一律不执行**（不是“跳过它继续”）。`aaa`（100，`yield=false`）与 `zzz`（100，`yield=true`）同时命中时只跑 `aaa`，`zzz` 因 `aaa` 阻断而未执行；反过来两者都跑。这个阻断关系在 full 级轨迹里每个被挡住的插件各占一行（`未执行 · 插件 … （… 未让位）`），不再有“静默不执行”。组内**无权限**的候选照旧跳过并记一行 `权限不足`，跳过本身不改变“是否继续”。
 - **跨 priority 不扇出**：`yield` 只在同 priority 组内生效。高优先级插件让位，去处是同组的下一个匹配者，不是低优先级插件——低优先级仍只在前者全部无权时才可能被考虑。
 - **核心保留前缀**：`/claim`、`/admin`、`/group`、`/reset`、`/reload`、`/restart` 由核心以最高优先级独占处理，插件在启动期若声明了相同前缀，**直接拒绝加载并报错**。否则一个第三方插件就能劫持重置指令，等于把第 8 章的鉴权整个绕过去。清单必须与 `handleReserved` 的 case 严格对应——多列一个会白占名字，少列一个会让核心静默遮蔽插件声明的同名命令。`/grant`、`/revoke` 的功能已由 `/admin add|rm` 取代，指令删除后名字一并释放。
