@@ -58,11 +58,20 @@ D5 的前提有两层，必须分清：
 |---|---|
 | 内存（核心） | 15–40 MB |
 | 内存（每插件，同进程） | +2–8 MB |
+| 内存（`Event.Raw` 副本） | 实测（`BenchmarkDecodeGroupMessage`，win/amd64）：真实群消息载荷 482 B → 单条 `Raw` 副本 482 B，整次解码 **1680 B/op、23 allocs/op**。dispatch 工作池 16 并发满载时在途 Raw 约 16×482 B ≈ 7.5 KiB，全部解码分配约 16×1680 B ≈ 26 KiB；最坏情况每条都撞上限 → 16×32 KiB = 512 KiB，占 `MemoryMax=256M` 的 0.2% |
 | 二进制磁盘 | 19 MB 量级（实测：windows 19.22 MB / linux 19.03 MB，其中内嵌字体 6.2 MB） |
 | SQLite（1000–10000 条/天，留 7 天） | 5–40 MB |
 | 媒体配额 | 0 —— 入站不下载；出站图片存在平台侧，不占本地盘 |
 | 日志（journald 限额） | 200 MB |
 | 结论 | 20 GB 盘余量充裕；1 GB 内存下与 TS3/WebDAV 共存可行，但需 `MemoryMax` 约束 |
+
+`Raw` 那一行的换算方式：`go test ./internal/gateway -run '^$' -bench BenchmarkDecode -benchmem`
+给出的 `B/op` 是**单次解码**的总分配字节数；每个 dispatch worker 同一时刻只处理
+一条事件，所以并发峰值 ≈ 工作池上限（16）× B/op。三个基准分别是：单条真实群消息
+（`BenchmarkDecodeGroupMessage`，1680 B/op）、同一载荷 16 协程并发
+（`BenchmarkDecodeGroupMessageConcurrent16`，仍是 1680 B/op，说明并发不放大单条开销）、
+以及被截断的最坏载荷（`BenchmarkDecodeOversizeRaw`，66368 B/op，其中 32 KiB 是 `Raw` 副本本身）。
+真实消息的 `Raw` 平均占用就是载荷长度（482 B）；上限由 `host.MaxRawBytes` 钉死在 32 KiB。
 
 ### 1.4 事件模型（三轴）
 
@@ -75,7 +84,11 @@ D5 的前提有两层，必须分清：
 | 平台事件名 | `Name` | 如 `GROUP_AT_MESSAGE_CREATE` | 只用于观测与解码表索引，插件不订阅它 |
 
 - 本地解码覆盖全部 12 个群与单聊事件（2 个群消息 + 1 个单聊消息 + 9 个通知/请求），另有 4 个跨场景事件：`FRIEND_ADD`、`FRIEND_DEL`、`INTERACTION_CREATE`、`SUBSCRIBE_MESSAGE_STATUS`。
-- `GROUP_AT_MESSAGE_CREATE`（@机器人）与 `GROUP_MESSAGE_CREATE`（全量模式：群主开启「接收所有消息」后群里每条消息都推）字段结构一致，**归一化为同一类 `message` 事件**，下游不区分。
+- `GROUP_AT_MESSAGE_CREATE`（@机器人）与 `GROUP_MESSAGE_CREATE`（全量模式：群主开启「接收所有消息」后群里每条消息都推）字段结构一致，**归一化为同一类 `message` 事件**：`Kind` / `Scene`、路由与订阅都不区分来源。两者的差异只用**语义标记**表达，核心与插件都不比较平台事件名（票 #13）：
+  - `Mentioned=true` 仅当平台事件是 `GROUP_AT_MESSAGE_CREATE`。官方文档把 `mentions` 定义为「消息中@的用户列表（**不含@机器人自身**）」，数组里永远不会有机器人自己，所以**不得**用它反推「@ 了我」；`GROUP_MESSAGE_CREATE` 的载荷里没有任何「@ 了机器人」的标记，一律 `false`，不做猜测。单聊、通知、未知事件恒 `false`。
+  - 需要「@ 了别人」这一事实的插件自己读 `Raw` 里的 `mentions`——它原样躺在那里，核心不解析也不解释。
+- `Raw` 是所有事件（**含已知事件**）的原始 JSON 副本，上限 `host.MaxRawBytes` = 32 KiB；超出时截断并置 `RawTruncated=true`，截断状态因此可判定（不是静默切出半截 JSON 让插件误以为平台发了坏数据）。`Raw` **只在 dispatch 生命周期内有效**：不进 `messages` 表、不参与 `processed_events` 去重键、不被 GC 与 `/reset` 任何一级触碰。
+- `Payload` 的既有语义不变：**仅未知事件**、完整原文，供排障用。未知事件因此同时带一份完整 `Payload` 与一份 ≤32 KiB 的 `Raw` 副本，代价可以接受——未知事件本就罕见。
 - 解码表里没有的事件归为 `Kind=unknown`：进调试轨迹、可观测，**永不进入插件路由**。
 - 订阅语法：`Manifest.Intents` 写 `<kind>` 或 `<scene>.<kind>`，例如 `message`、`group.message`；写错在装配阶段即拒绝加载。
 
@@ -200,9 +213,24 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 
 以下三条**当前不成立**，读契约时不要据此推断保障：
 
-- `commands` 的 **@提及匹配当前未实现**：网关解出 `mentions` 后即丢弃，路由层只有前缀与正则两种方式（评审 §4.2，票 #13）。
+- `commands` 的 **@提及匹配当前未实现**：`Command` 只有前缀与正则两种方式，`@` 不参与匹配（评审 §4.2，票 #13）。「这条消息 @ 了机器人」这一事实本身**可读**——见 `Event.Mentioned`，但路由不会因此放宽或收紧；要不要据此响应是插件自己的判断。
 - 同优先级冲突的静态检测**当前未实现**：两条规则同时命中不会报错，启动期也发现不了。实际行为见 §3.4（评审 §4.7 第一行 / §2.3）。
 - `capabilities` 是**保留字段**，当前不参与任何门控；真正起门控作用的是哪三项，见 §3.3 末段（评审 §4.1）。
+
+`Event` 是插件能看到的全部事件事实（字段语义见 `internal/host/host.go`）：
+
+| 字段 | 含义 | 备注 |
+|---|---|---|
+| `ID` | 平台事件/消息 ID | 幂等键，去重只看它 |
+| `Kind` / `Scene` / `Name` | 三轴（§1.4） | `Name` 只用于观测 |
+| `Notice` | 核心语义标签 | 仅入群/退群等少数通知非空 |
+| `PeerID` / `SenderID` / `UnionID` | 会话与发送者标识 | 判权用 `SenderID` 与 `Actor` |
+| `Username` / `Content` / `MsgType` / `HasMedia` | 消息正文与形态 | 单聊 `Username` 恒空 |
+| `Command` / `Args` | 命中的命令与其后参数 | 由核心在 `Handle` 之前填好；未命中为空串 |
+| `Mentioned` | 这条消息 **@ 了机器人** | 仅 `GROUP_AT_MESSAGE_CREATE` 为 `true`；由平台事件类型决定，与 `mentions` 数组无关（§1.4） |
+| `Raw` / `RawTruncated` | 平台原始 JSON 副本（≤32 KiB）与截断标记 | 含已知事件；不落库、不参与去重，只在 dispatch 生命周期内有效 |
+| `Payload` | 原始 JSON，**仅未知事件**、完整原文 | 与 `Raw` 的取舍见 §1.4 |
+| `Timestamp` / `Actor` | 时间与权限视图 | `Actor` 由核心在投递前填好，插件只读 |
 
 #### 契约版本历史（`api_version`）
 
