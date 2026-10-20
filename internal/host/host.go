@@ -46,6 +46,13 @@ import (
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
 const APIVersion = "8"
 
+// MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
+//
+// 一条真实群消息通常只有几百字节，只有平台塞进超长字段（超长昵称、卡片 JSON）
+// 时才会触顶。32 KiB 足够装下常见载荷的完整原文，同时让 dispatch 工作池
+// 满载（16 并发）时在途 Raw 的峰值停在 512 KiB 量级（见 ARCHITECTURE §1.3）。
+const MaxRawBytes = 32 << 10
+
 // Scene 是消息场景。频道（guild）留作扩展，核心暂不实现发送。
 type Scene string
 
@@ -111,8 +118,37 @@ type Event struct {
 	MsgType int
 	// HasMedia 表示平台载荷里带附件。附件不会被下载（入站媒体不做），
 	// 所以它只是"这条消息有图/音视频"的标记，别指望能读到内容。
-	HasMedia  bool
-	Payload   []byte // 原始 JSON，仅未知事件保留（排查"平台到底推了什么"）
+	HasMedia bool
+	// Mentioned 表示这条消息 **@ 了机器人**。
+	//
+	// 口径只有平台事件类型一条：`GROUP_AT_MESSAGE_CREATE` 的语义就是「用户 @ 了
+	// 机器人」，该事件恒为 true；`GROUP_MESSAGE_CREATE`（全量模式）的载荷里没有
+	// 任何「@ 了机器人」的标记，一律 false——不做猜测。单聊、通知、未知事件恒 false。
+	//
+	// 不能用载荷里的 `mentions` 反推：官方文档对它的定义是「消息中@的用户列表
+	// （**不含@机器人自身**）」，数组里永远不会有机器人自己。需要「@ 了别人」
+	// 这一事实的插件，自己读 Raw 里的 mentions。
+	Mentioned bool
+	// Raw 是平台原始 JSON 的副本，**所有事件**（含已知事件）都有，最长 MaxRawBytes。
+	//
+	// 存在的理由：平台新增字段不该逼着核心改结构体、升契约版本才能被插件看见。
+	// 它只在 dispatch 生命周期内有效——不落库（messages 表没有这一列）、
+	// 不参与幂等键（去重只看 ID）、`/reset` 与 GC 都不触碰它；事件处理完
+	// 随 Event 一起被回收。
+	//
+	// 超过 MaxRawBytes 时截断为原文前缀，并置 RawTruncated=true。截断必须可判定：
+	// 不允许静默给出半截 JSON，让插件误以为平台发了坏数据。RawTruncated 为 false
+	// 时 Raw 与原文逐字节相等。
+	//
+	// 与 Payload 的关系：Payload 的既有语义不动（**仅未知事件**、完整原文）；
+	// 未知事件因此同时有一份完整 Payload 与一份 ≤32 KiB 的 Raw，代价可以接受
+	// ——未知事件本就罕见。
+	Raw []byte
+	// RawTruncated 报告 Raw 是否因超过 MaxRawBytes 被截断。
+	RawTruncated bool
+	// Payload 是原始 JSON，仅未知事件保留（排查"平台到底推了什么"）。
+	// 新代码优先用 Raw：它对所有事件都有，且带截断标记。
+	Payload   []byte
 	Timestamp time.Time
 
 	// Actor 是调用者身份与权限，由核心在投递插件之前填好：网关填群内角色，
@@ -332,8 +368,8 @@ type Host interface {
 
 // Command 是声明式路由规则：前缀或正则二选一。
 //
-// 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配（网关解出 mentions 后即
-// 丢弃，见评审 §4.2）。
+// 没有第三种匹配方式：平台是否 @ 了机器人不参与匹配。那个事实在
+// Event.Mentioned，要不要据此响应由插件自己判断（ARCHITECTURE §1.4 / 票 #13）。
 type Command struct {
 	Prefix string
 	// Loose 只对 Prefix 生效，默认 false = 严格：前缀之后必须是空白或字符串结尾，

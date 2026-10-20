@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/knight000/go_qqbot/internal/host"
@@ -31,7 +33,9 @@ const groupMessagePayload = `{
 }`
 
 // 全量模式（GROUP_MESSAGE_CREATE）与 @机器人（GROUP_AT_MESSAGE_CREATE）必须
-// 归一化成同一个事件：下游路由与插件订阅都不区分来源。
+// 归一化成同一个**事件类**：下游路由与插件订阅都不区分来源。
+// 差异只有两处，且都必须是语义标记而不是"平台事件名"：Name（观测用）
+// 与 Mentioned（"这条消息 @ 了我"这一事实，票 #13）。
 func TestDecodeGroupMessageNormalizesBothEvents(t *testing.T) {
 	atEv, err := Decode(platGroupAtMessage, json.RawMessage(groupMessagePayload))
 	if err != nil {
@@ -41,10 +45,136 @@ func TestDecodeGroupMessageNormalizesBothEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%s 解码失败: %v", platGroupMessageAll, err)
 	}
-	// Name 记录平台原名，是两者唯一允许的差异。
+	// Name 记录平台原名，Mentioned 记录语义差异；其余字段必须完全一致。
 	allEv.Name = atEv.Name
+	allEv.Mentioned = atEv.Mentioned
 	if !reflect.DeepEqual(atEv, allEv) {
-		t.Fatalf("两种群消息事件除 Name 外应完全一致:\n@  %+v\n全量 %+v", atEv, allEv)
+		t.Fatalf("两种群消息事件除 Name/Mentioned 外应完全一致:\n@  %+v\n全量 %+v", atEv, allEv)
+	}
+}
+
+// @ 的事实只能来自平台事件类型：官方文档对 mentions 的定义是
+// 「消息中@的用户列表（不含@机器人自身）」，数组里永远不会有机器人自己。
+// 因此 GROUP_AT_MESSAGE_CREATE 恒 true，其余消息事件恒 false——不猜。
+func TestDecodeMentionedMarksOnlyGroupAtEvent(t *testing.T) {
+	atEv, err := Decode(platGroupAtMessage, json.RawMessage(groupMessagePayload))
+	if err != nil {
+		t.Fatalf("%s 解码失败: %v", platGroupAtMessage, err)
+	}
+	if !atEv.Mentioned {
+		t.Fatal("GROUP_AT_MESSAGE_CREATE 的 Mentioned 应为 true")
+	}
+
+	allEv, err := Decode(platGroupMessageAll, json.RawMessage(groupMessagePayload))
+	if err != nil {
+		t.Fatalf("%s 解码失败: %v", platGroupMessageAll, err)
+	}
+	// 全量模式的载荷里没有任何"@ 了机器人"的标记，只能保守为 false。
+	if allEv.Mentioned {
+		t.Fatal("GROUP_MESSAGE_CREATE 的 Mentioned 必须为 false（平台不标记，不做猜测）")
+	}
+}
+
+// 单聊恒为 false：平台在单聊载荷里根本不标记 @，猜就是编造。
+// 通知/未知事件同理——Mentioned 只描述消息。
+func TestDecodeMentionedFalseOffMessagePaths(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  string
+		raw  string
+	}{
+		{"单聊消息", platC2CMessage, `{"id":"c1","content":"hi","author":{"id":"U1","user_openid":"U1"},"message_type":0}`},
+		{"群通知", platGroupAddRobot, `{"group_openid":"G1","timestamp":1721500000}`},
+		{"未知事件", "SOME_FUTURE_EVENT", `{"group_openid":"G1"}`},
+	}
+	for _, c := range cases {
+		ev, err := Decode(c.typ, json.RawMessage(c.raw))
+		if err != nil {
+			t.Fatalf("%s 解码失败: %v", c.name, err)
+		}
+		if ev.Mentioned {
+			t.Fatalf("%s 的 Mentioned 应为 false", c.name)
+		}
+	}
+}
+
+// mentions 里列的是"@ 了别人"，与"@ 了我"无关。这条测试把口径钉死：
+// 即使载荷里带着非空 mentions，全量模式也仍是 Mentioned=false。
+func TestDecodeMentionedIgnoresMentionsArray(t *testing.T) {
+	ev, err := Decode(platGroupMessageAll, json.RawMessage(groupMessagePayload))
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	if len(ev.Raw) == 0 || !strings.Contains(string(ev.Raw), `"mentions"`) {
+		t.Fatalf("前置条件：载荷里的 mentions 应原样进 Raw，实际 %s", ev.Raw)
+	}
+	if ev.Mentioned {
+		t.Fatal("mentions 非空不代表 @ 了机器人：不得据此置位 Mentioned")
+	}
+}
+
+// 已知事件也要能读到原始 JSON：平台加字段时插件可自救，不必等核心升契约。
+func TestDecodeKeepsRawForKnownEvents(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  string
+		raw  string
+	}{
+		{"群消息", platGroupAtMessage, groupMessagePayload},
+		{"单聊消息", platC2CMessage, `{"id":"c1","content":"hi","author":{"id":"U1","user_openid":"U1"},"message_type":0}`},
+		{"群通知", platGroupAddRobot, `{"group_openid":"G1","timestamp":1721500000}`},
+		{"未知事件", "SOME_FUTURE_EVENT", `{"group_openid":"G1","whatever":"x"}`},
+	}
+	for _, c := range cases {
+		ev, err := Decode(c.typ, json.RawMessage(c.raw))
+		if err != nil {
+			t.Fatalf("%s 解码失败: %v", c.name, err)
+		}
+		if ev.RawTruncated {
+			t.Fatalf("%s 的 Raw 不应被截断", c.name)
+		}
+		if string(ev.Raw) != c.raw {
+			t.Fatalf("%s 的 Raw 应与原文逐字节相等:\n got %s\nwant %s", c.name, ev.Raw, c.raw)
+		}
+	}
+}
+
+// 超过上限时截断，但必须可判定：RawTruncated=true，且 Raw 是原文的严格前缀。
+// 不允许"静默切出半截 JSON"——那样插件分不清是平台发了坏 JSON 还是本地切的。
+func TestDecodeTruncatesRawAtLimit(t *testing.T) {
+	big := `{"id":"M1","content":"` + strings.Repeat("a", host.MaxRawBytes) + `"}`
+	ev, err := Decode(platGroupMessageAll, json.RawMessage(big))
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	if !ev.RawTruncated {
+		t.Fatal("超长载荷的 RawTruncated 应为 true")
+	}
+	if len(ev.Raw) != host.MaxRawBytes {
+		t.Fatalf("Raw 应截到 %d 字节，实际 %d", host.MaxRawBytes, len(ev.Raw))
+	}
+	if !bytes.HasPrefix([]byte(big), ev.Raw) {
+		t.Fatal("截断后的 Raw 必须是原文的前缀")
+	}
+}
+
+// 未截断时不得申请超过原文的内存：Raw 是副本而不是原文的切片，
+// 这样事件生命周期结束后 RawMessage 所在的大 buffer 能被回收。
+func TestDecodeRawIsIndependentCopy(t *testing.T) {
+	raw := json.RawMessage(groupMessagePayload)
+	ev, err := Decode(platGroupAtMessage, raw)
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	if len(ev.Raw) == 0 || len(raw) == 0 {
+		t.Fatal("前置条件不成立")
+	}
+	if &ev.Raw[0] == &raw[0] {
+		t.Fatal("Raw 必须是副本，不能与入参共享底层数组")
+	}
+	raw[0] = 'X'
+	if ev.Raw[0] == 'X' {
+		t.Fatal("修改入参不应影响 Raw")
 	}
 }
 
@@ -246,5 +376,56 @@ func TestDecodeNormalizesLineEndings(t *testing.T) {
 	// CR、CRLF 都变成 LF，首尾空白（含结尾的 LF）被去掉，内部换行保留。
 	if want := "a\nb\nc\nd"; ev.Content != want {
 		t.Fatalf("content=%q, want %q", ev.Content, want)
+	}
+}
+
+// 内存实测用：单条真实群消息解码（含 Raw 副本）的分配量。
+// 数字写进 ARCHITECTURE §1.3，换算过程见该节。
+func BenchmarkDecodeGroupMessage(b *testing.B) {
+	raw := json.RawMessage(groupMessagePayload)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for i := 0; i < b.N; i++ {
+		if _, err := Decode(platGroupAtMessage, raw); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// 并发 16（dispatch 工作池默认上限）同时解码时的单条分配量。
+// 每个 worker 同一时刻最多持有一条事件的 Raw，峰值 ≈ 16 × 单条 Raw 字节。
+func BenchmarkDecodeGroupMessageConcurrent16(b *testing.B) {
+	raw := json.RawMessage(groupMessagePayload)
+	b.ReportAllocs()
+	var wg sync.WaitGroup
+	workers := 16
+	per := b.N / workers
+	if per == 0 {
+		per = 1
+	}
+	b.ResetTimer()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				if _, err := Decode(platGroupAtMessage, raw); err != nil {
+					b.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// 最坏情况的分配上界：一条被截断的 32 KiB Raw。
+func BenchmarkDecodeOversizeRaw(b *testing.B) {
+	raw := json.RawMessage(`{"id":"M1","content":"` + strings.Repeat("a", host.MaxRawBytes) + `"}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := Decode(platGroupMessageAll, raw); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
