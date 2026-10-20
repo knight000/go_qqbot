@@ -153,9 +153,18 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 		}
 		d.trace.Hit(m, ev)
 		d.run(ctx, m, ev)
-		if !m.Manifest.Yield {
-			break
+		if m.Manifest.Yield {
+			continue
 		}
+		// 不让位：组内后面的都不再执行。逐个写进 full 级轨迹——否则就是
+		// 「zzz 为什么没反应」永远查不出来的沉默（旧 Broadcast 的实现如此）。
+		for _, rest := range matches[i+1:] {
+			if rest.Priority != group {
+				break
+			}
+			d.trace.Blocked(m, rest)
+		}
+		break
 	}
 }
 
