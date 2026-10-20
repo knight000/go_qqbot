@@ -16,6 +16,7 @@ import (
 // 与「缺失」可区分。
 //
 // 支持四种类型，与 Params 的读取方法一一对应：string / bool / int / duration。
+// 类型清单与各自的校验只由 configKinds 这一张表描述。
 // 声明其它类型名同样在装配期报错——那说明插件作者对契约的理解有偏差，
 // 静默忽略会把它变成下一个「只在纸上成立」的字段。
 //
@@ -24,11 +25,12 @@ import (
 func (m Manifest) ValidateConfig(section map[string]any) error {
 	problems := make([]string, 0, len(m.ConfigSchema))
 	for _, key := range sortedSchemaKeys(m.ConfigSchema) {
-		kind := m.ConfigSchema[key]
+		kindName := m.ConfigSchema[key]
 		// 类型名先判：schema 写错时不该被"缺键"掩盖，否则修正方向会指错。
-		if !supportedConfigKind(kind) {
+		kind, ok := lookupConfigKind(kindName)
+		if !ok {
 			problems = append(problems, fmt.Sprintf("键 %q 的类型 %q 不受支持（仅支持 %s）",
-				key, kind, supportedConfigKindList))
+				key, kindName, supportedConfigKindList()))
 			continue
 		}
 		if msg, ok := checkConfigValue(kind, key, section); !ok {
@@ -42,47 +44,83 @@ func (m Manifest) ValidateConfig(section map[string]any) error {
 		m.Name, m.Name, strings.Join(problems, "\n  - "))
 }
 
-// supportedConfigKindList 只用于错误文案，顺序与 ValidateConfig 注释一致。
-const supportedConfigKindList = "string / bool / int / duration"
+// configKind 是一种受支持的类型。
+//
+// 表里的顺序就是错误文案里类型清单的顺序（map 会打乱顺序，所以用切片），
+// 加第五种类型只动这一处：名字、取值是否合法、以及"为什么不合法"都在同一行。
+type configKind struct {
+	name  string
+	match func(v any) bool
+	// reason 在 match 失败时给出更具体的原因；返回空串表示用默认的
+	// 「期望 X，实际是 T(v)」。duration 用它区分"不是字符串"与"解析不了"。
+	reason func(key string, v any) string
+}
 
-// supportedConfigKind 报告类型名是否属于四种受支持类型。
-func supportedConfigKind(kind string) bool {
-	switch kind {
-	case "string", "bool", "int", "duration":
-		return true
+// configKinds 是类型表：名字、判定与取值校验的唯一来源。
+var configKinds = []configKind{
+	{name: "string", match: func(v any) bool {
+		_, ok := v.(string)
+		return ok
+	}},
+	{name: "bool", match: func(v any) bool {
+		_, ok := v.(bool)
+		return ok
+	}},
+	{name: "int", match: isConfigInt},
+	{
+		name: "duration",
+		match: func(v any) bool {
+			s, ok := v.(string)
+			if !ok {
+				return false
+			}
+			_, err := time.ParseDuration(s)
+			return err == nil
+		},
+		reason: func(key string, v any) string {
+			s, ok := v.(string)
+			if !ok {
+				return "" // 不是字符串：交给默认文案
+			}
+			return fmt.Sprintf("键 %q 期望 duration（能被 time.ParseDuration 解析，如 \"10s\"），实际是 string(%q)", key, s)
+		},
+	},
+}
+
+// lookupConfigKind 查类型表；ok=false 表示这个类型名不受支持。
+func lookupConfigKind(name string) (configKind, bool) {
+	for _, k := range configKinds {
+		if k.name == name {
+			return k, true
+		}
 	}
-	return false
+	return configKind{}, false
+}
+
+// supportedConfigKindList 把类型表拼成错误文案里的清单（顺序即表顺序）。
+func supportedConfigKindList() string {
+	names := make([]string, len(configKinds))
+	for i, k := range configKinds {
+		names[i] = k.name
+	}
+	return strings.Join(names, " / ")
 }
 
 // checkConfigValue 校验单个键，返回（错误描述, 是否通过）。
-func checkConfigValue(kind, key string, section map[string]any) (string, bool) {
+func checkConfigValue(kind configKind, key string, section map[string]any) (string, bool) {
 	v, ok := section[key]
 	if !ok || v == nil {
-		return fmt.Sprintf("缺少键 %q（期望 %s；config_schema 声明即必填）", key, kind), false
+		return fmt.Sprintf("缺少键 %q（期望 %s；config_schema 声明即必填）", key, kind.name), false
 	}
-	switch kind {
-	case "string":
-		if _, ok := v.(string); !ok {
-			return typeMismatch(key, kind, v), false
-		}
-	case "bool":
-		if _, ok := v.(bool); !ok {
-			return typeMismatch(key, kind, v), false
-		}
-	case "int":
-		if !isConfigInt(v) {
-			return typeMismatch(key, kind, v), false
-		}
-	case "duration":
-		s, ok := v.(string)
-		if !ok {
-			return typeMismatch(key, kind, v), false
-		}
-		if _, err := time.ParseDuration(s); err != nil {
-			return fmt.Sprintf("键 %q 期望 duration（能被 time.ParseDuration 解析，如 \"10s\"），实际是 string(%q)", key, s), false
+	if kind.match(v) {
+		return "", true
+	}
+	if kind.reason != nil {
+		if msg := kind.reason(key, v); msg != "" {
+			return msg, false
 		}
 	}
-	return "", true
+	return typeMismatch(key, kind.name, v), false
 }
 
 // isConfigInt 认 int64 与 int：TOML 解出来的整数是 int64，
