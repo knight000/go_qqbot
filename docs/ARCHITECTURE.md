@@ -200,8 +200,8 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 
 | 能力 | 签名要点 | 门控 |
 |---|---|---|
-| `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq`；`Reply.Image` 非空时先上传再发 `msg_type=7` | 走频控；图文拆分后**消耗两格**被动配额；超出被动窗口直接失败并告警 |
-| `Sender.SendActive` | 主动消息 | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启 |
+| `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq`；`msg_seq` 在同一 `msg_id` 下**单调递增**，窗口过期只重置剩余次数、不回退序号；`Reply.Image` 非空时先上传再发 `msg_type=7` | 走频控；图文拆分后**消耗两格**被动配额；超出被动窗口直接失败并告警 |
+| `Sender.SendActive` | 主动消息；先扣本地日预算**再**发 HTTP，预算是**持久化**的（`active_usage` 表，重启不清零、跨日按本地时区自动换桶） | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启；每 peer 每日预算由 `active_usage` 承担 |
 | `KV` / `PeerKV(peer)` | 按插件命名空间隔离的 KV，支持 TTL；`PeerKV` 多一层会话维度 | 只能读写自己的命名空间；`/reset session` 只清 `PeerKV` 写入的部分 |
 | `Store.Query` | 只读、参数化、行数上限 1000 | 不允许 DDL/写操作 |
 | `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝 |
@@ -418,6 +418,20 @@ CREATE TABLE plugin_kv (
   expires_at INTEGER,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (plugin, peer, k)
+);
+
+-- 主动消息的本地日预算（§3.3）。
+-- 为什么不复用 plugin_kv：那是插件命名空间，核心自己写进去等于往别人的
+-- 抽屉里塞东西，插件一 DeletePrefix 就把额度账抹了。
+-- 没有内存镜像：发送前用一条 upsert 原子地"检查 + 自增"，所以重启不清零、
+-- 并发与多进程都不会超发。day 是本地时区的 2006-01-02，跨日就是新主键，
+-- 换桶不需要任何重置动作。每会话每天 1 行，一年不到 400 行。
+CREATE TABLE active_usage (
+  day   TEXT NOT NULL,                  -- 本地时区 YYYY-MM-DD
+  scene TEXT NOT NULL,                  -- group | c2c
+  peer  TEXT NOT NULL,
+  used  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, scene, peer)
 );
 
 -- 管理员（Bot 角色：平台群角色只描述群内身份，不参与这里的授权）
@@ -703,8 +717,8 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 |---|---|---|---|---|
 | R0 重连 `/reset reconnect` | 断开当前 WSS 后**立即**重连（保留 session，走 Resume） | 无 | owner | 60 s |
 | R1 会话 `/reset session` | 清该 peer 的 `plugin_kv`（`peer` 非空的行） | 该群/该用户需重新开始对话 | Bot 管理员 | 10 min |
-| R2 数据 `/reset data` | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
-| R3 全量 `/reset all` | 清 `messages` / `media` / `processed_events` / `plugin_kv` / `job_runs` / `identities` | 全库业务数据不可恢复 | 仅 owner + 二次确认 + 短语 | 24 h |
+| R2 数据 `/reset data` | 清该 peer 的 `messages` + `media`（先删文件后删行）+ `job_runs` + `active_usage` | 该群历史不可恢复 | Bot 管理员 + 二次确认 | 1 h |
+| R3 全量 `/reset all` | 清 `messages` / `media` / `processed_events` / `plugin_kv` / `job_runs` / `identities` / `active_usage` | 全库业务数据不可恢复 | 仅 owner + 二次确认 + 短语 | 24 h |
 
 **四条硬约定**（每条都对应一类"重置完机器人就废了"的故障）：
 
@@ -716,6 +730,8 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 **冷却按 `(level, peer)` 计**。R1/R2 换个群不受上一个群的影响——连清两个群是正常运维动作；R0/R3 是全局操作，`peer` 记为 `*`，因此全局冷却。冷却起点取 `reset_audit.finished_at`，只认 `status=done` 的行。
 
 **R2 清 `job_runs` 但保留 `jobs`**：执行历史是该群的业务数据，任务定义（含 per-peer 实例行）是配置。这与“R2 不动 `qq_groups`”是同一条边界的两个方向。
+
+**`active_usage` 跟着业务数据走**：R2 清该 peer 的行，R3 清全表；R1 只清插件会话状态、R0 不动数据，都不碰它。理由是预算是平台配额账而不是会话状态——不过清数据就等于承认“这个会话重新开始”，额度也重开；反过来 R1/R0 只是让插件重来一遍或重连，凭什么免掉当天已烧的配额。预算行不计入重置摘要里的条数（那是给用户看的业务数据量，预算行属于记账）。
 
 ### 8.4 二次确认
 

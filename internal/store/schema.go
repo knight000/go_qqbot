@@ -29,6 +29,16 @@ const kvTableDDL = `CREATE TABLE IF NOT EXISTS plugin_kv (
 		PRIMARY KEY (plugin, peer, k)
 	)`
 
+// activeUsageTableDDL 单独提出来只是为了和 kvTableDDL 一样读得清楚：
+// 它是"核心自己的账"，与插件 KV 完全不共享命名空间。
+const activeUsageTableDDL = `CREATE TABLE IF NOT EXISTS active_usage (
+		day   TEXT NOT NULL,
+		scene TEXT NOT NULL,
+		peer  TEXT NOT NULL,
+		used  INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (day, scene, peer)
+	)`
+
 // schema 与 ARCHITECTURE.md §4.1 完全一致。
 // 迁移采用「幂等 DDL 列表」而非版本号：当前是脚手架，表结构变更时
 // 追加新的 ALTER 语句并留下注释；正式上线后建议切换到版本化迁移。
@@ -74,6 +84,14 @@ var schema = []string{
 	`CREATE INDEX        IF NOT EXISTS idx_media_created ON media(created_at)`,
 
 	kvTableDDL,
+
+	// active_usage 是主动消息的本地日预算（§3.3）。核心不能写 plugin_kv
+	// ——那是插件命名空间，插件一清前缀就把额度账抹了。
+	//
+	// 没有内存镜像：发送前用一条 upsert 原子地"检查 + 自增"，于是
+	// 重启不清零、并发与多进程都不会超发。day 取本地时区的 YYYY-MM-DD，
+	// 跨日就是新主键，换桶不需要任何重置动作。
+	activeUsageTableDDL,
 
 	adminTableDDL,
 
