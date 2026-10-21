@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -104,6 +105,108 @@ func TestResetReconnectGatewayNotReady(t *testing.T) {
 	recs, err := c.store.RecentResets(context.Background(), 5)
 	if err != nil || len(recs) != 1 || !strings.Contains(recs[0].Detail, "失败") {
 		t.Fatalf("失败的尝试也应进审计: %+v err=%v", recs, err)
+	}
+	// 记录的是"失败"而不是"已执行"：审计不能谎报。
+	if recs[0].Status != store.ResetStatusFailed {
+		t.Fatalf("失败的状态应为 %q，实际 %q", store.ResetStatusFailed, recs[0].Status)
+	}
+}
+
+// P2-3：失败的重置不能占用冷却窗口，否则 R3 失败一次就锁 24 小时。
+func TestResetFailureDoesNotConsumeCooldown(t *testing.T) {
+	c, f := newAdminCore(t)
+	seedAdmin(t, c, "owner-1", "", store.RoleOwner)
+	c.SetReconnector(&fakeReconnector{err: errors.New("网关当前未连接")})
+	ctx := context.Background()
+
+	got := resetCall(t, c, f, ctx, "/reset reconnect", "owner-1", host.SceneC2C, "owner-1")
+	if !strings.Contains(got, "重置失败") {
+		t.Fatalf("应报告失败，实际: %q", got)
+	}
+	if !strings.Contains(got, "不计入冷却") {
+		t.Errorf("失败回复应说明冷却没被占用，实际: %q", got)
+	}
+	if _, ok, err := c.store.LastResetDoneAt(ctx, store.ResetLevelReconnect, store.ResetScopeGlobal); err != nil || ok {
+		t.Fatalf("失败不得写入冷却起点: ok=%v err=%v", ok, err)
+	}
+
+	// 状态页不能把失败说成"已执行"，也不能说冷却中。
+	got = resetCall(t, c, f, ctx, "/reset status", "owner-1", host.SceneC2C, "owner-1")
+	if strings.Contains(got, "已执行") {
+		t.Errorf("失败不该显示成已执行，实际: %q", got)
+	}
+	if !strings.Contains(got, "失败") {
+		t.Errorf("状态页应明确显示失败，实际: %q", got)
+	}
+
+	// 失败后可立即重试：仍然执行（再次失败），而不是被冷却挡住。
+	got = resetCall(t, c, f, ctx, "/reset reconnect", "owner-1", host.SceneC2C, "owner-1")
+	if strings.Contains(got, "冷却中") {
+		t.Fatalf("失败不应触发冷却，实际: %q", got)
+	}
+	if !strings.Contains(got, "重置失败") {
+		t.Fatalf("应立即重试，实际: %q", got)
+	}
+}
+
+// 有确认码的路径（R2/R3）失败时，pending 记录要关成 failed，不是 done。
+// 用 SQLite 触发器让清理阶段的 DELETE 报错——这是"库层面失败"的真实形态。
+func TestResetConfirmedFailureRecordedAsFailed(t *testing.T) {
+	c, f := newAdminCore(t)
+	seedAdmin(t, c, "owner-1", "", store.RoleOwner)
+	ctx := context.Background()
+
+	if err := c.store.InsertMessage(ctx, store.Message{
+		EventID: "e1", Scene: "group", PeerOpenID: "g1", Content: "hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resetCall(t, c, f, ctx, "/reset data", "owner-1", host.SceneGroup, "g1")
+	rec, ok, err := c.store.PendingReset(ctx, "owner-1", "g1", store.ResetLevelData)
+	if err != nil || !ok {
+		t.Fatalf("应生成确认码: ok=%v err=%v", ok, err)
+	}
+
+	// 让删消息这一步必失败，模拟执行中途的库错误。
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.ToSlash(c.store.Path())+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqldb.Close() })
+	if _, err := sqldb.ExecContext(ctx,
+		`CREATE TRIGGER refuse_message_delete BEFORE DELETE ON messages
+		 BEGIN SELECT RAISE(ABORT, '模拟磁盘故障'); END`); err != nil {
+		t.Fatalf("注入故障触发器: %v", err)
+	}
+
+	got := resetCall(t, c, f, ctx, "/reset data "+rec.Code, "owner-1", host.SceneGroup, "g1")
+	if !strings.Contains(got, "重置失败") || !strings.Contains(got, "模拟磁盘故障") {
+		t.Fatalf("应把失败原因回给用户，实际: %q", got)
+	}
+
+	// 数据没删掉（事务回滚），但审计如实写了失败。
+	if stats, _ := c.store.PeerStats(ctx, "g1"); stats.Messages != 1 {
+		t.Fatalf("失败的清理不应留下半截状态，剩余消息 %d", stats.Messages)
+	}
+	recs, err := c.store.RecentResets(ctx, 5)
+	if err != nil || len(recs) == 0 {
+		t.Fatalf("应留下审计: %+v err=%v", recs, err)
+	}
+	if recs[0].Status != store.ResetStatusFailed {
+		t.Fatalf("失败的状态应为 %q，实际 %q", store.ResetStatusFailed, recs[0].Status)
+	}
+	if _, ok, _ := c.store.LastResetDoneAt(ctx, store.ResetLevelData, "g1"); ok {
+		t.Fatal("失败不得写入冷却起点")
+	}
+
+	// 状态页据此显示失败，且该级别仍可执行。
+	got = resetCall(t, c, f, ctx, "/reset status", "owner-1", host.SceneGroup, "g1")
+	if strings.Contains(got, "已执行") {
+		t.Errorf("失败不该显示成已执行，实际: %q", got)
+	}
+	if !strings.Contains(got, "失败") {
+		t.Errorf("状态页应明确显示失败，实际: %q", got)
 	}
 }
 
