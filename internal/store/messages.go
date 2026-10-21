@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -86,9 +87,16 @@ func (db *DB) purge(ctx context.Context, query string, args ...any) (int64, erro
 	if err != nil {
 		return 0, fmt.Errorf("分批清理: %w", err)
 	}
+	return purgeResult(res)
+}
+
+// purgeResult 读删除行数。失败必须上报：调用方（GC）用 n < batch 判断
+// "删完了没有"，把错误吞成 0 等于告诉它"这一批已经删空"，剩余行要等
+// 下个周期，且日志里没有任何痕迹。
+func purgeResult(res sql.Result) (int64, error) {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, nil
+		return 0, fmt.Errorf("分批清理: 读取删除行数: %w", err)
 	}
 	return n, nil
 }
