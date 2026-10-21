@@ -18,10 +18,11 @@ type gatedPlugin struct {
 	gate     chan struct{}
 	entered  chan struct{}
 
-	mu      sync.Mutex
-	closed  bool
-	handled int
-	refused int // Close 之后才完成的次数：出现就是关停顺序错了
+	mu        sync.Mutex
+	closed    bool
+	handled   int
+	cancelled int // 处理途中被取消：真实插件在这里会返回错误、没有回复
+	refused   int // Close 之后才完成的次数：出现就是关停顺序错了
 }
 
 func newGatedPlugin() *gatedPlugin {
@@ -46,6 +47,11 @@ func (p *gatedPlugin) Handle(ctx context.Context, _ *host.Event) (*host.Reply, e
 	select {
 	case <-p.gate:
 	case <-ctx.Done():
+		// 真实插件在这里多半是一次 HTTP 或写库：ctx 取消就返回错误、没有回复。
+		p.mu.Lock()
+		p.cancelled++
+		p.mu.Unlock()
+		return nil, ctx.Err()
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -109,6 +115,34 @@ func TestDispatcherWaitBlocksUntilQueueDrained(t *testing.T) {
 	}
 	if got := f.callCount(); got != 2 {
 		t.Fatalf("两条回复都应发出，实际 %d", got)
+	}
+}
+
+// 网关 ctx 在关停第一步就被取消（main 的 stop()）。已经进入 Handle 的插件
+// 不该跟着被打断：它正在写库、正在回消息，打断的代价是这条消息永远没有回复，
+// 而平台不会再投第二次。
+func TestDispatchKeepsRunningAfterGatewayContextCancelled(t *testing.T) {
+	p := newGatedPlugin()
+	c, f, _ := newShutdownCore(t, p)
+
+	ctx, cancelGateway := context.WithCancel(context.Background())
+	defer cancelGateway()
+
+	c.Handle(ctx, adminEvent("/slow", "u1", "", host.SceneGroup, "g1"))
+	<-p.entered
+
+	// 这一步等价于 SIGTERM 之后 main 里的 stop()：网关 ctx 取消。
+	cancelGateway()
+	time.Sleep(20 * time.Millisecond) // 给"错误地跟着取消"留出窗口
+	close(p.gate)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("关停应成功: %v", err)
+	}
+	if got := f.callCount(); got != 1 {
+		t.Fatalf("网关 ctx 取消后这条消息的回复丢了（发出 %d 条）", got)
 	}
 }
 
