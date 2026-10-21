@@ -94,6 +94,13 @@ func TestGoldenLooseList(t *testing.T) {
 	goldenCrop(t, "loose-list.png", m, image.Rect(0, 0, int(imgWidth), m.Bounds().Dy()))
 }
 
+// 行内 tab 是 P3-3 的视觉面：字体里没有 tab 字形，不预处理就是四个缺字
+// 方框（还会误报"字体子集外"）。基准里 tab 必须表现为一段空白。
+func TestGoldenInlineTab(t *testing.T) {
+	m := decodePNG(t, renderPNG(t, "甲\t乙\t丙 与 a\tb\tc\n"))
+	goldenCrop(t, "inline-tab.png", m, image.Rect(0, 0, int(imgWidth), m.Bounds().Dy()))
+}
+
 // 超宽表格的右边框是 P3-2 的视觉面：130 列时旧的 9px/列下限让总宽 1170px
 // 超出 1016px 的可用宽度，右边框与最后几列一起被画布裁掉。
 //

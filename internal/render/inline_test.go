@@ -38,6 +38,43 @@ func TestInlineCodeAndLinkTextIsLaidOut(t *testing.T) {
 	}
 }
 
+// 行内路径必须和代码块一样预处理 tab 与控制字符：字体里没有 tab 字形，
+// 不展开会画成缺字方框，还会让缺字 warn 误报"字体子集外"；C0 控制字符
+// 根本没有可画的形态，连推进量都不该占。
+func TestInlineTabAndControlCharsArePreprocessed(t *testing.T) {
+	l := newLayout(testRenderer(t).faces.scope(), "")
+	gs, err := l.glyphs([]span{{text: "a\tb\x00c\x07d"}}, WeightRegular, fsBody)
+	if err != nil {
+		t.Fatalf("glyphs: %v", err)
+	}
+
+	var got []rune
+	for _, g := range gs {
+		if g.missing {
+			t.Errorf("%q 被画成缺字方框，期望 tab/控制字符已被预处理", g.r)
+		}
+		got = append(got, g.r)
+	}
+	// tab → 4 个空格；\x00 与 \x07 整条丢弃。
+	if want := "a    bcd"; string(got) != want {
+		t.Errorf("字形序列 = %q，期望 %q", string(got), want)
+	}
+	if len(l.missing) != 0 {
+		t.Errorf("缺字表 = %v，期望空：tab 与控制字符不是缺字", l.missing)
+	}
+
+	// 展开出来的空格要真的占宽度，否则"对齐用的 tab"会静默塌掉。
+	spaces := 0.0
+	for _, g := range gs {
+		if g.r == ' ' {
+			spaces += g.adv
+		}
+	}
+	if spaces <= 0 {
+		t.Error("tab 展开后的空格推进量为 0，对齐信息丢了")
+	}
+}
+
 // 五种行内样式混排在同一行：不报错、宽度仍是基线、能解出 PNG。
 func TestInlineStylesRenderTogether(t *testing.T) {
 	data := renderPNG(t, inlineSample+"\n\n同一行再来一次：**粗** *斜* `code` [链接](https://example.com/a) ~~删~~。")
