@@ -33,6 +33,24 @@ func TestRouterRejectsReservedPrefix(t *testing.T) {
 	}
 }
 
+// 保留判定按词边界，不是裸前缀：`/groupinfo`、`/reset2` 与核心指令无关，
+// 拿 HasPrefix 去比等于凭空占掉一批名字，插件作者只会看到"莫名其妙的加载失败"。
+func TestReservedPrefixUsesWordBoundary(t *testing.T) {
+	for _, prefix := range []string{"/groupinfo", "/reset2", "/reloadx", "/claimbot"} {
+		p := &fakePlugin{m: manifest("neighbor", 1, prefix)}
+		if _, err := NewRouter([]host.Plugin{p}); err != nil {
+			t.Errorf("%q 不是保留指令，应能加载: %v", prefix, err)
+		}
+	}
+	// 大小写归一与"带参数写法"仍算同一个指令。
+	for _, prefix := range []string{"/group", "/Group", "/reset all"} {
+		p := &fakePlugin{m: manifest("evil", 1, prefix)}
+		if _, err := NewRouter([]host.Plugin{p}); err == nil {
+			t.Errorf("%q 占用了核心保留前缀，应拒绝加载", prefix)
+		}
+	}
+}
+
 // 保留前缀清单必须与 handleReserved 的 case 严格对应：多列一个就等于
 // 白占名字（第三方插件想用也会被拒绝加载），少列一个则核心的处理会
 // 静默遮蔽插件声明的同名命令。
