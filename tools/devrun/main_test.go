@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -99,6 +100,81 @@ func TestReplace(t *testing.T) {
 	}
 	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
 		t.Fatalf("临时文件应已被改名消耗掉，得到 err=%v", err)
+	}
+}
+
+// 第二步改名失败（旧的已经叫 .old、新的还没就位）必须把 .old 改回 bin：
+// 否则一次无人值守的 /reload 就让二进制消失、进程下线，而能跑的那份躺在旁边。
+func TestReplaceRollsBackWhenSecondRenameFails(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("两步替换只发生在 Windows")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bot.exe")
+	tmp := bin + ".new"
+	if err := os.WriteFile(bin, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rename := func(oldpath, newpath string) error {
+		if oldpath == tmp && newpath == bin {
+			return errors.New("注入：新二进制无法就位")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	err := replaceWith(tmp, bin, rename)
+	if err == nil {
+		t.Fatal("第二步改名失败时应当返回错误")
+	}
+	got, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("回滚后 bin 应当存在: %v", err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("回滚后 bin 内容 %q，期望旧内容 old", got)
+	}
+	if _, err := os.Stat(bin + ".old"); !os.IsNotExist(err) {
+		t.Fatalf("回滚后 .old 应已被消耗，得到 err=%v", err)
+	}
+}
+
+// 替换中断后留下的现场：bin 缺失、.old 还在。启动前必须先接回来。
+func TestRestoreBinaryFromOld(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bot.exe")
+	old := bin + ".old"
+	if err := os.WriteFile(old, []byte("survivor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreBinary(bin); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("恢复后 bin 应当存在: %v", err)
+	}
+	if string(got) != "survivor" {
+		t.Fatalf("恢复后 bin 内容 %q，期望 survivor", got)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf(".old 应已被改名消耗，得到 err=%v", err)
+	}
+
+	// bin 正常时绝不能用备份覆盖它。
+	if err := os.WriteFile(bin, []byte("current"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(old, []byte("stale"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreBinary(bin); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(bin); string(got) != "current" {
+		t.Fatalf("bin 已存在时不该被 .old 覆盖，实际内容 %q", got)
 	}
 }
 
