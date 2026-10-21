@@ -230,3 +230,116 @@ func TestRedirectWithinAllowlistIsFollowed(t *testing.T) {
 		t.Fatalf("重定向未被跟随，终点 handler 收到 %d 次", got)
 	}
 }
+
+// statusServer 是固定状态码 + 固定响应头的测试服务器。
+func statusServer(t *testing.T, code int, header map[string]string, hits *int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(hits, 1)
+		for k, v := range header {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"code":1000,"message":"rate limited"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// 429 不是"可重试的 5xx"：重试只会把惩罚窗口续期，还白烧域名桶的令牌。
+func TestTooManyRequestsIsNotRetried(t *testing.T) {
+	var hits int32
+	srv := statusServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "2"}, &hits)
+	c := New(Options{Timeout: time.Second, Retries: 3, HTTPClient: srv.Client()})
+
+	err := c.GetJSON(context.Background(), srv.URL, nil)
+	if !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("应返回 429 错误，实际 %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("429 不得自动重试，平台被打了 %d 次", got)
+	}
+	if got := RetryAfter(err); got != 2*time.Second {
+		t.Fatalf("应读到 Retry-After: 2，实际 %s", got)
+	}
+}
+
+// 冷却期内直接失败、不出网：这是"被拒的那次不该继续扣令牌"的可见后果。
+func TestRateLimitCooldownBlocksNextRequest(t *testing.T) {
+	var hits int32
+	srv := statusServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "2"}, &hits)
+	// 额度给足，确保第二次被挡住的理由是冷却而不是令牌桶。
+	c := New(Options{Timeout: time.Second, RatePerMin: 6000, HTTPClient: srv.Client()})
+
+	if err := c.GetJSON(context.Background(), srv.URL, nil); !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("首个请求应拿到 429，实际 %v", err)
+	}
+
+	start := time.Now()
+	err := c.GetJSON(context.Background(), srv.URL, nil)
+	elapsed := time.Since(start)
+	if !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("冷却期内的请求应直接失败并标明 429，实际 %v", err)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("冷却期内应立刻失败，实际耗时 %s", elapsed)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("冷却期内不得出网，平台被打了 %d 次", got)
+	}
+	if got := RetryAfter(err); got <= 0 || got > 2*time.Second {
+		t.Fatalf("冷却错误应带上剩余时长（0 < x ≤ 2s），实际 %s", got)
+	}
+}
+
+// Retry-After 的三种形态：秒数、HTTP-date、缺省/非法。缺省按 60s——
+// 平台惩罚窗口通常 ≥1 分钟，本地不能因为"没给头"就当没有惩罚。
+func TestRetryAfterParsing(t *testing.T) {
+	future := time.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat)
+	cases := []struct {
+		name   string
+		header string
+		check  func(time.Duration) bool
+	}{
+		{"seconds", "2", func(d time.Duration) bool { return d == 2*time.Second }},
+		{"http-date", future, func(d time.Duration) bool { return d > time.Second && d <= 3*time.Second }},
+		{"missing", "", func(d time.Duration) bool { return d == DefaultRetryAfter }},
+		{"garbage", "soon", func(d time.Duration) bool { return d == DefaultRetryAfter }},
+		// "0 秒后可以重试"在这个平台上不成立：本地仍按缺省窗口保护。
+		{"zero", "0", func(d time.Duration) bool { return d == DefaultRetryAfter }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int32
+			h := map[string]string{}
+			if tc.header != "" {
+				h["Retry-After"] = tc.header
+			}
+			srv := statusServer(t, http.StatusTooManyRequests, h, &hits)
+			c := New(Options{Timeout: time.Second, HTTPClient: srv.Client()})
+
+			err := c.GetJSON(context.Background(), srv.URL, nil)
+			if !IsStatus(err, http.StatusTooManyRequests) {
+				t.Fatalf("应返回 429，实际 %v", err)
+			}
+			if got := RetryAfter(err); !tc.check(got) {
+				t.Fatalf("Retry-After=%q 解析出 %s，不符合预期", tc.header, got)
+			}
+		})
+	}
+}
+
+// 5xx 的重试语义不变：它与 429 是两类事实（"上游坏了，可以再试" vs
+// "你被罚了，等到点再来"），不能合并处理。
+func TestServerErrorStillRetries(t *testing.T) {
+	var hits int32
+	srv := statusServer(t, http.StatusInternalServerError, nil, &hits)
+	c := New(Options{Timeout: time.Second, Retries: 1, HTTPClient: srv.Client()})
+
+	if err := c.GetJSON(context.Background(), srv.URL, nil); err == nil {
+		t.Fatal("5xx 应返回错误")
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("5xx 应照旧重试一次（共 2 次），实际 %d 次", got)
+	}
+}
