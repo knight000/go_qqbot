@@ -84,6 +84,12 @@ func NewScheduler(db *store.DB, log *slog.Logger) *Scheduler {
 	}
 }
 
+// Location 是"一天/一个 cron 时刻"的唯一时区来源。
+//
+// 主动消息日预算的切日必须与 cron 用同一个 location（见 NewSender）：
+// 两者分叉时，一个平台自然日内可以花掉两个桶的额度，最多 2×limit。
+func (s *Scheduler) Location() *time.Location { return s.tz }
+
 // Bind 把插件实例登记为任务执行者（Core 在 Init 之前调用）。
 func (s *Scheduler) Bind(plugin string, p host.Plugin) {
 	if r, ok := p.(host.JobRunner); ok {
