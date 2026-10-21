@@ -11,7 +11,8 @@ import (
 // 而后果是"另一个人的额度被扣掉"。绑成一个类型后调用点必须写字段名，
 // 记账与 R2 的"按 peer 清"也就用的是同一套坐标。
 type ActiveUsageKey struct {
-	// Day 是本地时区的日期（YYYY-MM-DD）：跨日换桶靠它，不靠墙钟。
+	// Day 是调度时区（Asia/Shanghai，与 cron 同源）的日期（YYYY-MM-DD）：
+	// 跨日换桶靠它，不靠墙钟，也不跟进程本地时区。
 	Day   string
 	Scene string
 	Peer  string
