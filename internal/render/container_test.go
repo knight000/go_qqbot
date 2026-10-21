@@ -43,6 +43,31 @@ func TestListItemsUseTightSpacing(t *testing.T) {
 	}
 }
 
+// 松散列表里的段落必须和顶层段落一样参与 margin collapsing：两段之间是
+// max(mbPara, 0) 的段间距，代码块/嵌套列表之后的段落同样不能零间距。
+//
+// 断言用高度差而不是比像素：列表项里的 Paragraph 此前走 textBlock，绕过了
+// paragraphLines 的 gap(0)+bottom(mbPara)，增量少掉的正好是一个段间距。
+func TestLooseListItemParagraphsKeepSpacing(t *testing.T) {
+	if mbPara != mbCode {
+		// 本用例的两段断言都用 mbPara 当期望值，前提是两者相等。
+		t.Fatalf("用例前提不成立：需要 mbPara(%v) == mbCode(%v)", mbPara, mbCode)
+	}
+
+	one := imgHeight(t, "- 甲\n")
+	two := imgHeight(t, "- 甲\n\n  乙\n")
+	if got, want := two-one, int(mbPara+lhBody); got != want {
+		t.Errorf("松散列表第二段带来的高度增量 = %d，期望 %d（段间距 %v + 一行 %v）", got, want, mbPara, lhBody)
+	}
+
+	// 列表内的围栏代码块之后再接一段：间距取 max(mbCode, 0)。
+	withCode := imgHeight(t, "- 甲\n\n  ```\n  x\n  ```\n")
+	withTail := imgHeight(t, "- 甲\n\n  ```\n  x\n  ```\n\n  尾巴\n")
+	if got, want := withTail-withCode, int(mbCode+lhBody); got != want {
+		t.Errorf("列表内代码块之后的段落高度增量 = %d，期望 %d（%v + %v）", got, want, mbCode, lhBody)
+	}
+}
+
 // 有序/无序、两层嵌套、任务列表在同一份文档里都能出图。
 func TestListsRenderNestedAndTaskItems(t *testing.T) {
 	data := renderPNG(t, listSample)

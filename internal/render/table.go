@@ -206,21 +206,24 @@ func (l *layout) layoutTable(head [][]span, body [][][]span, ncol int) (tableLay
 
 	avail := l.right - l.x
 	// 列数极多时，左右内边距本身就会超过画布宽度：按比例收窄内边距，
-	// 宁可挤一点也不让表格溢出。
+	// 不留硬下限。旧的 4px 下限与 1px 列宽下限相加是 9px/列，113 列就已经
+	// 越过 1016px 的可用宽度——溢出的右边框会被画布裁掉，而读者看不出
+	// 后面还有列。宁可挤，也不让内容静默消失。
 	padH := tablePadH
 	if need := float64(ncol) * 2 * padH; need > avail*0.4 {
-		padH = math.Max(4, avail*0.4/float64(ncol*2))
+		padH = avail * 0.4 / float64(ncol*2)
 	}
 
 	widths = fitColumns(widths, mins, avail, padH)
 	return tableLayout{widths: widths, padH: padH, total: tableWidth(widths, padH)}, nil
 }
 
-// glyphsWidth 是字形序列的总推进量（含行内代码药丸的 padding）。
+// glyphsWidth 是字形序列的总推进量（含行内代码药丸的 padding 与相邻字形的
+// kern），与折行判决用的是同一个量。
 func glyphsWidth(gs []glyph) float64 {
 	var width float64
-	for _, g := range gs {
-		width += g.adv
+	for i := range gs {
+		width += pxAdvance(gs, i)
 	}
 	return width
 }
@@ -235,7 +238,7 @@ func minContentWidth(gs []glyph) float64 {
 			cur = 0
 			continue
 		}
-		cur += g.adv
+		cur += pxAdvance(gs, i)
 		if i+1 < len(gs) && !gs[i+1].br && canBreak(g.r, gs[i+1].r) {
 			longest = math.Max(longest, cur)
 			cur = 0
@@ -268,14 +271,15 @@ func tableWidth(widths []float64, padH float64) float64 {
 //     被砍掉的宽度，且谁都不得窄于自己的下限。直接按宽度等比压缩会先把
 //     「运行中」这种三字列压到折行，而旁边的长文本列本来还有大量富余——
 //     那不是浏览器的排法。
-//  3. 全部压到下限后仍超宽（列太多或画布太窄）→ 下限本身等比再收一档，
-//     剩下的交给单元格内硬断行。宁可把超长 token 从中间断开，也不能让
-//     表格溢出画布，更不能把别的列压成单字竖排。
+//  3. 全部压到下限后仍超宽（列太多或画布太窄）→ 下限本身等比再收一档
+//     （允许 <1px），剩下的交给单元格内硬断行。宁可把超长 token 从中间
+//     断开、宁可列窄到读不清，也不能让表格溢出画布——溢出的部分会被画布
+//     裁掉，读者连"这里还有列"都看不出来。
 //
-// 下限分两层：tableMinColWidth 是**硬**下限（可读性）；"不破词"（列宽不窄于
-// 最长不可断片段）是**软**下限，只在预算有余时满足。两层都写成硬下限会出事：
-// 一条 60 字符的 token 的 min-content 就是它自己，它会把预算吃光，剩下的
-// 可断行列只能退到一两个字——这正是要修的缺陷。
+// 下限分两层：tableMinColWidth 是**软**下限（可读性，且不超过均分预算）；
+// "不破词"（列宽不窄于最长不可断片段）只在水位法里有余量时满足。两层都
+// 写成硬下限会出事：一条 60 字符的 token 的 min-content 就是它自己，它会
+// 把预算吃光，剩下的可断行列只能退到一两个字——这正是要修的缺陷。
 func fitColumns(maxContent, minContent []float64, avail, padH float64) []float64 {
 	ncol := len(maxContent)
 	out := append([]float64{}, maxContent...)
@@ -284,21 +288,22 @@ func fitColumns(maxContent, minContent []float64, avail, padH float64) []float64
 	}
 
 	remaining := avail - float64(ncol)*2*padH
-	if remaining < 1 {
-		remaining = 1
-	}
 
 	// 均分宽度是"不破词"天花板：任何一列都不该因为内容不可断而拿到
 	// 超过均分的宽度，否则其余列连可读性下限都保不住。
 	share := avail / float64(ncol)
+	// 可读性下限同样受均分预算约束：列数一大，"每列至少 6 个半角"本身就
+	// 会把表格撑出画布（113 列 × 96px ≫ 1016px）。下限是软目标，不溢出
+	// 是硬约束。
+	floor := math.Min(tableMinColWidth, remaining/float64(ncol))
+	if floor < 0 {
+		floor = 0
+	}
 	base := make([]float64, ncol)
 	word := make([]float64, ncol)
 	baseSum, upper := 0.0, 0.0
 	for i := range out {
-		b := math.Min(maxContent[i], tableMinColWidth)
-		if b < 1 {
-			b = 1
-		}
+		b := math.Min(maxContent[i], floor)
 		base[i] = b
 		w := b
 		if minContent[i] > w {
@@ -316,7 +321,7 @@ func fitColumns(maxContent, minContent []float64, avail, padH float64) []float64
 		// 连硬下限都放不下：只能力保不溢出，剩下的交给折行硬断。
 		scale := remaining / baseSum
 		for i := range out {
-			out[i] = math.Max(base[i]*scale, 1)
+			out[i] = math.Max(base[i]*scale, 0)
 		}
 		return out
 	}
@@ -353,6 +358,19 @@ func fitColumns(maxContent, minContent []float64, avail, padH float64) []float64
 	}
 	for i := range out {
 		out[i] = math.Max(floors[i], math.Min(maxContent[i], lo))
+	}
+
+	// 二分只收敛到"约等于"，几十列累加后的零点几像素也会让右边框落到
+	// 画布外。最后再按总和归一一次，保证 total ≤ avail 是硬约束。
+	sum := 0.0
+	for _, w := range out {
+		sum += w
+	}
+	if sum > remaining {
+		scale := remaining / sum
+		for i := range out {
+			out[i] *= scale
+		}
 	}
 	return out
 }
