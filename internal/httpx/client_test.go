@@ -94,9 +94,18 @@ func newRedirectFixture(t *testing.T, location func(targetURL string) string) *r
 	}))
 	t.Cleanup(f.src.Close)
 
-	// 信任自签证书 + 把 evilHost 解析到目标监听器。TLS 校验与白名单是两件事：
-	// 这里要验的是「白名单有没有拦住这一跳」，所以放过证书。
-	tr := f.src.Client().Transport.(*http.Transport).Clone()
+	targetAddr := f.target.Listener.Addr().String()
+	f.client = evilTransport(t, f.src.Client(), targetAddr)
+	return f
+}
+
+// evilTransport 信任自签证书，并把 evilHost 解析到 targetAddr。
+//
+// TLS 校验与白名单是两件事：这里要验的是「策略有没有拦住这一跳」，
+// 所以放过证书；而 dial 改写让"策略失效"真的能打到监听器上。
+func evilTransport(t *testing.T, base *http.Client, targetAddr string) *http.Client {
+	t.Helper()
+	tr := base.Transport.(*http.Transport).Clone()
 	cfg := &tls.Config{}
 	if tr.TLSClientConfig != nil {
 		cfg = tr.TLSClientConfig.Clone()
@@ -108,15 +117,13 @@ func newRedirectFixture(t *testing.T, location func(targetURL string) string) *r
 		var d net.Dialer
 		dial = d.DialContext
 	}
-	targetAddr := f.target.Listener.Addr().String()
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if h, _, err := net.SplitHostPort(addr); err == nil && strings.EqualFold(h, evilHost) {
 			addr = targetAddr
 		}
 		return dial(ctx, network, addr)
 	}
-	f.client = &http.Client{Transport: tr}
-	return f
+	return &http.Client{Transport: tr}
 }
 
 func (f *redirectFixture) host(t *testing.T) string {
@@ -341,5 +348,62 @@ func TestServerErrorStillRetries(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 2 {
 		t.Fatalf("5xx 应照旧重试一次（共 2 次），实际 %d 次", got)
+	}
+}
+
+// 429 的冷却要同时覆盖「被扣令牌的桶」与「真正答复的域名」。
+//
+// 这里源站只回 302，429 来自被重定向到的站点：令牌是从源站的桶里取的，
+// 若只冷却答复方，下一次请求仍会从源站的桶取一次令牌再出网——账本与
+// 被拒请求没对齐，惩罚窗口还会被续期。
+func TestRateLimitCooldownCoversBucketAndResponder(t *testing.T) {
+	var targetHits, srcHits int32
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&targetHits, 1)
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer target.Close()
+	limitedURL := strings.Replace(target.URL, "127.0.0.1", evilHost, 1) + "/limited"
+
+	src := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&srcHits, 1)
+		http.Redirect(w, r, limitedURL, http.StatusFound)
+	}))
+	defer src.Close()
+
+	client := evilTransport(t, src.Client(), target.Listener.Addr().String())
+	u, _ := url.Parse(src.URL)
+	// 两个域名都声明了、也都配了独立桶：这条测的是冷却落在哪个桶上，
+	// 不是白名单，也不是"共用一个默认桶"。
+	c := New(Options{
+		Timeout:    time.Second,
+		RatePerMin: 6000,
+		DomainRatePerMin: map[string]int{
+			u.Hostname(): 6000,
+			evilHost:     6000,
+		},
+		HTTPClient: client,
+	}).WithDomains([]string{u.Hostname(), evilHost})
+
+	if err := c.GetJSON(context.Background(), src.URL, nil); !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("应拿到 429，实际 %v", err)
+	}
+
+	start := time.Now()
+	if err := c.GetJSON(context.Background(), src.URL, nil); !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("入口域名的桶（取过令牌的那个）应被冷却，实际 %v", err)
+	}
+	if err := c.GetJSON(context.Background(), limitedURL, nil); !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("答复方域名也应被冷却，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("冷却期内应立刻失败，实际耗时 %s", elapsed)
+	}
+	if got := atomic.LoadInt32(&targetHits); got != 1 {
+		t.Fatalf("冷却期内不得再打平台，目标站收到 %d 次", got)
+	}
+	if got := atomic.LoadInt32(&srcHits); got != 1 {
+		t.Fatalf("冷却期内不得再出网，源站收到 %d 次", got)
 	}
 }
