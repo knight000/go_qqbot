@@ -65,11 +65,13 @@ func (db *DB) PurgeEvents(ctx context.Context, before int64, limit int) (int64, 
 		before, limit)
 }
 
+// purgeJobRunsSQL 是 job_runs 的分批清理语句。单独提成常量是为了让
+// 「索引是否被这条查询用上」可以在测试里对着同一份 SQL 跑 EXPLAIN QUERY PLAN。
+const purgeJobRunsSQL = `DELETE FROM job_runs WHERE id IN
+			(SELECT id FROM job_runs WHERE started_at < ? LIMIT ?)`
+
 func (db *DB) PurgeJobRuns(ctx context.Context, before int64, limit int) (int64, error) {
-	return db.purge(ctx,
-		`DELETE FROM job_runs WHERE id IN
-			(SELECT id FROM job_runs WHERE started_at < ? LIMIT ?)`,
-		before, limit)
+	return db.purge(ctx, purgeJobRunsSQL, before, limit)
 }
 
 // PurgeMediaRows 只删行；文件删除由媒体模块负责（本脚手架未启用下载）。

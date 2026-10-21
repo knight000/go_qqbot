@@ -152,6 +152,13 @@ func (db *DB) Migrate(ctx context.Context) error {
 		_ = tx.Rollback()
 		return err
 	}
+	// 索引变更排在所有重建之后：重建 plugin_kv 会把它的索引一起带走。
+	for _, stmt := range postMigrationStatements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("执行索引迁移失败: %w\n%s", err, firstLine(stmt))
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交迁移: %w", err)
 	}

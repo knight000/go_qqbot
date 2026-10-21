@@ -174,7 +174,6 @@ var schema = []string{
 	// idx_job_runs_peer 不能写在这里——schema 先于补列执行，
 	// 旧库此时还没有 peer 列，建索引会直接失败（reset_audit 踩过同一个坑）。
 	jobRunsTableDDL,
-	`CREATE INDEX IF NOT EXISTS idx_job_runs ON job_runs(job_id, started_at)`,
 
 	// sessions 是新表，旧库升级不需要迁移：幂等 DDL 直接把它建出来。
 	// 两个索引各有明确用途——expires 给 GC 的 DELETE 走索引，
@@ -182,6 +181,21 @@ var schema = []string{
 	sessionTableDDL,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_plugin  ON sessions(plugin)`,
+}
+
+// postMigrationStatements 是**必须排在建表与补列之后**的索引变更。
+//
+// 放在这里而不是 schema 列表里，有两个原因：
+//   - migrateLegacyPluginKV 会重建 plugin_kv，重建会把表上的索引一起带走，
+//     schema 里建好的索引会在迁移末尾消失；
+//   - job_runs 的旧索引要先 DROP 再建新的，且新索引列必须已经存在。
+//
+// 每条都用 IF [NOT] EXISTS，所以重复迁移是幂等的。
+var postMigrationStatements = []string{
+	// GC 按 started_at 分批删（PurgeJobRuns），唯一的消费方就是这条查询。
+	// 旧的 (job_id, started_at) 没有任何查询用得上，只增加写放大。
+	`DROP INDEX IF EXISTS idx_job_runs`,
+	`CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at)`,
 }
 
 // jobTableDDL 单独提出来：旧库要把 jobs 从 id 主键重建成 (id, peer) 复合主键。
