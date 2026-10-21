@@ -163,12 +163,14 @@ func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 			weight = WeightBold
 		}
 
+		// 颜色优先级：链接的强调色压过引用块的 muted。反过来会让引用块里的
+		// 链接与正文同色，静态图里唯一的链接线索就没了。
 		col := colFg
-		if s.link {
-			col = colAccent
-		}
 		if l.muted {
 			col = colMuted
+		}
+		if s.link {
+			col = colAccent
 		}
 
 		start := len(out)
