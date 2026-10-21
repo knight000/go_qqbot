@@ -23,18 +23,25 @@ type DB struct {
 	path string
 }
 
-func dsn(path string) string {
+func dsn(path string, readOnly bool) string {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = path
 	}
-	return "file:" + filepath.ToSlash(abs) +
+	s := "file:" + filepath.ToSlash(abs) +
 		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=foreign_keys(1)" +
 		"&_pragma=auto_vacuum(INCREMENTAL)" +
 		"&_pragma=wal_autocheckpoint(1000)"
+	if readOnly {
+		// 读连接一律 query_only：插件查询的"只读"由 SQLite 自己判定，
+		// 而不是靠 Go 里猜 SQL 的第一个词（`WITH … DELETE` 会以 with 开头）。
+		// 这条 pragma 是连接级的，连接池里每个连接都会带上。
+		s += "&_pragma=query_only(1)"
+	}
+	return s
 }
 
 // Open 打开数据库。目录不存在会自动创建；禁止把 path 指向网络盘或 tmpfs。
@@ -42,8 +49,8 @@ func Open(path string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("创建数据目录: %w", err)
 	}
-	connect := func(maxOpen int) (*sql.DB, error) {
-		db, err := sql.Open("sqlite", dsn(path))
+	connect := func(maxOpen int, readOnly bool) (*sql.DB, error) {
+		db, err := sql.Open("sqlite", dsn(path, readOnly))
 		if err != nil {
 			return nil, err
 		}
@@ -53,11 +60,11 @@ func Open(path string) (*DB, error) {
 		return db, nil
 	}
 
-	w, err := connect(1)
+	w, err := connect(1, false)
 	if err != nil {
 		return nil, fmt.Errorf("打开写连接: %w", err)
 	}
-	r, err := connect(4)
+	r, err := connect(4, true)
 	if err != nil {
 		_ = w.Close()
 		return nil, fmt.Errorf("打开读连接: %w", err)

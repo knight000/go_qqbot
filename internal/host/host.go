@@ -268,6 +268,10 @@ type Sender interface {
 type Row map[string]any
 
 // QueryStore 只读、参数化、行数上限 1000；不允许 DDL/写操作。
+//
+// 只读不是在 SQL 文本上判首词，而是执行侧保证：查询走 SQLite 的只读连接
+// （PRAGMA query_only），`WITH … DELETE` 这类写法会在执行时报错。行数上限
+// 同样在取行时截断——SQL 按插件写的原样执行，不会被拼上额外的 LIMIT。
 type QueryStore interface {
 	Query(ctx context.Context, query string, args ...any) ([]Row, error)
 }

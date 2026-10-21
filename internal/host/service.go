@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -208,23 +207,20 @@ func (k *kvStore) Delete(ctx context.Context, key string) error {
 
 type queryStore struct{ db QueryBackend }
 
+// Query 把查询原样交给后端。
+//
+// 这里**不做** SQL 文本层面的只读判断：`WITH … DELETE` 同样以 with 开头，
+// 前缀校验拦不住；按 `" limit "` 判断上限还会把 `LIMIT\n100` 误判成没写
+// 上限、在尾巴上再拼一个 LIMIT。两件事的负责方都已下移：
+//   - 只读由 store 的只读连接（PRAGMA query_only）保证，写语句在执行时报错；
+//   - 行数上限由 store.QueryRows 在取行时截断到 1000。
+//
+// 因此插件看到的 SQL 与自己写的逐字一致，参数也原样透传。
 func (q *queryStore) Query(ctx context.Context, query string, args ...any) ([]Row, error) {
 	if q.db == nil {
 		return nil, fmt.Errorf("查询后端未初始化")
 	}
-	trimmed := strings.TrimSpace(query)
-	lower := strings.ToLower(trimmed)
-	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
-		return nil, fmt.Errorf("只允许只读查询")
-	}
-	// 简易单语句校验：分号只允许出现在结尾之前（本脚手架按最保守规则处理）
-	if strings.Contains(strings.TrimSuffix(trimmed, ";"), ";") {
-		return nil, fmt.Errorf("只允许单条语句")
-	}
-	if !strings.Contains(lower, " limit ") {
-		trimmed = strings.TrimSuffix(trimmed, ";") + " LIMIT 1000"
-	}
-	raw, err := q.db.QueryRows(ctx, trimmed, args...)
+	raw, err := q.db.QueryRows(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
