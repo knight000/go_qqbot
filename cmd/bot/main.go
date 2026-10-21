@@ -2,6 +2,9 @@
 //
 // 内置插件在本文件 blank import（P1 编译期注册，见 ARCHITECTURE.md §3.1）；
 // plugins/ 下的其余插件由 tools/genplugins 生成到 plugins_gen.go，见 §3.5。
+// 生成物不入库（.gitignore），所以构建前必须先跑 go generate ./cmd/bot：
+// 少了这一步，新放进 plugins/ 的插件不会被链接进二进制，启动日志里的插件
+// 名单也不会多出它。
 //
 //go:generate go run ../../tools/genplugins
 package main
@@ -117,6 +120,13 @@ func run() (*core.RestartRequest, error) {
 	log := logx.New(logLevel, cfg.Log.Format)
 	slog.SetDefault(log)
 
+	// 信号注册必须在这里——配置刚读完，后面还要解析字体（约 300ms）、拿单实例锁、
+	// 开库、跑迁移。放在它们之后，这段窗口里收到的 Ctrl-C/SIGTERM 会走 Go 的
+	// 默认处理：进程被直接杀死，会话不落盘，systemd 记的是 "killed by signal"
+	// 而不是一次正常退出（P3-21）。
+	ctx, stop := notifyShutdown(context.Background())
+	defer stop()
+
 	// 渲染器在启动期同步解析字体（约 300 ms，全部花在 20 MB 字体的字节码扫描上）。
 	// 字体是 go:embed 进来的，解析失败只可能是二进制本身有问题——带病运行会在
 	// 第一次出图时把错误抛给插件，不如现在直接启动失败。
@@ -202,9 +212,6 @@ func run() (*core.RestartRequest, error) {
 		return nil, err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	if err := coreImpl.Start(ctx); err != nil {
 		return nil, err
 	}
@@ -234,18 +241,19 @@ func run() (*core.RestartRequest, error) {
 	}()
 
 	bi := buildinfo.Get()
-	log.Info("qqbot 启动完成",
-		"config", *cfgPath,
-		"db", db.Path(),
-		"lock", lock.Path(),
-		"app_lock", lock.AppPath(),
-		"sandbox", cfg.App.Sandbox,
-		"debug", cfg.Debug.Enabled,
-		"version", bi.String(),
-		"platform", bi.Platform,
-		"go", bi.GoVer,
-		"restarted", buildinfo.RestartedByReload(),
-		"plugins", len(host.Registered()))
+	logStartup(log, startupInfo{
+		ConfigPath:  *cfgPath,
+		DBPath:      db.Path(),
+		LockPath:    lock.Path(),
+		AppLockPath: lock.AppPath(),
+		Sandbox:     cfg.App.Sandbox,
+		Debug:       cfg.Debug.Enabled,
+		Version:     bi.String(),
+		Platform:    bi.Platform,
+		GoVersion:   bi.GoVer,
+		Restarted:   buildinfo.RestartedByReload(),
+		Plugins:     host.Registered(),
+	})
 	if buildinfo.RestartedByReload() {
 		log.Info("本次启动由 /reload 触发", "version", bi.String())
 	}
@@ -260,17 +268,13 @@ func run() (*core.RestartRequest, error) {
 		}
 	}
 
-	var req *core.RestartRequest
-	var gwFatal error
-	select {
-	case <-ctx.Done():
-	case r := <-coreImpl.RestartRequests():
-		req = &r
-	case <-gwDone:
-		// 网关自己退出了。正常退出只发生在 ctx 取消之后，所以走到这里往往是
-		// 永久性错误（4001/4002/4010–4014/4914/4915）：再连也不会好，
-		// 但也不能留着一个"进程在跑、机器人已死"的躯壳。
-		gwFatal = <-gwRes
+	req, dropped, gwFatal := waitExit(ctx, coreImpl.RestartRequests(), gwDone, gwRes)
+	// select 在 ctx.Done 与 /reload 同时就绪时是随机选：选中请求就把一次
+	// Ctrl-C 变成"重新执行自身"，systemd 记成异常重启。waitExit 已经把这种
+	// 请求丢掉，这里只负责把现场写进日志（P3-22）。
+	if dropped != nil {
+		log.Warn("退出信号与重启请求同时到达，按关停处理",
+			"by", dropped.By, "role", dropped.Role, "reason", dropped.Reason)
 	}
 	stop()
 
@@ -341,6 +345,36 @@ func rawDumpFunc(cfg *config.Config, c *core.Core) func(string, []byte) {
 	return c.PrintRaw
 }
 
+// notifyShutdown 返回随 Ctrl-C / SIGTERM 取消的 ctx。
+//
+// 调用点必须紧跟 config.Load：后面的字体解析（约 300ms）、单实例锁、开库与
+// 迁移都在这段窗口里，晚注册就会让期间的 SIGTERM 走默认处理（P3-21）。
+func notifyShutdown(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+}
+
+// waitExit 等待本次运行的结束原因：关停信号、/reload 请求，或网关自己退出。
+//
+// dropped 非 nil 表示 /reload 请求确实到了，但与退出信号同时就绪。select 对
+// 同时就绪的多个 case 是随机选，选中请求就会把一次 Ctrl-C 变成"重新执行自身"。
+// 所以这里先判 ctx：信号已到就一律按关停走（P3-22）。
+func waitExit(ctx context.Context, restarts <-chan core.RestartRequest, gwDone <-chan struct{}, gwRes <-chan error) (req, dropped *core.RestartRequest, gwFatal error) {
+	select {
+	case <-ctx.Done():
+	case r := <-restarts:
+		req = &r
+	case <-gwDone:
+		// 网关自己退出了。正常退出只发生在 ctx 取消之后，所以走到这里往往是
+		// 永久性错误（4001/4002/4010–4014/4914/4915）：再连也不会好，
+		// 但也不能留着一个"进程在跑、机器人已死"的躯壳。
+		gwFatal = <-gwRes
+	}
+	if ctx.Err() != nil && req != nil {
+		dropped, req = req, nil
+	}
+	return req, dropped, gwFatal
+}
+
 // lockWait 决定等单实例锁的上限。
 //
 // /reload 拉起的新进程是"交接"：旧进程在 exec 之前就放手了，正常情况下一次
@@ -366,4 +400,50 @@ func formatDomainLimits(limits map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%s=%d", h, limits[h]))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// startupInfo 是"启动完成"那一行需要的事实。抽成结构体是为了让日志内容可测。
+type startupInfo struct {
+	ConfigPath  string
+	DBPath      string
+	LockPath    string
+	AppLockPath string
+	Sandbox     bool
+	Debug       bool
+	Version     string
+	Platform    string
+	GoVersion   string
+	Restarted   bool
+	Plugins     []host.Plugin
+}
+
+// logStartup 打印启动完成。插件既报数量也报名字：
+//
+// 只报 plugins=4 时，"新插件没进二进制"与"插件进去了但没注册"看起来一模一样，
+// 现场只能靠"指令没反应"反推，而构建日志里全是成功（P3-17）。
+func logStartup(log *slog.Logger, in startupInfo) {
+	log.Info("qqbot 启动完成",
+		"config", in.ConfigPath,
+		"db", in.DBPath,
+		"lock", in.LockPath,
+		"app_lock", in.AppLockPath,
+		"sandbox", in.Sandbox,
+		"debug", in.Debug,
+		"version", in.Version,
+		"platform", in.Platform,
+		"go", in.GoVersion,
+		"restarted", in.Restarted,
+		"plugins", len(in.Plugins),
+		"plugin_names", pluginNames(in.Plugins))
+}
+
+// pluginNames 把已注册插件按名字排序后用逗号连起来。
+// 排序只为两次启动能逐字比对——host.Registered() 的顺序取决于 import 顺序。
+func pluginNames(plugins []host.Plugin) string {
+	names := make([]string, 0, len(plugins))
+	for _, p := range plugins {
+		names = append(names, p.Manifest().Name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
