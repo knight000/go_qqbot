@@ -8,6 +8,9 @@ Type=simple
 User=qqbot
 WorkingDirectory=/opt/qqbot
 ExecStart=/opt/qqbot/bin/qqbot -c /etc/qqbot/config.toml
+# 双保险：cron 与主动消息日预算都由程序内的 Asia/Shanghai 决定（不读 TZ），
+# 但 Debian 12 默认 UTC，日志时间戳与任何依赖本地时区的库都会偏 8 小时。
+Environment=TZ=Asia/Shanghai
 # 认证已写入 /etc/qqbot/config.toml（600）。若改用环境变量覆盖，
 # 再启用下面一行，AppID/Secret 不落配置文件。
 # EnvironmentFile=-/etc/qqbot/env
