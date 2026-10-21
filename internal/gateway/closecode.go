@@ -158,6 +158,12 @@ const (
 	stableReadyWindow = 30 * time.Second
 )
 
+// defaultHandshakeTimeout 是 Identify/Resume 之后等 READY/RESUMED 的上限。
+//
+// 量级与官方 SDK 一致（约 30s）：握手没完成就等于没连上，而这段等待如果
+// 没有上限，平台"接受 WS + 心跳回 ACK + 不回 READY"就会让读循环永久阻塞。
+const defaultHandshakeTimeout = 30 * time.Second
+
 // backoff 是重连退避的状态机：Run 每轮先用 note 汇报上一条连接活了多久，
 // 再用 next 取本轮该等多久。把它抽出来是为了让"短命连接不复位"这条
 // 口径能被单测钉住，而不是埋在 Run 的循环里。
