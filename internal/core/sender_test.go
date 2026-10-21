@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/store"
 )
 
@@ -56,6 +58,10 @@ type fakeAPI struct {
 	// bizSendAt 让第 N 次（1 起）发消息返回平台业务错误（HTTP 200 + err_code），
 	// 与 failSendAt 的区别是"平台明确拒绝"而不是"网络层面不明"。
 	bizSendAt int
+	// rateLimitedAt 让第 N 次（1 起）发消息返回平台 429；retryAfter 模拟
+	// Retry-After 头（0 表示平台没给，核心应按缺省窗口冷却）。
+	rateLimitedAt int
+	retryAfter    time.Duration
 }
 
 func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.MessageBody) error {
@@ -63,6 +69,9 @@ func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.
 	defer f.mu.Unlock()
 	f.calls++
 	f.bodies = append(f.bodies, body)
+	if f.rateLimitedAt > 0 && f.calls == f.rateLimitedAt {
+		return &httpx.HTTPError{Status: http.StatusTooManyRequests, RetryAfter: f.retryAfter}
+	}
 	if f.bizSendAt > 0 && f.calls == f.bizSendAt {
 		return &api.BusinessError{Code: 40034005, Message: "msg_id 已过期"}
 	}
@@ -637,5 +646,98 @@ func TestSenderActiveBudgetSurvivesRestart(t *testing.T) {
 	}
 	if n := f2.callCount(); n != 0 {
 		t.Fatalf("额度已尽时不应发 HTTP，实际 %d 次", n)
+	}
+}
+
+// 429 是平台在说"到点再来"，不是"可以重试"。核心要在 (scene, peer) 上记
+// 同样的窗口：冷却期内直接失败、不出网，连换个 msg_id 也不放行（惩罚是
+// 会话级的，不是某条消息的）。
+func TestSenderRateLimitCooldownSkipsNetwork(t *testing.T) {
+	f := &fakeAPI{rateLimitedAt: 1, retryAfter: 2 * time.Second}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
+	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("429 应返回 ErrRateLimited，实际 %v", err)
+	}
+
+	next := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m2"}
+	start := time.Now()
+	err := s.Reply(ctx, next, host.Reply{Content: "hi"})
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("冷却期内应直接返回 ErrRateLimited，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("冷却期内应立刻失败，实际耗时 %s", elapsed)
+	}
+	if n := f.callCount(); n != 1 {
+		t.Fatalf("冷却期内不得出网，实际调用 %d 次", n)
+	}
+
+	now = now.Add(3 * time.Second)
+	if err := s.Reply(ctx, next, host.Reply{Content: "hi"}); err != nil {
+		t.Fatalf("冷却结束后应能发送: %v", err)
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("冷却结束后应再发 1 次，实际共 %d 次", n)
+	}
+}
+
+// 平台没给 Retry-After 时按 60s：惩罚窗口通常 ≥1 分钟，本地的缺省值不能是 0。
+func TestSenderRateLimitCooldownDefaultsTo60s(t *testing.T) {
+	f := &fakeAPI{rateLimitedAt: 1} // retryAfter 为 0：平台没带头
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
+	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	ctx := context.Background()
+	ev := &host.Event{Scene: host.SceneC2C, PeerID: "u1", MsgID: "m1"}
+
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("429 应返回 ErrRateLimited，实际 %v", err)
+	}
+	now = now.Add(59 * time.Second)
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("59s 时仍在缺省冷却窗口内，实际 %v", err)
+	}
+	now = now.Add(2 * time.Second)
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+		t.Fatalf("61s 时应已过冷却: %v", err)
+	}
+}
+
+// 主动消息的冷却检查必须在扣日预算之前：冷却期内被挡下的请求既不出网，
+// 也不该烧掉一格（预算按天计，比令牌贵得多）。
+func TestSenderActiveRateLimitCooldownKeepsBudget(t *testing.T) {
+	f := &fakeAPI{rateLimitedAt: 1, retryAfter: 2 * time.Second}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 2,
+	}, newUsageStore(t), time.Local)
+	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return now }
+	p := s.ForPlugin("bootnotice")
+	ctx := context.Background()
+
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("429 应返回 ErrRateLimited，实际 %v", err)
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("冷却期内应返回 ErrRateLimited，实际 %v", err)
+	}
+	if n := f.callCount(); n != 1 {
+		t.Fatalf("冷却期内不得出网，实际调用 %d 次", n)
+	}
+
+	now = now.Add(3 * time.Second)
+	// 预算 2：被 429 拒掉的那条占 1 格，冷却期内被挡下的两次都不该再扣。
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("冷却结束后仍应有额度: %v", err)
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("应发 2 次（1 次 429 + 1 次成功），实际 %d 次", n)
 	}
 }
