@@ -2,12 +2,14 @@ package adminping
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/sysinfo"
 )
 
 // fakeHost 只填本插件用到的能力（日志与配置）；鉴权已不在插件里，IsAdmin 不参与。
@@ -40,7 +42,9 @@ func newPlugin(t *testing.T) *Plugin {
 	return p
 }
 
-func ev(content string) *host.Event {
+// ev 构造一条投递到本插件的事件。command 是路由层填好的 Event.Command
+// （未命中任何命令时为空串，例如会话接管消息）。
+func ev(command, content string) *host.Event {
 	return &host.Event{
 		ID:       "e1",
 		Kind:     host.KindMessage,
@@ -49,6 +53,7 @@ func ev(content string) *host.Event {
 		PeerID:   "group-1",
 		SenderID: "user-1",
 		MsgID:    "m1",
+		Command:  command,
 		Content:  content,
 		Actor: host.Principal{
 			OpenID: "user-1", Scene: host.SceneGroup, PeerID: "group-1",
@@ -57,23 +62,18 @@ func ev(content string) *host.Event {
 	}
 }
 
-func TestIsPing(t *testing.T) {
-	cases := []struct {
-		in   string
-		want bool
-	}{
-		{"/ping", true},
-		{"  /ping  ", true},
-		{"/PING", true},
-		{"/ping 忽略多余参数", true},
-		{"/pingpong", false},
-		{"!ping", false},
-		{"", false},
+// 命令匹配归路由层：core.argsAfterPrefix 用大小写敏感的 strings.CutPrefix 切前缀，
+// 所以 `/PING` 永远不会投递到本插件。插件只认 ev.Command，不再自己按原文再判一次——
+// 那种"假保险"会把路由层刻意排除的大小写变体又放进来，而且让"谁决定这是指令"
+// 出现第二个仲裁者（echo / md 都只认 ev.Command）。
+func TestUpperCasePingIsNotHandled(t *testing.T) {
+	p := newPlugin(t)
+	reply, err := p.Handle(context.Background(), ev("", "/PING"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
-	for _, c := range cases {
-		if got := isPing(c.in); got != c.want {
-			t.Errorf("isPing(%q) = %v, want %v", c.in, got, c.want)
-		}
+	if reply != nil {
+		t.Errorf("/PING 不应被当作 ping（路由层大小写敏感，不会投递它）：%q", reply.Content)
 	}
 }
 
@@ -107,20 +107,24 @@ func TestManifestRequiresBotAdmin(t *testing.T) {
 
 func TestOtherCommandsIgnored(t *testing.T) {
 	p := newPlugin(t)
-	for _, c := range []string{"hello", "/reset", "/pingpong"} {
-		reply, err := p.Handle(context.Background(), ev(c))
+	for _, c := range []struct{ command, content string }{
+		{"", "hello"},        // 没有命中任何命令（例如会话接管消息）
+		{"/reset", "/reset"}, // 命中别的插件
+		{"/md", "/md # 标题"},  // 同上，带参数
+	} {
+		reply, err := p.Handle(context.Background(), ev(c.command, c.content))
 		if err != nil {
-			t.Fatalf("Handle(%q): %v", c, err)
+			t.Fatalf("Handle(%q): %v", c.content, err)
 		}
 		if reply != nil {
-			t.Errorf("%q 不应被本插件处理", c)
+			t.Errorf("%q 不应被本插件处理", c.content)
 		}
 	}
 }
 
 func TestAdminGetsFullReport(t *testing.T) {
 	p := newPlugin(t)
-	reply, err := p.Handle(context.Background(), ev("/ping"))
+	reply, err := p.Handle(context.Background(), ev("/ping", "/ping"))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -136,6 +140,56 @@ func TestAdminGetsFullReport(t *testing.T) {
 		t.Errorf("MsgType = %d, want 0（文本）", reply.MsgType)
 	}
 	t.Logf("报告内容:\n%s", reply.Content)
+}
+
+// 峰值 RSS 是排查 OOM 的唯一线索：进程被重启后当前 RSS 从头开始，
+// 只有峰值还记得"它死之前吃到了多少"。所以它必须出现在 /ping 里。
+//
+// 用注入的采集结果断言整段文本，而不是只查"峰值"两个字：否则把当前 RSS
+// 当成峰值打印（这正是修复前的样子）也能过。
+func TestReportShowsProcessPeakRSS(t *testing.T) {
+	orig := readProcessMemory
+	readProcessMemory = func() (sysinfo.ProcessMemory, error) {
+		return sysinfo.ProcessMemory{RSS: 8 << 20, Peak: 64 << 20}, nil
+	}
+	t.Cleanup(func() { readProcessMemory = orig })
+
+	p := newPlugin(t)
+	reply, err := p.Handle(context.Background(), ev("/ping", "/ping"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply == nil {
+		t.Fatal("应收到回复")
+	}
+	if want := "本进程 8.0 MB（峰值 64.0 MB）"; !strings.Contains(reply.Content, want) {
+		t.Errorf("报告缺少 %q：\n%s", want, reply.Content)
+	}
+}
+
+// 采集失败必须显式说出来。旧实现是"RSS 为 0 就不打印这一段"，
+// 于是采集失败与"真的 0 字节"在 /ping 上长得一样——都是没有这一行。
+func TestReportShowsProcessMemoryFailure(t *testing.T) {
+	orig := readProcessMemory
+	readProcessMemory = func() (sysinfo.ProcessMemory, error) {
+		return sysinfo.ProcessMemory{}, errors.New("注入的采集失败")
+	}
+	t.Cleanup(func() { readProcessMemory = orig })
+
+	p := newPlugin(t)
+	reply, err := p.Handle(context.Background(), ev("/ping", "/ping"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply == nil {
+		t.Fatal("应收到回复：采集失败不是整条报告失败")
+	}
+	if !strings.Contains(reply.Content, "本进程") || !strings.Contains(reply.Content, "采集失败") {
+		t.Errorf("采集失败未被显式展示：\n%s", reply.Content)
+	}
+	if strings.Contains(reply.Content, "峰值 0 B") {
+		t.Errorf("不应用 0 B 冒充峰值：\n%s", reply.Content)
+	}
 }
 
 func TestManifestDeclaresPing(t *testing.T) {
