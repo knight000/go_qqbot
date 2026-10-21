@@ -218,11 +218,12 @@ func (l *layout) layoutTable(head [][]span, body [][][]span, ncol int) (tableLay
 	return tableLayout{widths: widths, padH: padH, total: tableWidth(widths, padH)}, nil
 }
 
-// glyphsWidth 是字形序列的总推进量（含行内代码药丸的 padding）。
+// glyphsWidth 是字形序列的总推进量（含行内代码药丸的 padding 与相邻字形的
+// kern），与折行判决用的是同一个量。
 func glyphsWidth(gs []glyph) float64 {
 	var width float64
-	for _, g := range gs {
-		width += g.adv
+	for i := range gs {
+		width += pxAdvance(gs, i)
 	}
 	return width
 }
@@ -237,7 +238,7 @@ func minContentWidth(gs []glyph) float64 {
 			cur = 0
 			continue
 		}
-		cur += g.adv
+		cur += pxAdvance(gs, i)
 		if i+1 < len(gs) && !gs[i+1].br && canBreak(g.r, gs[i+1].r) {
 			longest = math.Max(longest, cur)
 			cur = 0
