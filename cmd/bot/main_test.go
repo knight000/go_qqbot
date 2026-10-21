@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/core"
 	"github.com/knight000/go_qqbot/internal/host"
 )
 
@@ -71,6 +72,40 @@ func (f fakePlugin) Manifest() host.Manifest             { return host.Manifest{
 func (fakePlugin) Init(context.Context, host.Host) error { return nil }
 func (fakePlugin) Handle(context.Context, *host.Event) (*host.Reply, error) {
 	return nil, nil
+}
+
+// 退出信号与 /reload 同时就绪时 select 随机选，选中请求就会把 Ctrl-C 变成重启。
+// 无论 select 选中哪个 case，只要 ctx 已取消，waitExit 都不能返回重启请求（P3-22）。
+func TestWaitExitDropsRestartAfterSignal(t *testing.T) {
+	// 两个 case 同时就绪，选中是随机的；重复多轮，任何一轮把请求交出去都算回归。
+	for i := 0; i < 100; i++ {
+		restarts := make(chan core.RestartRequest, 1)
+		restarts <- core.RestartRequest{By: "owner", Role: "owner"}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		req, _, gwFatal := waitExit(ctx, restarts, make(chan struct{}), make(chan error, 1))
+		if req != nil {
+			t.Fatalf("第 %d 轮：退出信号已到，却返回了重启请求 %+v", i, req)
+		}
+		if gwFatal != nil {
+			t.Fatalf("第 %d 轮：网关没有退出，不该有 fatal 错误: %v", i, gwFatal)
+		}
+	}
+
+	// 正常情况：没有退出信号时请求照常生效，且不算被丢弃。
+	restarts := make(chan core.RestartRequest, 1)
+	restarts <- core.RestartRequest{By: "owner", Role: "owner"}
+	req, dropped, gwFatal := waitExit(context.Background(), restarts, make(chan struct{}), make(chan error, 1))
+	if req == nil || req.By != "owner" {
+		t.Fatalf("没有退出信号时应返回重启请求，实际 %+v", req)
+	}
+	if dropped != nil {
+		t.Fatalf("没有退出信号时不该标记丢弃，实际 %+v", dropped)
+	}
+	if gwFatal != nil {
+		t.Fatalf("网关没有退出，不该有 fatal 错误: %v", gwFatal)
+	}
 }
 
 // 信号注册必须紧跟 config.Load：字体解析（约 300ms）、拿锁、开库、迁移都在
