@@ -321,9 +321,10 @@ func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {
 		return
 	}
 
-	// handler ctx 可能已被取消，回复必须用独立 ctx，否则平台侧收到空请求
-	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer rcancel()
+	// 发送预算由 Sender 按回复内容决定（纯文本 5s、含上传 30s），这里只剥掉
+	// handler 的截止时间，不再自己拍一个 5s——那会把上传的 30s 压回 5s。
+	// 插件拿不到 Reply 的错误，超时判断与降级只能在核心内做。
+	rctx := context.WithoutCancel(ctx)
 	if err := d.sender.Reply(rctx, ev, *reply); err != nil {
 		if errors.Is(err, ErrRateLimited) {
 			// 429 是平台侧事实，本地账本需要据此校正；不能盲目重试（重试可能仍是 429）
