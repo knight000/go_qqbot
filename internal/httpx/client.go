@@ -17,6 +17,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,13 @@ const maxBodyBytes = 8 << 20 // 单次响应读取上限，防慢速大文件打
 // maxRedirects 与 net/http 的默认策略一致（10 跳）。自己实现 CheckRedirect
 // 就必须自己带上这个上限，否则等于把默认策略整个丢掉。
 const maxRedirects = 10
+
+// DefaultRetryAfter 是 429 没给出可用冷却时长时的窗口。
+//
+// 平台通常不带 Retry-After，而惩罚窗口通常 ≥1 分钟：本地按 60s 退让，
+// 比"不知道就按 1s/2s/4s 重试"安全得多——后者每次都撞在惩罚期内，
+// 还会把域名桶的令牌烧掉、挤掉同域的其它请求。
+const DefaultRetryAfter = 60 * time.Second
 
 type Options struct {
 	Timeout    time.Duration
@@ -42,8 +50,8 @@ type Options struct {
 	// HTTPClient 注入传输层实现，nil 时由 New 自己构造。
 	//
 	// 用途有二：测试可以注入信任自签证书的客户端；将来接代理或双向 TLS
-	// 时不必再改构造函数。注入后 Timeout 不再生效——调用方给的客户端的
-	// 参数被原样沿用（连接池、超时、自带的 CheckRedirect），但会拷一份
+	// 时不必再改构造函数。注入后 Timeout 不再生效——调用方给的客户端
+	// 的参数被原样沿用（连接池、超时、自带的 CheckRedirect），但会拷一份
 	// 再挂上本包的重定向策略，不会改动调用方的对象；WithTimeout 仍会基于
 	// 它的 Transport 重建。
 	HTTPClient *http.Client
@@ -158,9 +166,15 @@ func (c *Client) WithTimeout(d time.Duration) *Client {
 type HTTPError struct {
 	Status int
 	Body   string
+	// RetryAfter 是 429 的冷却时长（已解析、缺失时已填 DefaultRetryAfter）；
+	// 其它状态码为 0。调用方用 RetryAfter(err) 读取，不要直接比对字段。
+	RetryAfter time.Duration
 }
 
 func (e *HTTPError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("http %d: %s (retry_after=%s)", e.Status, e.Body, e.RetryAfter)
+	}
 	return fmt.Sprintf("http %d: %s", e.Status, e.Body)
 }
 
@@ -168,6 +182,21 @@ func (e *HTTPError) Error() string {
 func IsStatus(err error, code int) bool {
 	var he *HTTPError
 	return errors.As(err, &he) && he.Status == code
+}
+
+// RetryAfter 返回 429 错误的冷却时长；非 429 返回 0。
+//
+// 核心侧用它给 (scene, peer) 记同样的窗口：两层必须同源——本地比平台短就
+// 还会撞墙，长就是白等。
+func RetryAfter(err error) time.Duration {
+	var he *HTTPError
+	if !errors.As(err, &he) || he.Status != http.StatusTooManyRequests {
+		return 0
+	}
+	if he.RetryAfter > 0 {
+		return he.RetryAfter
+	}
+	return DefaultRetryAfter
 }
 
 // RedirectError 表示重定向被本地策略拒绝：请求**没有**跟过去。
@@ -298,7 +327,21 @@ func (c *Client) doWithRetries(ctx context.Context, method, rawURL string, heade
 			continue
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		// 429 与 5xx 是两类事实：5xx 是"上游坏了，可以再试"，429 是
+		// "你被罚了，到点再来"。按退避链重试 429 只会续期惩罚，还每次都从
+		// 域名桶取一次令牌——被拒的请求不该继续消耗同域的额度。
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+			// 冷却记在"真正答复的域名"上：重定向后的 429 属于终点站，
+			// 冷却第一个域名冤枉了它（也可能根本冷却错了对象）。
+			coolHost := host
+			if resp.Request != nil && resp.Request.URL != nil {
+				coolHost = strings.ToLower(resp.Request.URL.Hostname())
+			}
+			c.buckets.cooldown(coolHost, retryAfter)
+			return &HTTPError{Status: resp.StatusCode, Body: truncate(data), RetryAfter: retryAfter}
+		}
+		if resp.StatusCode >= 500 {
 			lastErr = &HTTPError{Status: resp.StatusCode, Body: truncate(data)}
 			continue // 可重试
 		}
@@ -385,6 +428,29 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// parseRetryAfter 支持标准的两种写法：秒数与 HTTP-date。
+//
+// 缺失、无法解析、非正数（含 0）一律按 DefaultRetryAfter：0 秒的字面意思是
+// "立刻重来"，而 429 的惩罚窗口不会因为重试而缩短——本地不吃这个字面值。
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return DefaultRetryAfter
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return DefaultRetryAfter
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return DefaultRetryAfter
+}
+
 func backoff(attempt int) time.Duration {
 	base := time.Second << uint(attempt-1) // 1s,2s,4s...
 	if base > 30*time.Second {
@@ -454,11 +520,26 @@ func newBucketSet(defPerMin int, domainRatePerMin map[string]int, log *slog.Logg
 // wait 取该域名对应的桶。未配置的域名走默认桶；配置了独立额度的域名
 // 只用独立桶，不与默认桶叠加。
 func (s *bucketSet) wait(ctx context.Context, host string) error {
-	l := s.def
-	if hl, ok := s.byHost[host]; ok {
-		l = hl
+	return s.forHost(host).wait(ctx)
+}
+
+// cooldown 让该域名的桶停到 d 之后：令牌清零 + 冷却期内拒绝取令牌。
+//
+// 只有 429 会调用它。被 429 拒掉的那次请求已经在请求前取过令牌（取桶发生在
+// 出网之前），无法归还；能保证的是"被拒之后不再继续扣"，所以这里清零而不是
+// 补发——补发等于把平台给的惩罚窗口翻译成"本地可以多打几次"。
+func (s *bucketSet) cooldown(host string, d time.Duration) {
+	if d <= 0 {
+		return
 	}
-	return l.wait(ctx)
+	s.forHost(host).coolDown(d)
+}
+
+func (s *bucketSet) forHost(host string) *limiter {
+	if hl, ok := s.byHost[host]; ok {
+		return hl
+	}
+	return s.def
 }
 
 func (s *bucketSet) limits() map[string]int {
@@ -476,6 +557,8 @@ type limiter struct {
 	burst  float64
 	tokens float64
 	last   time.Time
+	// cooldown 是 429 之后的冷却截止时间；零值表示没有冷却。
+	cooldown time.Time
 }
 
 func newLimiter(perMin int) *limiter {
@@ -487,10 +570,37 @@ func newLimiter(perMin int) *limiter {
 	return &limiter{rate: rate, burst: burst, tokens: burst, last: time.Now()}
 }
 
+// coolDown 清零令牌并把下次可取的时刻推迟到 d 之后。
+//
+// 并发/连续的两个 429 只延长、不缩短窗口（取较晚的截止时间）：惩罚窗口是
+// 平台的事实，本地两次记账不该把它越算越短。last 同时前移，冷却结束后从
+// 零开始补充，而不是把冷却期当成"一直在攒令牌"。
+func (l *limiter) coolDown(d time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if until := now.Add(d); until.After(l.cooldown) {
+		l.cooldown = until
+	}
+	l.tokens = 0
+	l.last = now
+}
+
 func (l *limiter) wait(ctx context.Context) error {
 	for {
 		l.mu.Lock()
 		now := time.Now()
+		if now.Before(l.cooldown) {
+			remaining := l.cooldown.Sub(now)
+			l.mu.Unlock()
+			// 冷却期内直接失败、不出网：在这里排队只是把调用方拖到 ctx 超时，
+			// 惩罚窗口不会因为本地排队而缩短。
+			return &HTTPError{
+				Status:     http.StatusTooManyRequests,
+				Body:       "本地冷却中：该域名桶因 429 被清零，冷却结束前不出网",
+				RetryAfter: remaining,
+			}
+		}
 		l.tokens += now.Sub(l.last).Seconds() * l.rate
 		if l.tokens > l.burst {
 			l.tokens = l.burst
