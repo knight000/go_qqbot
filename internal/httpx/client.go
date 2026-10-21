@@ -332,13 +332,17 @@ func (c *Client) doWithRetries(ctx context.Context, method, rawURL string, heade
 		// 域名桶取一次令牌——被拒的请求不该继续消耗同域的额度。
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-			// 冷却记在"真正答复的域名"上：重定向后的 429 属于终点站，
-			// 冷却第一个域名冤枉了它（也可能根本冷却错了对象）。
-			coolHost := host
+			// 冷却两个桶，缺一不可：
+			//   - 入口域名：令牌是从它的桶里取的，不冷却的话下一次请求仍会
+			//     取一次令牌再出网，"被拒了还继续扣"的原样复发；
+			//   - 真正答复的域名：重定向后的 429 属于终点站，以后直连它
+			//     同样不该出网（两个域名相同时只冷却一次）。
+			c.buckets.cooldown(host, retryAfter)
 			if resp.Request != nil && resp.Request.URL != nil {
-				coolHost = strings.ToLower(resp.Request.URL.Hostname())
+				if h := strings.ToLower(resp.Request.URL.Hostname()); h != host {
+					c.buckets.cooldown(h, retryAfter)
+				}
 			}
-			c.buckets.cooldown(coolHost, retryAfter)
 			return &HTTPError{Status: resp.StatusCode, Body: truncate(data), RetryAfter: retryAfter}
 		}
 		if resp.StatusCode >= 500 {
