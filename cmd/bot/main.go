@@ -120,6 +120,13 @@ func run() (*core.RestartRequest, error) {
 	log := logx.New(logLevel, cfg.Log.Format)
 	slog.SetDefault(log)
 
+	// 信号注册必须在这里——配置刚读完，后面还要解析字体（约 300ms）、拿单实例锁、
+	// 开库、跑迁移。放在它们之后，这段窗口里收到的 Ctrl-C/SIGTERM 会走 Go 的
+	// 默认处理：进程被直接杀死，会话不落盘，systemd 记的是 "killed by signal"
+	// 而不是一次正常退出（P3-21）。
+	ctx, stop := notifyShutdown(context.Background())
+	defer stop()
+
 	// 渲染器在启动期同步解析字体（约 300 ms，全部花在 20 MB 字体的字节码扫描上）。
 	// 字体是 go:embed 进来的，解析失败只可能是二进制本身有问题——带病运行会在
 	// 第一次出图时把错误抛给插件，不如现在直接启动失败。
@@ -204,9 +211,6 @@ func run() (*core.RestartRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	if err := coreImpl.Start(ctx); err != nil {
 		return nil, err
@@ -343,6 +347,14 @@ func rawDumpFunc(cfg *config.Config, c *core.Core) func(string, []byte) {
 		return nil
 	}
 	return c.PrintRaw
+}
+
+// notifyShutdown 返回随 Ctrl-C / SIGTERM 取消的 ctx。
+//
+// 调用点必须紧跟 config.Load：后面的字体解析（约 300ms）、单实例锁、开库与
+// 迁移都在这段窗口里，晚注册就会让期间的 SIGTERM 走默认处理（P3-21）。
+func notifyShutdown(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 }
 
 // lockWait 决定等单实例锁的上限。
