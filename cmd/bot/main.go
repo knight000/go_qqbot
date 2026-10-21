@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -39,10 +40,29 @@ import (
 	_ "github.com/knight000/go_qqbot/plugins/md"
 )
 
+// errShutdown 表示进程本身没有故障，只是关停没能在期限内完成。
+//
+// 与"启动失败"分开只为日志能说清楚：退出码都是非 0，systemd 的
+// Restart=on-failure 都应该看见（P3-23）。
+var errShutdown = errors.New("关停未在期限内完成")
+
+const (
+	// gatewayStopTimeout 是等网关读循环退出的上限。它退出前会把
+	// session_id / seq 落盘（connectOnce 的 defer），所以这个等待就是
+	// "等状态落盘完成"——必须早于 db.Close。
+	gatewayStopTimeout = 5 * time.Second
+	// shutdownTimeout 覆盖调度收尾、派发排空、GC 退出与插件关闭。
+	shutdownTimeout = 10 * time.Second
+)
+
 func main() {
 	req, err := run()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "启动失败:", err)
+		if errors.Is(err, errShutdown) {
+			fmt.Fprintln(os.Stderr, "关停失败:", err)
+		} else {
+			fmt.Fprintln(os.Stderr, "启动失败:", err)
+		}
 		os.Exit(1)
 	}
 	if req == nil {
@@ -131,6 +151,8 @@ func run() (*core.RestartRequest, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 关库是关停序列的最后一步：网关落盘（等 gwDone）→ core.Shutdown
+	// （调度收尾 → 派发排空 → GC 退出 → 插件关闭）→ 这里。
 	defer db.Close()
 
 	if err := db.Migrate(context.Background()); err != nil {
@@ -243,16 +265,36 @@ func run() (*core.RestartRequest, error) {
 		log.Info("收到退出信号，开始关闭")
 	}
 
-	// 先停接入层：让它把 session_id / seq 落盘，下次启动就能 Resume
+	// 先停接入层：connectOnce 返回前会把 session_id / seq 落盘，所以等 gwDone
+	// 就是等"网关状态落盘完成"——它必须发生在 db.Close 之前，否则下次只能冷
+	// Identify，白烧一次 session 配额。
+	//
+	// 超时不能静默：那一刻网关可能还在写库，照常往下走就是 db.Close 与在途写
+	// 并发。这里只记账，退出码在下面统一变成非 0（P3-23）。
+	gwStopped := true
 	select {
 	case <-gwDone:
-	case <-time.After(5 * time.Second):
-		log.Warn("网关关闭超时，强制退出")
+	case <-time.After(gatewayStopTimeout):
+		gwStopped = false
+		log.Error("网关读循环未在期限内退出，状态可能未落盘",
+			"timeout", gatewayStopTimeout.String())
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	coreImpl.Shutdown(shutdownCtx)
+	shutdownErr := coreImpl.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		log.Error("核心关停未完成", "err", shutdownErr)
+	}
+	if !gwStopped {
+		shutdownErr = errors.Join(shutdownErr, errors.New("网关读循环未退出"))
+	}
+
+	if shutdownErr != nil {
+		// 关停没走完就不重启自己：新进程会和还没退干净的旧进程抢同一份
+		// 数据目录，而 systemd 会按失败重启这个进程。
+		return nil, fmt.Errorf("%w: %w", errShutdown, shutdownErr)
+	}
 
 	if req != nil {
 		if buildinfo.Supervised() {
