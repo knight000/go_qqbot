@@ -44,7 +44,7 @@ D5 的前提有两层，必须分清：
 
 | 约束 | 事实 | 后果 |
 |---|---|---|
-| 鉴权 | `POST https://bots.qq.com/app/getAppAccessToken`，`{appId, clientSecret}` → `access_token` / `expires_in: 7200`；请求头 `Authorization: QQBot {token}` | 必须缓存，到期前 60 s 刷新；旧 `Bot appid.token` 已废弃 |
+| 鉴权 | `POST https://bots.qq.com/app/getAppAccessToken`，`{appId, clientSecret}` → `access_token` / `expires_in: 7200`；请求头 `Authorization: QQBot {token}` | 必须缓存，到期前 60 s 刷新；401 时作废内存与 `bot_state` 里的 token，换新 token 重试一次（并发 401 只刷新一次）；旧 `Bot appid.token` 已废弃 |
 | 接入 | v2 仅 WebSocket 长连接：`/gateway/bot` → op10 → op2 Identify → op1 心跳 → op6 Resume | 纯出站；服务器零入站端口 |
 | 环境 | 沙箱 `https://sandbox.api.sgroup.qq.com`；**IP 白名单仅作用于正式环境** | 本机可开发，动态 IP 无影响；上线需服务器固定 IP |
 | 会话配额 | `session_start_limit: total 1000 / reset 86400000 / max_concurrency 1` | 重启风暴会耗尽日配额 → 必须退避重启 + 持久化 session |
@@ -355,7 +355,7 @@ qqbot-plugin-torn/              插件工作区：核心仓的克隆
 - **插件目录不能有 `go.mod`**：嵌套模块会让 `go build ./...` 静默跳过它。要单独跑测试就在工作区里 `go test ./plugins/<repo>/...`。
 - **生成器的判据是 `host.Register(`**：目录（含**一层**子包）里必须出现过这个调用，光有 `package` 不算。插件代码放在 `plugins/foo/plugin/`、根包只做 blank import 转发，是合法形态；而目录里有源码却找不到 `host.Register(` 会直接 exit 1，不会生成一个"编译全绿、指令没反应"的空 import。
 
-**为什么需要「生成」这一步**：Go 的 import 是静态的，编译器不会去发现目录里的包，`go build ./...` 只编译不链接，未 import 的包会被丢弃。所以"放入即生效"在 Go 里没有零步骤方案；生成器是成本最低的那个——它只读目录名，不解析代码，40 行，无第三方依赖。
+**为什么需要「生成」这一步**：Go 的 import 是静态的，编译器不会去发现目录里的包，`go build ./...` 只编译不链接，未 import 的包会被丢弃。所以"放入即生效"在 Go 里没有零步骤方案；生成器是成本最低的那个——它只做一层目录扫描 + 读 Go 源码找 `host.Register(`，**不编译、不加载**，不到 200 行，无第三方依赖。
 
 推论：同一个核心提交在不同工作区可能产出不同二进制（取决于 `plugins_gen.go` 生成时目录里有什么）。这是「核心不引用业务插件」的代价，换来核心仓克隆即可构建、插件仓有独立提交历史。
 
@@ -629,6 +629,7 @@ CREATE INDEX idx_sessions_plugin  ON sessions(plugin);  -- 仅排障查询，不
 ### 4.2 7 天留存的实现要点
 
 - **分批删**，不要一次 `DELETE`：每 10 分钟执行 `DELETE FROM messages WHERE created_at < ? LIMIT 5000` 循环至影响行数为 0。理由：单条大事务会长时间持有写锁，与 aria2 的磁盘 IO 叠加时造成 `database is locked`。
+- **删除行数读不出来就报错**：每批的 `RowsAffected` 失败直接返回 error，不吞成 0。GC 用 `n < batch` 判断"删完没有"，吞成 0 等于宣称"这批已经删空"，剩余行要多等一个周期，而日志里连痕迹都没有。
 - **保留期是配置项**，默认 `168h`；`processed_events` 默认 `72h`（只需覆盖 resume 窗口）。
 - `job_runs` 同样纳入 GC（默认 7 天），否则它是最容易无声膨胀的表。
 - 删除后用 `PRAGMA incremental_vacuum`（配合 `auto_vacuum=INCREMENTAL`）回收，避免每月一次全库 `VACUUM` 造成分钟级卡顿。
@@ -878,7 +879,7 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 
 **R2 清 `job_runs` 但保留 `jobs`**：执行历史是该群的业务数据，任务定义（含 per-peer 实例行）是配置。这与“R2 不动 `qq_groups`”是同一条边界的两个方向。
 
-**媒体回收口径**：`media.message_id IS NULL` 的行没有会话归属，任何一次 R2 都命中不了它们，所以由任意一次 R2 一并回收；预览与删除用同一个谓词（`message_id IS NULL OR message_id IN (…该 peer 的消息…)`），回复里说的数量和真正删掉的一致。
+**媒体回收口径**：R2 只清该 peer **名下**的媒体——经 `messages` 关联到本会话的那些行，预览与实删用同一个谓词，所以回复里说的数量与真正删掉的一致。`message_id IS NULL` 的孤儿行没有会话归属，**只由 R3 回收**（扫全库路径）：塞进 R2 会让一个群的 `/reset data` 删掉全库无归属媒体，预览还会把同一批行重复计到每个 peer 头上。
 
 **`active_usage` 跟着业务数据走**：R2 清该 peer 的行，R3 清全表；R1 只清插件会话状态、R0 不动数据，都不碰它。理由是预算是平台配额账而不是会话状态——不过清数据就等于承认“这个会话重新开始”，额度也重开；反过来 R1/R0 只是让插件重来一遍或重连，凭什么免掉当天已烧的配额。预算行不计入重置摘要里的条数（那是给用户看的业务数据量，预算行属于记账）。
 
