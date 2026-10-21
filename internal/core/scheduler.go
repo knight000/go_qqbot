@@ -55,6 +55,10 @@ const (
 	// 100 覆盖当前规模的 5 倍余量，同时不至于一次把内存里的桶撑爆。
 	dueJobLimit = 100
 
+	// writeBackTimeout 是"任务状态回写"的期限。它必须短：关停时这段写入
+	// 挡在关库之前，写不动就该让上层以非 0 退出，而不是无限等。
+	writeBackTimeout = 2 * time.Second
+
 	// jobParallel 是同时执行的桶数。调度任务是 I/O 型的（HTTP + SQLite 写），
 	// 低配机上真正的瓶颈是出站配额与单写连接而不是 CPU；4 与 dispatch 的
 	// 16 令牌、render 的 2 并发形成梯度，既能让慢任务不再挡住别人，又不会
@@ -428,7 +432,7 @@ func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 	if !ok {
 		s.log.Warn("任务已无插件注册，停用", "job", j.ID, "peer", j.Peer)
 		j.Enabled = false
-		_ = s.db.UpdateJob(ctx, j)
+		s.saveJob(ctx, j)
 		return
 	}
 	// per-peer 实例的目标群在注册时并不存在，只能由核心在执行前注入。
@@ -440,8 +444,10 @@ func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 		j.LastRunAt = now.Unix()
 		j.LastStatus = "skipped"
 		j.NextRunAt = next
-		_ = s.db.UpdateJob(ctx, j)
-		_ = s.db.RecordJobRun(ctx, j.ID, j.Peer, now.Unix(), now.Unix(), "skipped", "错过执行窗口")
+		wctx, wcancel := writeBackCtx(ctx)
+		_ = s.db.UpdateJob(wctx, j)
+		_ = s.db.RecordJobRun(wctx, j.ID, j.Peer, now.Unix(), now.Unix(), "skipped", "错过执行窗口")
+		wcancel()
 		s.log.Warn("任务错过执行窗口，跳过", "job", j.ID, "peer", j.Peer)
 		return
 	}
@@ -450,7 +456,7 @@ func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 	if runner == nil {
 		s.log.Error("插件未实现 JobRunner，停用任务", "job", j.ID, "peer", j.Peer)
 		j.Enabled = false
-		_ = s.db.UpdateJob(ctx, j)
+		s.saveJob(ctx, j)
 		return
 	}
 
@@ -489,10 +495,14 @@ func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 	j.NextRunAt = next
 	j.ConsecutiveFailures = failures
 	j.Enabled = enabled
-	if err := s.db.UpdateJob(ctx, j); err != nil {
+	// 收尾写入不继承取消：任务已经被 Stop 打断了，但"它跑过、下次什么时候跑"
+	// 必须落盘，否则重启后同一个任务会再跑一遍（P2-2）。
+	wctx, wcancel := writeBackCtx(ctx)
+	defer wcancel()
+	if err := s.db.UpdateJob(wctx, j); err != nil {
 		s.log.Error("更新任务状态失败", "job", j.ID, "err", err)
 	}
-	_ = s.db.RecordJobRun(ctx, j.ID, j.Peer, started.Unix(), finished.Unix(), status, errMsg)
+	_ = s.db.RecordJobRun(wctx, j.ID, j.Peer, started.Unix(), finished.Unix(), status, errMsg)
 
 	if err != nil {
 		s.log.Error("任务执行失败", "job", j.ID, "peer", j.Peer, "status", status, "failures", failures, "err", err)
@@ -502,6 +512,25 @@ func (s *Scheduler) run(ctx context.Context, j store.Job, now time.Time) {
 		return
 	}
 	s.log.Info("任务执行成功", "job", j.ID, "peer", j.Peer, "cost", finished.Sub(started).String())
+}
+
+// writeBackCtx 是"任务状态回写"专用的 ctx：不继承取消信号，只受短超时约束。
+//
+// 任务执行本身仍然跟着 runCtx 走（Stop 一到就取消），只有回写这一步例外。
+// 关停时这两件事必须分开：不取消执行就等不到收尾，取消回写就会丢掉
+// next_run_at 与 job_runs（P2-2）。
+func writeBackCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), writeBackTimeout)
+}
+
+// saveJob 用不继承取消的 ctx 回写单行任务状态，失败只记日志：
+// 这里的写入都是"顺手维护"，任务本身已经有结论了。
+func (s *Scheduler) saveJob(ctx context.Context, j store.Job) {
+	wctx, cancel := writeBackCtx(ctx)
+	defer cancel()
+	if err := s.db.UpdateJob(wctx, j); err != nil {
+		s.log.Error("更新任务状态失败", "job", j.ID, "peer", j.Peer, "err", err)
+	}
 }
 
 func (s *Scheduler) call(ctx context.Context, runner host.JobRunner, spec host.JobSpec) (err error) {

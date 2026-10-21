@@ -666,13 +666,10 @@ func TestSessionSerializesWithStaticRouting(t *testing.T) {
 	db := newUsageStore(t)
 	d, _ := newSessionDispatcher(t, db, p)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	d.Dispatch(ctx, groupEvent("/start", host.Principal{Role: host.RoleUser}))
+	d.Dispatch(groupEvent("/start", host.Principal{Role: host.RoleUser}))
 	second := groupEvent("下一条", host.Principal{Role: host.RoleUser})
 	second.ID = "e-2"
-	d.Dispatch(ctx, second)
+	d.Dispatch(second)
 
 	for i := 0; i < 2; i++ {
 		select {
