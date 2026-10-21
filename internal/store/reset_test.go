@@ -265,7 +265,7 @@ func TestClearAllDataKeepsConfig(t *testing.T) {
 	if err := db.UpsertJob(ctx, Job{ID: "echo:tick", Plugin: "echo", Spec: "* * * * *", NextRunAt: nowUnix()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AuditResetDone(ctx, "owner-1", ResetScopeGlobal, ResetLevelAll, "准备中"); err != nil {
+	if err := db.AuditResetFinished(ctx, "owner-1", ResetScopeGlobal, ResetLevelAll, ResetStatusDone, "准备中"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -323,11 +323,11 @@ func TestClearAllDataKeepsConfig(t *testing.T) {
 	}
 }
 
-func TestAuditResetDoneRecordsDetail(t *testing.T) {
+func TestAuditResetFinishedRecordsDetail(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	if err := db.AuditResetDone(ctx, "owner-1", "g1", ResetLevelSession, "会话状态 3 条"); err != nil {
+	if err := db.AuditResetFinished(ctx, "owner-1", "g1", ResetLevelSession, ResetStatusDone, "会话状态 3 条"); err != nil {
 		t.Fatal(err)
 	}
 	recs, err := db.RecentResets(ctx, 5)
@@ -340,5 +340,109 @@ func TestAuditResetDoneRecordsDetail(t *testing.T) {
 	}
 	if r.FinishedAt.IsZero() {
 		t.Fatal("已执行记录必须有 finished_at，冷却靠它计算")
+	}
+}
+
+// 失败的直通路径（R0/R1 无确认码）也必须如实写 failed，且不占用冷却。
+// 这条是 P2-3 的根：把失败写成 done，用户就得等满一个冷却窗口才能重试。
+func TestFailedResetDoesNotStartCooldown(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if err := db.AuditResetFinished(ctx, "owner-1", ResetScopeGlobal, ResetLevelReconnect, ResetStatusFailed, "失败: 网关未就绪"); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := db.RecentResets(ctx, 5)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("失败的尝试也应进审计: %+v err=%v", recs, err)
+	}
+	if recs[0].Status != ResetStatusFailed {
+		t.Fatalf("失败的状态应为 %q，实际 %q", ResetStatusFailed, recs[0].Status)
+	}
+	if _, ok, err := db.LastResetDoneAt(ctx, ResetLevelReconnect, ResetScopeGlobal); err != nil || ok {
+		t.Fatalf("失败不得占用冷却: ok=%v err=%v", ok, err)
+	}
+
+	// 失败之后真的执行成功了，冷却才从那一刻开始。
+	at, err := time.Parse(time.RFC3339, "2026-10-22T10:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.w.ExecContext(ctx,
+		`INSERT INTO reset_audit(actor, peer, level, status, code, detail, created_at, expires_at, finished_at)
+		 VALUES(?, ?, ?, ?, '', '已断开，等待 Resume', ?, 0, ?)`,
+		"owner-1", ResetScopeGlobal, ResetLevelReconnect, ResetStatusDone, at.Unix(), at.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := db.LastResetDoneAt(ctx, ResetLevelReconnect, ResetScopeGlobal)
+	if err != nil || !ok || !got.Equal(at) {
+		t.Fatalf("成功记录应成为冷却起点: got=%v ok=%v err=%v", got, ok, err)
+	}
+}
+
+// 旧库的 reset_audit 没有 status 列，补列后默认 'done'（旧行都是"已执行"），
+// 且表上没有 CHECK 约束会拒绝新值——failed 能直接写进去，不需要数据迁移。
+func TestLegacyResetAuditAcceptsFailed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oldreset.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+
+	if _, err := db.w.ExecContext(ctx, `CREATE TABLE reset_audit (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		actor      TEXT NOT NULL,
+		peer       TEXT NOT NULL DEFAULT '',
+		level      TEXT NOT NULL,
+		detail     TEXT,
+		created_at INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.w.ExecContext(ctx,
+		`INSERT INTO reset_audit(actor, peer, level, detail, created_at) VALUES('owner-1', 'g1', 'session', '会话状态 3 条', 1)`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+
+	recs, err := db.RecentResets(ctx, 5)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("旧行应保留: %+v err=%v", recs, err)
+	}
+	if recs[0].Status != ResetStatusDone {
+		t.Fatalf("旧行语义是已执行，实际 %q", recs[0].Status)
+	}
+
+	if err := db.AuditResetFinished(ctx, "owner-1", "g1", ResetLevelSession, ResetStatusFailed, "失败: 库错误"); err != nil {
+		t.Fatalf("旧库迁移后应能写 failed（表上不能有拒绝新值的约束）: %v", err)
+	}
+	recs, err = db.RecentResets(ctx, 5)
+	if err != nil || len(recs) != 2 || recs[0].Status != ResetStatusFailed {
+		t.Fatalf("failed 应原样落库: %+v err=%v", recs, err)
+	}
+}
+
+// CloseReset 写 failed 同样不参与冷却，且 pending 不再被当成待确认。
+func TestCloseResetFailedKeepsPendingClosed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	id, err := db.OpenResetPending(ctx, "owner-1", "g1", ResetLevelData, "111111", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CloseReset(ctx, id, ResetStatusFailed, "失败: 清空 messages: 磁盘只读"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := db.PendingReset(ctx, "owner-1", "g1", ResetLevelData); ok {
+		t.Fatal("执行失败的记录不应再被当成待确认")
+	}
+	if _, ok, _ := db.LastResetDoneAt(ctx, ResetLevelData, "g1"); ok {
+		t.Fatal("执行失败不得占用冷却")
 	}
 }

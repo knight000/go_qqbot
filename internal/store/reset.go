@@ -22,10 +22,15 @@ const (
 	ResetLevelAll       = "all"       // R3：清全部业务数据
 )
 
-// 审计状态机：pending → done | cancelled | expired。
+// 审计状态机：pending → done | failed | cancelled | expired。
+//
+// failed 与 done 必须分开：done 是冷却的计时起点，failed 不是——
+// 把失败记成 done 会让"一次没跑成的重置"锁住下一个冷却窗口，
+// 而审计本身也回答不了"这次到底成了还是败了"。
 const (
 	ResetStatusPending   = "pending"
 	ResetStatusDone      = "done"
+	ResetStatusFailed    = "failed"
 	ResetStatusCancelled = "cancelled"
 	ResetStatusExpired   = "expired"
 )
@@ -255,13 +260,14 @@ func (db *DB) ClearAllData(ctx context.Context) (ResetCounts, error) {
 	return c, nil
 }
 
-// AuditResetDone 直接记一条"已执行"。R0 / R1 不需要确认码，
-// 没有 pending 阶段，但同样必须留痕——审计的意义是"所有重置都能查到"。
-func (db *DB) AuditResetDone(ctx context.Context, actor, peer, level, detail string) error {
+// AuditResetFinished 直接记一条已结束的重置（没有 pending 阶段的直通路径，
+// 例如 R0 / R1）。状态由调用方给：成功传 done，失败传 failed——审计必须
+// 如实回答"这次到底成了没成"，而不是恒写 done 再把错误塞进 detail。
+func (db *DB) AuditResetFinished(ctx context.Context, actor, peer, level, status, detail string) error {
 	if _, err := db.w.ExecContext(ctx,
 		`INSERT INTO reset_audit(actor, peer, level, status, code, detail, created_at, expires_at, finished_at)
 		 VALUES(?, ?, ?, ?, '', ?, ?, 0, ?)`,
-		actor, peer, level, ResetStatusDone, detail, nowUnix(), nowUnix()); err != nil {
+		actor, peer, level, status, detail, nowUnix(), nowUnix()); err != nil {
 		return fmt.Errorf("写入重置审计: %w", err)
 	}
 	return nil
@@ -384,7 +390,7 @@ func (db *DB) PendingReset(ctx context.Context, actor, peer, level string) (Rese
 	return r, true, nil
 }
 
-// CloseReset 结束一条审计记录（done / cancelled / expired）并补上执行摘要。
+// CloseReset 结束一条审计记录（done / failed / cancelled / expired）并补上执行摘要。
 func (db *DB) CloseReset(ctx context.Context, id int64, status, detail string) error {
 	if _, err := db.w.ExecContext(ctx,
 		`UPDATE reset_audit SET status = ?, detail = ?, finished_at = ? WHERE id = ?`,
@@ -394,7 +400,8 @@ func (db *DB) CloseReset(ctx context.Context, id int64, status, detail string) e
 	return nil
 }
 
-// LastResetDoneAt 返回该 (level, peer) 最近一次成功执行的时间，用于冷却。
+// LastResetDoneAt 返回该 (level, peer) 最近一次**成功**执行的时间，用于冷却。
+// 只认 done：failed 记录了尝试，但没有推进任何东西，不该让用户等一个窗口。
 func (db *DB) LastResetDoneAt(ctx context.Context, level, peer string) (time.Time, bool, error) {
 	var ts int64
 	err := db.r.QueryRowContext(ctx,
