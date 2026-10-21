@@ -351,7 +351,7 @@ func TestSenderPassiveSeqRetentionExpires(t *testing.T) {
 // 连着被风控挡掉几条之后，正常回复也发不出去了。
 func TestSenderPassiveSlotReleasedOnBusinessError(t *testing.T) {
 	f := &fakeAPI{bizSendAt: 1}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
 	ctx := context.Background()
 
@@ -379,7 +379,7 @@ func TestSenderPassiveSlotReleasedOnBusinessError(t *testing.T) {
 // 超过窗口上限（群 5 次/5 分钟、单聊 4 次/小时都是平台的硬约束）。
 func TestSenderPassiveSlotKeptOnNetworkError(t *testing.T) {
 	f := &fakeAPI{failSendAt: 1}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
 	ctx := context.Background()
 
@@ -404,7 +404,7 @@ func TestSenderActiveBudgetRefundedOnBusinessError(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 1,
-	}, newUsageStore(t))
+	}, newUsageStore(t), time.Local)
 	p := s.ForPlugin("bootnotice")
 	ctx := context.Background()
 
@@ -429,7 +429,7 @@ func TestSenderActiveBudgetRefundedOnUploadBusinessError(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"digest": true},
 		DailyPerPeer: 1,
-	}, newUsageStore(t))
+	}, newUsageStore(t), time.Local)
 	p := s.ForPlugin("digest")
 	ctx := context.Background()
 
@@ -451,7 +451,7 @@ func TestSenderActiveBudgetKeptOnNetworkError(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 1,
-	}, newUsageStore(t))
+	}, newUsageStore(t), time.Local)
 	p := s.ForPlugin("bootnotice")
 	ctx := context.Background()
 
@@ -468,7 +468,7 @@ func TestSenderActiveBudgetKeptOnNetworkError(t *testing.T) {
 func TestTraceSaysFailedOnBusinessError(t *testing.T) {
 	f := &fakeAPI{bizSendAt: 1}
 	var buf bytes.Buffer
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	s.trace = NewTrace(&buf, LevelFull)
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
 
