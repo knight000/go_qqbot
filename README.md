@@ -8,8 +8,8 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 |---|---|
 | `internal/config` | TOML 配置、默认值、环境变量覆盖、启动校验 |
 | `internal/httpx` | 统一出站：https 强制、域名白名单、按域名分桶的令牌桶、重试与全抖动退避 |
-| `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息、富媒体上传（`/files`） |
-| `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避 |
+| `internal/api` | access_token 缓存（到期前 60 s 刷新，落 `bot_state`）、网关地址、发消息、富媒体上传（`/files`）；401 时作废内存与 `bot_state` 里的 token，换新 token 重试一次（并发 401 只刷新一次） |
+| `internal/gateway` | op10 → Identify → 心跳 → Resume 状态机，断线指数退避；关闭码决定重连姿态（4006/4007/4900–4913 重新 Identify、4009 Resume、4008 至少等 60s、下架/封禁等永久错误停止重连）；握手 30s 截止；连续三次 <5s 断连冷却 60s；只有 READY 后活过 30s 才复位退避 |
 | `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、发图（上传 + `msg_type=7`）、调度器、7 天 GC、`/reload` 自重启、`/reset` 分级重置 |
 | `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
@@ -248,7 +248,7 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 |---|---|---|
 | 总开关 | `[active] enabled` | 关闭后所有 `SendActive` 直接返回 `ErrActiveDisabled` |
 | 插件白名单 | `[active] plugins` | 只有名单内插件能发；插件拿到的 Sender 是带名字的包装 |
-| 每日预算 | `[active] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按本地时区换桶），先扣预算再发 HTTP |
+| 每日预算 | `[active] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按调度时区 `Asia/Shanghai` 换桶，与 cron 同源），先扣预算再发 HTTP；平台明确拒绝时归还，网络失败不归还 |
 | 重启抑制 | `[plugins.bootnotice] min_interval` | 距上次启动不足该间隔则整轮跳过，防崩溃重启刷屏 |
 | 重试 | `[plugins.bootnotice] retry_delay` | 失败只重试一次；主动消息没有 `msg_id` 幂等键，多试等于重复推送 |
 
@@ -305,7 +305,7 @@ Go 插件是编译期静态链接的，改动无法热替换；`/reload` 的做�
 go run ./tools/devrun -c config/config.local.toml
 ```
 
-此后每次 `/reload` 都会重新扫描 `plugins/`，新放入的插件随之加载。编译失败时它会打印错误并用**旧二进制**继续运行，机器人不会掉线。
+此后每次 `/reload` 都会重新扫描 `plugins/`，新放入的插件随之加载。编译失败时它会打印错误并用**旧二进制**继续运行，机器人不会掉线。Windows 上换二进制要先把旧的改名成 `.old`，若两次改名之间被中断（`bot.exe` 缺了、`.old` 还在），下次启动会先把它从 `.old` 恢复回来，不会变成"二进制凭空消失"。
 
 原理：bot 在 `QQBOT_SUPERVISOR=1` 下把 `/reload` 从「自己换映像」改为**以退出码 75 退出**，由父进程接手重编译。Windows 没有 `execve`，这一步还顺带解决了「每次重载都把终端丢回提示符」的问题——终端始终由 devrun 占着，日志连续。
 
@@ -324,6 +324,8 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 ```
 
 约 1 分钟内应收到上线私聊。**没收到就查 journalctl** —— 重启失败时进程已经退出，只能从日志里找原因。
+
+`go generate` 不带 `GOOS` 前缀（写成 `GOOS=linux go generate ...` 会让生成器按目标平台编译、在本机根本跑不起来）：它只读目录名、生成 blank import，与目标平台无关；交叉编译只加在后面的 `go build` 上。
 
 ### 几个边界
 
@@ -366,7 +368,7 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 - **媒体先删文件再删行**；配了 `[media].dir` 时只删该目录内的路径，库里的 `path` 若被写坏，不会变成一次任意文件删除。
   入站媒体不下载（见「发图片」），所以这一步现在扫不到任何行——路径保留，接回下载时不用重写。
 - 冷却按 `(级别, 会话)` 计：连清两个群互不影响；R0/R3 是全局冷却。
-- 每次尝试都进 `reset_audit`，包括失败与未确认就过期的那些。
+- 每次尝试都进 `reset_audit`，包括失败与未确认就过期的那些。执行失败标 `failed`，`/reset status` 显示「失败（未占冷却）」，可以立即重试——冷却只认 `done`。
 
 ## 发图片（富媒体）
 
@@ -400,19 +402,34 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 - 主动消息同样能发图，但日预算**先扣再上传**（按天计的额度比 5 分钟的被动窗口稀缺）。
 - 上传超时放宽到 30 s：默认的 `[http].timeout=5s` 传不完 5 MB 的 base64 请求体。
 
-## 单实例：同一份数据只能跑一个进程
+## 网关断开：谁决定重连
 
-启动时会在数据库旁边取一把**操作系统级**文件锁（`<store.path>.lock`）。拿不到就直接退出，
-不连网关、不开库：
+关闭码不是日志脚注，它决定下一轮该 Identify、Resume，还是干脆不再连：
+
+| 关闭码 | 处置 |
+|---|---|
+| 4006 / 4007 / 4900–4913 | 清 `session_id` / `seq`，下一轮重新 Identify（不再 Resume 死 session） |
+| 4009 | 保留 session，下一轮 Resume |
+| 4004 | 作废 access_token 后重连 |
+| 4008 | 至少等 60s，抖动只加长不缩短 |
+| 4001 / 4002 / 4010–4014 / 4914 / 4915 | 永久错误：停止重连，进程以退出码 1 退出，由 systemd `StartLimit` 收敛 |
+
+表外的关闭码按退避重连、不动 session。握手（Identify/Resume 到 READY/RESUMED）有 30s 截止，等不到就断开重连——否则平台"收下 WS、心跳也 ACK、就是不回 READY"会让读循环永久阻塞。退避只在连接真正稳定后复位：READY 后活过 30s 才回到 1s 起；「连上就断」（READY 后不足 30s）不复位，连续三次寿命 <5s 的连接直接进 60s 冷却。
+
+## 单实例：同一台机器上的同一 bot 只能跑一个进程
+
+启动时按「先 appID、后数据目录」的顺序取两把**操作系统级**文件锁，拿不到就直接退出，不连网关、不开库：
+
+- **appID 维度**：`%TMP%/qqbot-<sha256(appID) 前 16 位>.lock`，约束"这台机器上的这个 bot"——换个数据目录也躲不掉；
+- **数据目录维度**：`<store.path>.lock`，约束"这份 SQLite 只被一个进程打开"。
 
 ```
-启动失败: 另一个实例正在运行：pid 20384（D:\vscode\go\qqbot\bot.exe，启动于 2026-10-18 11:52:07）持有 D:\vscode\go\qqbot\.temp\data\qqbot.db.lock
+启动失败: 另一个实例正在运行：appID 102xxxxx 已被占用——pid 20384（D:\vscode\go\qqbot\bot.exe，启动于 2026-10-18 11:52:07，主机 DESKTOP-8H2K）持有锁 C:\Users\knight\AppData\Local\Temp\qqbot-3f2a1c9d4b7e0a15.lock
 ```
 
-这不是保守限制。两个进程共用一份库会：
+数据目录冲突的文案会额外点出占用者的 appID，并提示改 `[store].path`——两种冲突该做的事完全不同（去结束那个进程 vs 换一份库），所以错误必须能区分。
 
-- 抢同一个网关 session —— 日志里反复出现 `4902 reset by resume`，两边轮流被踢下线；
-- 各回一遍消息：同一个 `msg_id` 被两边各当成一条事件，用户看到重复回复，被动额度翻倍扣。
+这不是保守限制。两个进程连同一个 appID 会抢同一个网关 session —— 日志里反复出现 `4902 reset by resume`，两边轮流被踢下线；若还共用一份库，同一个 `msg_id` 会被两边各当成一条事件，用户看到重复回复，被动额度翻倍扣。
 
 锁是**内核持有的锁，不是"锁文件存不存在"**。所以 `kill -9`、任务管理器结束、断电重启
 都不会留下"需要手动删掉的残留锁"；也正因如此，锁文件本身永不删除（删掉别人正持有的
@@ -423,13 +440,14 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 | 正常退出 / Ctrl-C | 显式释放，下一个进程立刻能拿 |
 | 崩溃 / 强杀 | 句柄随进程销毁，内核释放 |
 | `/reload` 拉起的进程 | 旧进程已经先放手，正常一次就能拿到；仍留 15 s 余量 |
-| 另一个实例 | 最多等 2 s，然后带着上面的错误退出 |
+| 另一个实例 | 立刻退出（wait=0），带着上面的错误 |
 
-错误里带 pid 与可执行文件路径，是为了**能精确结束那个进程**而不是让你猜：Windows 在任务
+错误里带 pid、可执行文件路径与主机名，是为了**能精确结束那个进程**而不是让你猜：Windows 在任务
 管理器里搜 `qqbot`，Linux 用 `ps -p <pid> -o pid,etime,cmd`。
 
-**不同 `[store].path` 就是不同实例**，可以同时跑。但同一 appID 的多个进程即使库不同也仍会
-抢 session——只有 `[bot].shard_id` 不同的分片部署才是合法的多进程形态。
+appID 锁落在系统临时目录，**临时目录不得对运行中的 bot 做自动清理**（`tmpwatch`、`systemd-tmpfiles` 之类）：Unix 的 `flock` 跟的是 inode，文件被删掉后下一个进程会在同路径另建一个，两把锁互不相识，"单实例"当场失效。
+
+同一 appID 配两份数据目录仍是双开，由 appID 锁挡住；只有 `[bot].shard_id` 不同的分片部署才是合法的多进程形态。
 
 ## `/ping`（仅管理员）
 
@@ -450,10 +468,13 @@ deny_reply = false
 /pong
 运行 2小时13分（启动于 10-17 14:16）｜windows/amd64
 CPU  12.3%（8 核）
-内存 5.1 GB / 15.6 GB（32.7%）｜本进程 48.2 MB
+内存 5.1 GB / 15.6 GB（32.7%）
+本进程 48.2 MB（峰值 96.7 MB）
 磁盘 可用 120.3 GB / 共 466 GB（已用 74.2%）
 目录 /opt/qqbot 36.1 MB，312 个文件（不含 .git）
 ```
+
+整机内存与本进程内存是两行、两个数据源：整机取不到不影响本进程那一行；本进程取不到时该行写成 `本进程 采集失败（原因）`，而不是整行消失。
 
 采集口径：
 
@@ -461,7 +482,7 @@ CPU  12.3%（8 核）
 |---|---|---|
 | CPU | `GetSystemTimes` 差值，200 ms 采样窗口，结果缓存 5 s | `/proc/stat` 差值（`idle` 含 `iowait`） |
 | 内存 | `GlobalMemoryStatusEx`（TotalPhys / AvailPhys） | `/proc/meminfo`（MemTotal / MemAvailable） |
-| 本进程内存 | `GetProcessMemoryInfo` 的 WorkingSetSize | `/proc/self/statm` 的常驻页数 |
+| 本进程内存 | `GetProcessMemoryInfo` 的 `WorkingSetSize` + `PeakWorkingSetSize` | `/proc/self/status` 的 `VmRSS` + `VmHWM` |
 | 分区余量 | `GetDiskFreeSpaceExW` | `statfs` 的 `Bavail` |
 | 目录占用 | 遍历当前工作目录，跳过 `.git`、不跟随符号链接/junction，1.5 s 预算 | 同左 |
 
@@ -483,8 +504,9 @@ go generate ./cmd/bot && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s
 | 层 | 位置 | 职责 |
 |---|---|---|
 | 协议账本（必须本地） | `internal/core/sender.go` | 被动窗口与次数、`msg_id + msg_seq` 原子分配（同一 `msg_id` 下 seq 单调递增，窗口过期只重置次数）；文档明确同一 `msg_id + msg_seq` 重复发送会失败 |
-| 接口限流（粗粒度） | `internal/httpx` | 全进程出站令牌桶，可按域名分桶（`[http.domains]`）；发消息走 `PostJSONOnce`，不自动重试 |
-| 返回值校正 | `sender` / `dispatch` | 429 → `ErrRateLimited` 告警；401 → 刷新 token |
+| 接口限流（粗粒度） | `internal/httpx` | 全进程出站令牌桶，可按域名分桶（`[http.domains]`）；发消息走 `PostJSONOnce`，不自动重试；429 **不自动重试**，按 `Retry-After`（秒数/HTTP-date，缺省 60s）冷却域名桶，冷却期内该桶不出网 |
+| 返回值校正 | `sender` / `dispatch` | 429 → `ErrRateLimited` 并告警，核心侧对 `(scene, peer)` 记同一窗口，冷却期内不出网；401 → 作废内存 + `bot_state` 的 token，换新 token 重试一次 |
+| 业务错误 | `internal/api` | 2xx + `err_code`≠0（access-token 为 `code`）→ `api.BusinessError`，不算已发送、不重试；平台明确拒绝时归还被动占格与主动日预算，网络失败不归还 |
 
 不能只依赖返回值的三个原因：
 
