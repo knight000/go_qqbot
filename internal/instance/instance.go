@@ -129,8 +129,20 @@ func (l *Lock) Release() error {
 	return errors.Join(err, l.app.release())
 }
 
+// Scope 说明是哪一把锁挡住的。两种冲突该做的事完全不同：appID 冲突要去结束
+// 那个进程，数据目录冲突要改 [store].path——所以错误文案必须能区分。
+type Scope string
+
+const (
+	// ScopeAppID 是"同一台机器上同一个 bot 已经有一个进程在跑"。
+	ScopeAppID Scope = "appID"
+	// ScopeDataDir 是"这份数据目录已经被另一个进程打开"。
+	ScopeDataDir Scope = "数据目录"
+)
+
 // LockedError 说明锁被谁占着。
 type LockedError struct {
+	Scope  Scope
 	Path   string
 	Holder Holder
 }
@@ -138,22 +150,52 @@ type LockedError struct {
 func (e *LockedError) Error() string {
 	h := e.Holder
 	if h.PID == 0 {
-		return fmt.Sprintf("另一个实例正在运行：%s 已被占用（读取持有者信息失败）", e.Path)
+		return fmt.Sprintf("另一个实例正在运行：%s已被占用（读取 %s 的持有者信息失败）",
+			e.Scope.subject(), e.Path)
 	}
-	exe := h.Exe
-	if exe == "" {
-		exe = "路径未知"
+	switch e.Scope {
+	case ScopeAppID:
+		return fmt.Sprintf("另一个实例正在运行：appID %s 已被占用——%s持有锁 %s",
+			orUnknown(h.AppID, "未知"), describeHolder(h, ""), e.Path)
+	case ScopeDataDir:
+		return fmt.Sprintf("另一个实例正在运行：数据目录已被占用——%s持有锁 %s；"+
+			"两个 bot 不要共用同一份库，请改 [store].path",
+			describeHolder(h, "appID "+orUnknown(h.AppID, "未知")), e.Path)
 	}
-	host := h.Host
-	if host == "" {
-		host = "主机未知"
+	return fmt.Sprintf("另一个实例正在运行：%s 已被占用——%s持有锁 %s",
+		e.Scope, describeHolder(h, ""), e.Path)
+}
+
+// subject 给"读取持有者信息失败"那句填主语。
+func (s Scope) subject() string {
+	switch s {
+	case ScopeAppID:
+		return "该 appID "
+	case ScopeDataDir:
+		return "该数据目录"
 	}
-	app := h.AppID
-	if app == "" {
-		app = "appID 未知"
+	return string(s) + " "
+}
+
+// describeHolder 把持有者拼成一句话里能用的短语。extra 插在 exe 之前，
+// 让"数据目录冲突"能在同一个括号里点出占用者的 appID。
+func describeHolder(h Holder, extra string) string {
+	parts := make([]string, 0, 4)
+	if extra != "" {
+		parts = append(parts, extra)
 	}
-	return fmt.Sprintf("另一个实例正在运行：pid %d（%s，启动于 %s，主机 %s）持有 appID %s 的锁 %s",
-		h.PID, exe, h.Started.Format("2006-01-02 15:04:05"), host, app, e.Path)
+	parts = append(parts,
+		orUnknown(h.Exe, "路径未知"),
+		"启动于 "+h.Started.Format("2006-01-02 15:04:05"),
+		"主机 "+orUnknown(h.Host, "未知"))
+	return fmt.Sprintf("pid %d（%s）", h.PID, strings.Join(parts, "，"))
+}
+
+func orUnknown(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // Unwrap 让 errors.Is(err, ErrLocked) 成立。
@@ -173,11 +215,11 @@ func Acquire(opts Options) (*Lock, error) {
 		return nil, errors.New("单实例锁需要 appID：缺了它就只能按数据目录划分，同一 bot 换个目录仍会双开")
 	}
 
-	app, err := acquireApp(opts.AppID, opts.Wait)
+	app, err := acquireApp(opts)
 	if err != nil {
 		return nil, err
 	}
-	dir, err := acquireFile(opts.DataPath, opts.AppID, opts.Wait)
+	dir, err := acquireFile(opts.DataPath, ScopeDataDir, opts)
 	if err != nil {
 		// 第二把没拿到就必须放手第一把，否则这个 appID 会被一个根本没起来的
 		// 进程占住，直到它退出。
@@ -200,16 +242,17 @@ func Acquire(opts Options) (*Lock, error) {
 //   - 占着的 appID 就是自己 → 真的双开，报错。
 //
 // 三条合起来保证：同一个 appID 无论走哪个文件，全机只有一个进程能拿到它。
-func acquireApp(appID string, wait time.Duration) (*fileLock, error) {
+func acquireApp(opts Options) (*fileLock, error) {
+	appID := opts.AppID
 	primary, full := appLockPaths(appID)
-	lock, err := acquireFile(primary, appID, wait)
+	lock, err := acquireFile(primary, ScopeAppID, opts)
 	if err == nil {
 		if lock.prev.AppID != "" && lock.prev.AppID != appID {
 			// 前缀文件空出来了，但上次用它的不是自己：一旦占着不放，撞车的两个
 			// appID 会在"文件空出来"的时刻轮流把它当成自己的锁，同一 bot 就有
 			// 两条 WS 了。放手，去锁自己的全哈希文件。
 			_ = lock.release()
-			return acquireFile(full, appID, wait)
+			return acquireFile(full, ScopeAppID, opts)
 		}
 		return lock, nil
 	}
@@ -218,7 +261,7 @@ func acquireApp(appID string, wait time.Duration) (*fileLock, error) {
 	}
 	var locked *LockedError
 	if errors.As(err, &locked) && locked.Holder.AppID != "" && locked.Holder.AppID != appID {
-		return acquireFile(full, appID, wait)
+		return acquireFile(full, ScopeAppID, opts)
 	}
 	return nil, err
 }
@@ -234,7 +277,8 @@ func appLockPaths(appID string) (primary, full string) {
 }
 
 // acquireFile 在 path 上取独占锁并在拿到后写入持有者信息。
-func acquireFile(path, appID string, wait time.Duration) (*fileLock, error) {
+// scope 只用于冲突时把"哪一把锁挡住的"写进错误文案。
+func acquireFile(path string, scope Scope, opts Options) (*fileLock, error) {
 	// 转成绝对路径：错误消息里出现 "./.temp/data/qqbot.db.lock" 这种相对路径时，
 	// 用户还得先猜是相对于谁——报错文案的价值就在于能直接照着去查。
 	if abs, err := filepath.Abs(path); err == nil {
@@ -244,17 +288,17 @@ func acquireFile(path, appID string, wait time.Duration) (*fileLock, error) {
 		return nil, fmt.Errorf("创建锁文件目录: %w", err)
 	}
 
-	deadline := time.Now().Add(wait)
+	deadline := time.Now().Add(opts.Wait)
 	for {
 		f, err := lockFile(path)
 		if err == nil {
-			return adopt(path, f, appID)
+			return adopt(path, f, opts.AppID)
 		}
 		if !errors.Is(err, errBusy) {
 			return nil, fmt.Errorf("打开锁文件 %s: %w", path, err)
 		}
 		if !time.Now().Before(deadline) {
-			return nil, &LockedError{Path: path, Holder: readHolder(path)}
+			return nil, &LockedError{Scope: scope, Path: path, Holder: readHolder(path)}
 		}
 		time.Sleep(retryInterval)
 	}
