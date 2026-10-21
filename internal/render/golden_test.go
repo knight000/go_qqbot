@@ -69,9 +69,10 @@ func goldenCrop(t *testing.T, name string, m image.Image, r image.Rectangle) {
 	}
 
 	diff, fx, fy := 0, -1, -1
+	baseMin := base.Bounds().Min
 	for y := 0; y < r.Dy(); y++ {
 		for x := 0; x < r.Dx(); x++ {
-			if crop.RGBAAt(x, y) != color.RGBAModel.Convert(base.At(r.Min.X+x, r.Min.Y+y)) {
+			if crop.RGBAAt(x, y) != color.RGBAModel.Convert(base.At(baseMin.X+x, baseMin.Y+y)) {
 				if diff == 0 {
 					fx, fy = x, y
 				}
@@ -91,4 +92,15 @@ func TestGoldenLooseList(t *testing.T) {
 	data := renderPNG(t, "- 第一项\n\n  第二段：松散列表里两段之间必须有段间距。\n\n- 第二项\n")
 	m := decodePNG(t, data)
 	goldenCrop(t, "loose-list.png", m, image.Rect(0, 0, int(imgWidth), m.Bounds().Dy()))
+}
+
+// 超宽表格的右边框是 P3-2 的视觉面：130 列时旧的 9px/列下限让总宽 1170px
+// 超出 1016px 的可用宽度，右边框与最后几列一起被画布裁掉。
+//
+// 基准的每格只放一个句点：这条断言看的是"网格的右边框在画布内"，而 130 列
+// 汉字在 1080px 宽下每个字都比列宽宽，横竖会糊成一片、看不出边框位置
+// （有汉字的场景由 TestWideTableNeverExceedsAvailableWidth 守）。
+func TestGoldenWideTableRightEdge(t *testing.T) {
+	m := decodePNG(t, renderPNG(t, wideTableDoc(130, ".")))
+	goldenCrop(t, "table-wide-right.png", m, image.Rect(900, 0, int(imgWidth), m.Bounds().Dy()))
 }
