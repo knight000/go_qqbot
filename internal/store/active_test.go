@@ -65,6 +65,43 @@ func TestTakeActiveBudgetNonPositiveLimitRefuses(t *testing.T) {
 	}
 }
 
+// 平台明确拒绝（2xx + err_code）时这一格要还回去：消息没发出去，账上却
+// 少一次，等于把"被风控挡掉"永久烧成额度——进程重启也救不回来。
+func TestRefundActiveBudgetReturnsOneSlot(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	key := ActiveUsageKey{Day: "2026-10-20", Scene: "c2c", Peer: "u1"}
+
+	if ok, err := db.TakeActiveBudget(ctx, key, 1); err != nil || !ok {
+		t.Fatalf("首次应可占额度: ok=%v err=%v", ok, err)
+	}
+	if err := db.RefundActiveBudget(ctx, key); err != nil {
+		t.Fatalf("归还额度: %v", err)
+	}
+	if ok, err := db.TakeActiveBudget(ctx, key, 1); err != nil || !ok {
+		t.Fatalf("归还后应能再占一格: ok=%v err=%v", ok, err)
+	}
+}
+
+// 归还不得把账做成负数：没占过就归还只是 no-op，不能凭空放大额度。
+func TestRefundActiveBudgetNeverGoesNegative(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	key := ActiveUsageKey{Day: "2026-10-20", Scene: "c2c", Peer: "u1"}
+
+	if err := db.RefundActiveBudget(ctx, key); err != nil {
+		t.Fatalf("归还未占用的额度不该报错: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		if ok, err := db.TakeActiveBudget(ctx, key, 2); err != nil || !ok {
+			t.Fatalf("第 %d 次应可占额度: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if ok, err := db.TakeActiveBudget(ctx, key, 2); err != nil || ok {
+		t.Fatalf("limit=2 时第 3 次必须失败（凭空归还不得放大额度）: ok=%v err=%v", ok, err)
+	}
+}
+
 // 落库的全部意义：换一个连接重开同一个库，额度还在。
 func TestActiveBudgetSurvivesReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.db")

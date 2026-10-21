@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -52,6 +53,9 @@ type fakeAPI struct {
 	uploadErr  error
 	// failSendAt 让第 N 次（1 起）发消息返回错误，用于验证"第二条失败"。
 	failSendAt int
+	// bizSendAt 让第 N 次（1 起）发消息返回平台业务错误（HTTP 200 + err_code），
+	// 与 failSendAt 的区别是"平台明确拒绝"而不是"网络层面不明"。
+	bizSendAt int
 }
 
 func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.MessageBody) error {
@@ -59,6 +63,9 @@ func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.
 	defer f.mu.Unlock()
 	f.calls++
 	f.bodies = append(f.bodies, body)
+	if f.bizSendAt > 0 && f.calls == f.bizSendAt {
+		return &api.BusinessError{Code: 40034005, Message: "msg_id 已过期"}
+	}
 	if f.failSendAt > 0 && f.calls == f.failSendAt {
 		return errors.New("模拟发送失败")
 	}
@@ -337,6 +344,146 @@ func TestSenderPassiveSeqRetentionExpires(t *testing.T) {
 	}
 	if got := f.bodyAt(1).MsgSeq; got != 1 {
 		t.Fatalf("保留期过后应重新从 1 计数，实际 seq=%d", got)
+	}
+}
+
+// 平台明确拒绝时，那一格被动配额要还回去：用户什么都没收到，账上却少一次，
+// 连着被风控挡掉几条之后，正常回复也发不出去了。
+func TestSenderPassiveSlotReleasedOnBusinessError(t *testing.T) {
+	f := &fakeAPI{bizSendAt: 1}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+	ctx := context.Background()
+
+	err := s.Reply(ctx, ev, host.Reply{Content: "hi"})
+	var be *api.BusinessError
+	if !errors.As(err, &be) {
+		t.Fatalf("平台拒绝应原样透出业务错误，实际 err=%v", err)
+	}
+	// 还回一格 = 群窗口的 5 次仍然完整可用。
+	for i := 1; i <= 5; i++ {
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("归还后第 %d 次应能发出: %v", i, err)
+		}
+	}
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrPassiveExhausted) {
+		t.Fatalf("5 格用满后应耗尽，实际 err=%v", err)
+	}
+	// seq 不回退：被拒的那次已经用过 seq=1，(msg_id, msg_seq) 不能重来。
+	if got := f.bodyAt(1).MsgSeq; got != 2 {
+		t.Errorf("业务错误后 seq 不该回退，期望 2，实际 %d", got)
+	}
+}
+
+// 网络失败时那一格不能还：请求可能已经到达平台，还回去等于允许实际发送
+// 超过窗口上限（群 5 次/5 分钟、单聊 4 次/小时都是平台的硬约束）。
+func TestSenderPassiveSlotKeptOnNetworkError(t *testing.T) {
+	f := &fakeAPI{failSendAt: 1}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+	ctx := context.Background()
+
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err == nil {
+		t.Fatal("模拟网络失败应返回错误")
+	}
+	for i := 1; i <= 4; i++ {
+		if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); err != nil {
+			t.Fatalf("第 %d 次应能发出: %v", i, err)
+		}
+	}
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrPassiveExhausted) {
+		t.Fatalf("网络失败已占一格，5 次后应耗尽，实际 err=%v", err)
+	}
+}
+
+// 主动消息的日预算先扣再发；平台明确拒绝时这一格同样要还——账在库里，
+// 不还就是永久烧掉当天的额度。
+func TestSenderActiveBudgetRefundedOnBusinessError(t *testing.T) {
+	f := &fakeAPI{bizSendAt: 1}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 1,
+	}, newUsageStore(t))
+	p := s.ForPlugin("bootnotice")
+	ctx := context.Background()
+
+	err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"})
+	var be *api.BusinessError
+	if !errors.As(err, &be) {
+		t.Fatalf("平台拒绝应返回业务错误，实际 err=%v", err)
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("归还后当天那 1 格应可用: %v", err)
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("归还后仍只能发 1 条，第 3 次应超预算，实际 err=%v", err)
+	}
+}
+
+// 上传被平台拒绝时预算也要还：主动消息的顺序是"扣预算 → 上传 → 发送"，
+// 上传就失败的那条根本到不了平台的消息接口。
+func TestSenderActiveBudgetRefundedOnUploadBusinessError(t *testing.T) {
+	f := &fakeAPI{uploadErr: &api.BusinessError{Code: 1100101, Message: "内容被风控"}}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"digest": true},
+		DailyPerPeer: 1,
+	}, newUsageStore(t))
+	p := s.ForPlugin("digest")
+	ctx := context.Background()
+
+	err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Image: host.ImageFromBytes(tinyPNG())})
+	var be *api.BusinessError
+	if !errors.As(err, &be) {
+		t.Fatalf("上传被拒绝应透出业务错误，实际 err=%v", err)
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
+		t.Fatalf("归还后当天那 1 格应可用: %v", err)
+	}
+}
+
+// 网络失败不归还主动预算：发没发出去是未知的。这是既定取舍——宁可少发
+// 一条，也不能把平台每天 1000 条的配额当成无限量烧掉。
+func TestSenderActiveBudgetKeptOnNetworkError(t *testing.T) {
+	f := &fakeAPI{failSendAt: 1}
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"bootnotice": true},
+		DailyPerPeer: 1,
+	}, newUsageStore(t))
+	p := s.ForPlugin("bootnotice")
+	ctx := context.Background()
+
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err == nil {
+		t.Fatal("模拟网络失败应返回错误")
+	}
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+		t.Fatalf("网络失败应保留那一格，第 2 次应超预算，实际 err=%v", err)
+	}
+}
+
+// 平台明确拒绝时轨迹必须是"发送失败"：轨迹里写着"已发送"是最误导人的一件事
+// ——所有日志都指向成功，用户却什么都没收到。
+func TestTraceSaysFailedOnBusinessError(t *testing.T) {
+	f := &fakeAPI{bizSendAt: 1}
+	var buf bytes.Buffer
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s.trace = NewTrace(&buf, LevelFull)
+	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
+
+	_ = s.Reply(context.Background(), ev, host.Reply{Content: "hi"})
+
+	out := buf.String()
+	if !strings.Contains(out, "发送失败") {
+		t.Fatalf("平台拒绝时轨迹应写发送失败，实际 %q", out)
+	}
+	if strings.Contains(out, "已发送") {
+		t.Fatalf("平台拒绝时轨迹不得写已发送，实际 %q", out)
+	}
+	// 错误码要出现在轨迹里，否则排障只能靠猜平台为什么拒。
+	if !strings.Contains(out, "40034005") {
+		t.Fatalf("轨迹应带平台错误码，实际 %q", out)
 	}
 }
 
