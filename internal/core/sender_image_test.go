@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
@@ -25,7 +26,7 @@ func tinyPNG() []byte {
 func imageSender(t *testing.T) (*Sender, *fakeAPI) {
 	t.Helper()
 	f := &fakeAPI{}
-	return NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil), f
+	return NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local), f
 }
 
 func msgEvent() *host.Event {
@@ -279,7 +280,7 @@ func TestActiveImageBudgetCheckedBeforeUpload(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"digest": true},
 		DailyPerPeer: 1,
-	}, newUsageStore(t))
+	}, newUsageStore(t), time.Local)
 	p := s.ForPlugin("digest")
 	ctx := context.Background()
 

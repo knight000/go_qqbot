@@ -28,6 +28,68 @@ type StateStore interface {
 // 5 s 传不完——默认的 [http].timeout 对上传太紧。
 const uploadTimeout = 30 * time.Second
 
+// BusinessError 表示平台**受理了 HTTP 请求但拒绝了业务**（err_code / code 非 0）。
+//
+// 官方调用指南：成功时 err_code 为 0；失败时响应体带 err_code，而 HTTP 状态
+// 仍可能是 200/201/202。只看状态码就会把"平台拒绝"当成"已发送"——轨迹说发了、
+// 配额扣了，用户什么都没收到，排障时所有日志都指向成功。
+//
+// Code 对一般接口来自 err_code；access-token 接口来自 code（该接口失败时
+// HTTP 恒为 200）。调用方用 errors.As 判定它，据此与网络失败区分：
+//
+//	var be *api.BusinessError
+//	if errors.As(err, &be) { /* 平台明确拒绝，重试无意义 */ }
+//
+// 网络错误、超时、非 2xx 响应都不会被包装成它。
+type BusinessError struct {
+	Code    int
+	Message string
+	// TraceID 是平台给的排障标识（响应体 trace_id），可能为空。
+	TraceID string
+}
+
+func (e *BusinessError) Error() string {
+	s := fmt.Sprintf("平台业务错误(err_code=%d): %s", e.Code, e.Message)
+	if e.TraceID != "" {
+		s += " [trace_id=" + e.TraceID + "]"
+	}
+	return s
+}
+
+// envelope 是平台响应里公共的错误信封。
+//
+// 只解 err_code，不含 code：access-token 用 code、其余接口用 err_code，字段名
+// 不同但语义相同；混在一起会让"正常响应里恰好带 code"被误判成失败。
+type envelope struct {
+	ErrCode int    `json:"err_code"`
+	Message string `json:"message"`
+	TraceID string `json:"trace_id"`
+}
+
+// decodeEnvelope 校验信封，再把 body 解到 out（out 可为 nil）。
+//
+// out 为 nil 也必须解码：发消息的响应体里只有 id/timestamp/err_code，
+// 那是唯一能判定"平台到底收没收"的地方，丢掉 body 等于放弃判据。
+func decodeEnvelope(raw json.RawMessage, out any) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("解析响应: %w", err)
+	}
+	if env.ErrCode != 0 {
+		return &BusinessError{Code: env.ErrCode, Message: env.Message, TraceID: env.TraceID}
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("解析响应: %w", err)
+	}
+	return nil
+}
+
 type Client struct {
 	hc       *httpx.Client
 	hcSlow   *httpx.Client // 共享连接池与限流器，只放宽超时
@@ -128,6 +190,10 @@ func (c *Client) AccessToken(ctx context.Context) (string, error) {
 	if err := c.hc.PostJSON(reqCtx, c.tokenURL, body, &resp); err != nil {
 		return "", fmt.Errorf("获取 access_token: %w", err)
 	}
+	// 这个接口失败时 HTTP 仍是 200，错误码在 code 字段里。
+	if resp.Code != 0 {
+		return "", &BusinessError{Code: resp.Code, Message: resp.Message}
+	}
 	if resp.AccessToken == "" {
 		return "", fmt.Errorf("获取 access_token 失败: code=%d message=%s", resp.Code, resp.Message)
 	}
@@ -176,13 +242,14 @@ func (c *Client) Get(ctx context.Context, path string, out any) error {
 		return err
 	}
 	h := map[string]string{"Authorization": "QQBot " + tok}
-	if err := c.hc.GetJSONWithHeader(ctx, c.base+path, h, out); err != nil {
+	var raw json.RawMessage
+	if err := c.hc.GetJSONWithHeader(ctx, c.base+path, h, &raw); err != nil {
 		if httpx.IsStatus(err, 401) {
 			c.InvalidateToken()
 		}
 		return err
 	}
-	return nil
+	return decodeEnvelope(raw, out)
 }
 
 // Post 发起带鉴权头的 POST（可重试，仅用于幂等写操作）。
@@ -192,13 +259,14 @@ func (c *Client) Post(ctx context.Context, path string, in, out any) error {
 		return err
 	}
 	h := map[string]string{"Authorization": "QQBot " + tok}
-	if err := c.hc.PostJSONWithHeader(ctx, c.base+path, h, in, out); err != nil {
+	var raw json.RawMessage
+	if err := c.hc.PostJSONWithHeader(ctx, c.base+path, h, in, &raw); err != nil {
 		if httpx.IsStatus(err, 401) {
 			c.InvalidateToken()
 		}
 		return err
 	}
-	return nil
+	return decodeEnvelope(raw, out)
 }
 
 // postOnce 用于非幂等写操作：不自动重试，避免重复发送。
@@ -219,13 +287,14 @@ func (c *Client) postOnceWith(ctx context.Context, hc *httpx.Client, path string
 		return err
 	}
 	h := map[string]string{"Authorization": "QQBot " + tok}
-	if err := hc.PostJSONOnce(ctx, c.base+path, h, in, out); err != nil {
+	var raw json.RawMessage
+	if err := hc.PostJSONOnce(ctx, c.base+path, h, in, &raw); err != nil {
 		if httpx.IsStatus(err, 401) {
 			c.InvalidateToken()
 		}
 		return err
 	}
-	return nil
+	return decodeEnvelope(raw, out)
 }
 
 // scenePath 拼按场景分类的接口路径：群走 /v2/groups/，单聊走 /v2/users/。
