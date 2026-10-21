@@ -21,6 +21,9 @@ import (
 type StateStore interface {
 	GetState(ctx context.Context, key string) (string, bool, error)
 	PutState(ctx context.Context, key, value string) error
+	// DeleteState 用于作废 token：只清内存不删库，下一次又从库里读回
+	// 同一个坏 token，全站在 exp 到期前（最长 7200s）鉴权失败。
+	DeleteState(ctx context.Context, key string) error
 }
 
 // uploadTimeout 是富媒体上传的整体超时。
@@ -103,6 +106,11 @@ type Client struct {
 	mu    sync.Mutex
 	token string
 	exp   time.Time
+	// gen 是 token 的代际号：缓存内容每变一次（从库里装载、刷新、作废）就自增。
+	// 请求拿 token 时记下它的代际号，401 时只有"缓存还是我失败的那一份"
+	// 才真正作废——否则 N 个并发 401 会换 N 次 token，后到的还会把别人
+	// 刚换好的 token 又删掉。
+	gen uint64
 }
 
 type Options struct {
@@ -165,11 +173,20 @@ func (r *tokenResponse) expires() time.Duration {
 
 // AccessToken 返回缓存中的 token，过期前 60 s 主动刷新。
 func (c *Client) AccessToken(ctx context.Context) (string, error) {
+	tok, _, err := c.accessToken(ctx)
+	return tok, err
+}
+
+// accessToken 额外返回 token 的代际号，供 401 时判断该不该作废。
+//
+// 整个换取过程都在 mutex 里：同一时刻只有一个 goroutine 会去打 token 接口，
+// 并发请求要么等它换好直接复用，要么读到新 token——不需要额外的 single-flight。
+func (c *Client) accessToken(ctx context.Context) (string, uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.token != "" && time.Now().Before(c.exp.Add(-60*time.Second)) {
-		return c.token, nil
+		return c.token, c.gen, nil
 	}
 	// 进程重启后先尝试复用持久化的 token，能省一次换取请求
 	if c.token == "" && c.state != nil {
@@ -177,7 +194,8 @@ func (c *Client) AccessToken(ctx context.Context) (string, error) {
 			if exp, ok2, _ := c.state.GetState(ctx, "access_token_exp"); ok2 {
 				if t, err := time.Parse(time.RFC3339, exp); err == nil && time.Now().Before(t.Add(-60*time.Second)) {
 					c.token, c.exp = tok, t
-					return tok, nil
+					c.gen++
+					return tok, c.gen, nil
 				}
 			}
 		}
@@ -188,18 +206,19 @@ func (c *Client) AccessToken(ctx context.Context) (string, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := c.hc.PostJSON(reqCtx, c.tokenURL, body, &resp); err != nil {
-		return "", fmt.Errorf("获取 access_token: %w", err)
+		return "", c.gen, fmt.Errorf("获取 access_token: %w", err)
 	}
 	// 这个接口失败时 HTTP 仍是 200，错误码在 code 字段里。
 	if resp.Code != 0 {
-		return "", &BusinessError{Code: resp.Code, Message: resp.Message}
+		return "", c.gen, &BusinessError{Code: resp.Code, Message: resp.Message}
 	}
 	if resp.AccessToken == "" {
-		return "", fmt.Errorf("获取 access_token 失败: code=%d message=%s", resp.Code, resp.Message)
+		return "", c.gen, fmt.Errorf("获取 access_token 失败: code=%d message=%s", resp.Code, resp.Message)
 	}
 
 	c.token = resp.AccessToken
 	c.exp = time.Now().Add(resp.expires())
+	c.gen++
 	if c.state != nil {
 		if err := c.state.PutState(ctx, "access_token", c.token); err != nil {
 			c.log.Warn("持久化 access_token 失败", "err", err)
@@ -209,14 +228,80 @@ func (c *Client) AccessToken(ctx context.Context) (string, error) {
 		}
 	}
 	c.log.Info("已刷新 access_token", "expires_at", c.exp.Format(time.RFC3339))
-	return c.token, nil
+	return c.token, c.gen, nil
 }
 
-// InvalidateToken 在收到 401/鉴权错误时强制下次重取。
+// InvalidateToken 作废当前 token：内存与持久化一起清，下次必然重新换取。
+//
+// 网关的 4004（鉴权失败）也走这里。**必须连 bot_state 一起删**：只清内存的话，
+// 下一次 accessToken 会从库里把同一个坏 token 读回来（它的 exp 可能还在
+// 未来 7200s），于是每次请求都 401、每次都"作废"同一份缓存，进程重启也无效。
 func (c *Client) InvalidateToken() {
+	// 作废不能受调用方取消影响：401 已经收到，删库失败就会把坏 token 留在库里。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 2*time.Second)
+	defer cancel()
+
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearTokenLocked(ctx)
+}
+
+// invalidateIfCurrent 只在缓存仍是 gen 这一代时作废，否则说明别的请求
+// 已经作废并换好了新 token，这时候再清一次等于把新 token 丢掉。
+func (c *Client) invalidateIfCurrent(ctx context.Context, gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gen != gen {
+		return
+	}
+	c.clearTokenLocked(ctx)
+}
+
+func (c *Client) clearTokenLocked(ctx context.Context) {
 	c.token = ""
-	c.mu.Unlock()
+	c.exp = time.Time{}
+	c.gen++
+	if c.state == nil {
+		return
+	}
+	for _, key := range []string{"access_token", "access_token_exp"} {
+		if err := c.state.DeleteState(ctx, key); err != nil {
+			c.log.Warn("删除持久化的 token 失败，下次可能读回同一个坏 token", "key", key, "err", err)
+		}
+	}
+}
+
+// authHeader 构造平台鉴权头。
+func authHeader(tok string) map[string]string {
+	return map[string]string{"Authorization": "QQBot " + tok}
+}
+
+// doAuthed 带鉴权发一次请求；401 时作废 token、换新的再发一次。
+//
+// 只重试一次：401 是平台在鉴权阶段拒绝的，请求体没有被受理，所以连
+// "本来就不重试"的非幂等写操作（发消息、上传）重发也不会重复落地。
+// 连着两次 401 说明不是 token 陈旧（权限被回收、appid 被停用），
+// 再试只会把失败拖成超时。
+func (c *Client) doAuthed(ctx context.Context, do func(header map[string]string) error) error {
+	tok, gen, err := c.accessToken(ctx)
+	if err != nil {
+		return err
+	}
+	err = do(authHeader(tok))
+	if !httpx.IsStatus(err, 401) {
+		return err
+	}
+
+	ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	c.invalidateIfCurrent(ictx, gen)
+	cancel()
+
+	fresh, _, ferr := c.accessToken(ctx)
+	if ferr != nil {
+		c.log.Warn("401 后换取新 token 失败", "err", ferr)
+		return ferr
+	}
+	return do(authHeader(fresh))
 }
 
 type gatewayResponse struct {
@@ -235,41 +320,32 @@ func (c *Client) GatewayURL(ctx context.Context) (string, error) {
 	return resp.URL, nil
 }
 
-// Get 发起带鉴权的 GET 请求。
+// Get 发起带鉴权的 GET 请求。401 时换新 token 重试一次。
 func (c *Client) Get(ctx context.Context, path string, out any) error {
-	tok, err := c.AccessToken(ctx)
-	if err != nil {
-		return err
-	}
-	h := map[string]string{"Authorization": "QQBot " + tok}
 	var raw json.RawMessage
-	if err := c.hc.GetJSONWithHeader(ctx, c.base+path, h, &raw); err != nil {
-		if httpx.IsStatus(err, 401) {
-			c.InvalidateToken()
-		}
+	err := c.doAuthed(ctx, func(h map[string]string) error {
+		return c.hc.GetJSONWithHeader(ctx, c.base+path, h, &raw)
+	})
+	if err != nil {
 		return err
 	}
 	return decodeEnvelope(raw, out)
 }
 
-// Post 发起带鉴权头的 POST（可重试，仅用于幂等写操作）。
+// Post 发起带鉴权头的 POST（可重试，仅用于幂等写操作）。401 时换新 token 重试一次。
 func (c *Client) Post(ctx context.Context, path string, in, out any) error {
-	tok, err := c.AccessToken(ctx)
-	if err != nil {
-		return err
-	}
-	h := map[string]string{"Authorization": "QQBot " + tok}
 	var raw json.RawMessage
-	if err := c.hc.PostJSONWithHeader(ctx, c.base+path, h, in, &raw); err != nil {
-		if httpx.IsStatus(err, 401) {
-			c.InvalidateToken()
-		}
+	err := c.doAuthed(ctx, func(h map[string]string) error {
+		return c.hc.PostJSONWithHeader(ctx, c.base+path, h, in, &raw)
+	})
+	if err != nil {
 		return err
 	}
 	return decodeEnvelope(raw, out)
 }
 
-// postOnce 用于非幂等写操作：不自动重试，避免重复发送。
+// postOnce 用于非幂等写操作：不因网络/5xx 重试，避免重复发送。
+// 401 例外——平台在鉴权阶段就拒了，请求体没被受理，换新 token 重发是安全的。
 func (c *Client) postOnce(ctx context.Context, path string, in, out any) error {
 	return c.postOnceWith(ctx, c.hc, path, in, out)
 }
@@ -280,18 +356,15 @@ func (c *Client) postOnceSlow(ctx context.Context, path string, in, out any) err
 }
 
 // postOnceWith 是两者共用的实现。重试次数恒为 0：非幂等写操作在超时后
-// 可能已经落地，重试等于重复发送或重复上传。
+// 可能已经落地，重试等于重复发送或重复上传。唯一的例外是 401 后换 token
+// 重发一次（见 doAuthed），重发仍用调用方给的 hc——上传必须留在 hcSlow 上，
+// 否则 5 MB 的请求体会被 5 s 默认超时掐死。
 func (c *Client) postOnceWith(ctx context.Context, hc *httpx.Client, path string, in, out any) error {
-	tok, err := c.AccessToken(ctx)
-	if err != nil {
-		return err
-	}
-	h := map[string]string{"Authorization": "QQBot " + tok}
 	var raw json.RawMessage
-	if err := hc.PostJSONOnce(ctx, c.base+path, h, in, &raw); err != nil {
-		if httpx.IsStatus(err, 401) {
-			c.InvalidateToken()
-		}
+	err := c.doAuthed(ctx, func(h map[string]string) error {
+		return hc.PostJSONOnce(ctx, c.base+path, h, in, &raw)
+	})
+	if err != nil {
 		return err
 	}
 	return decodeEnvelope(raw, out)

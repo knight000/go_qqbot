@@ -128,20 +128,22 @@ func run() (*core.RestartRequest, error) {
 
 	// 单实例锁：必须在打开数据库、连网关之前拿到。
 	//
-	// 两个进程共用一份数据目录会互相顶掉网关 session（日志里是 4902 reset by
+	// 两个进程跑同一个 bot 会互相顶掉网关 session（日志里是 4902 reset by
 	// resume），并且各自回复一遍消息、各记一遍幂等表——不是"慢一点"，是明确错误。
-	// 锁按数据库路径划分：不同 [store].path 就是不同实例，可以同时跑。
+	// 锁分两把：appID 维度挡"同一 bot 换了个数据目录"，数据目录维度挡"两个 bot
+	// 共用一份库"。只按数据目录划分是上一版的缺陷：换个 [store].path 就能双开。
 	//
 	// 注意锁的 defer 注册在 db.Close 之前，所以退出时的顺序是"先关库再放手"，
 	// 不会给下一个实例留下一个刚拿到锁但库还开着的窗口。
-	lockWait := 2 * time.Second
-	if buildinfo.RestartedByReload() {
-		// /reload 是交接而不是竞争：run 返回时锁已经放开，正常情况下新进程
-		// 一次就能拿到。多等一会儿只是保险——万一将来改了重启顺序（比如
-		// 先拉起子进程再放手），这里不会变成"重启后起不来"。
-		lockWait = 15 * time.Second
-	}
-	lock, err := instance.Acquire(cfg.Store.Path+".lock", lockWait)
+	//
+	// 只有 /reload 需要等：那是交接而不是竞争（旧进程在 exec 前已经放手），
+	// 多等一会儿只是保险。普通启动必须 wait=0——双开时等下去没有任何意义，
+	// 只会让用户误以为进程还在启动中。
+	lock, err := instance.Acquire(instance.Options{
+		AppID:    cfg.App.ID,
+		DataPath: cfg.Store.Path + ".lock",
+		Wait:     lockWait(buildinfo.RestartedByReload()),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +238,7 @@ func run() (*core.RestartRequest, error) {
 		"config", *cfgPath,
 		"db", db.Path(),
 		"lock", lock.Path(),
+		"app_lock", lock.AppPath(),
 		"sandbox", cfg.App.Sandbox,
 		"debug", cfg.Debug.Enabled,
 		"version", bi.String(),
@@ -336,6 +339,18 @@ func rawDumpFunc(cfg *config.Config, c *core.Core) func(string, []byte) {
 		return nil
 	}
 	return c.PrintRaw
+}
+
+// lockWait 决定等单实例锁的上限。
+//
+// /reload 拉起的新进程是"交接"：旧进程在 exec 之前就放手了，正常情况下一次
+// 就能拿到，15 s 只是万一将来改了重启顺序时的保险。普通启动是"竞争"，第二个
+// 实例应当立刻失败——等下去不会让占着锁的进程变成不占，只会让用户以为还在启动。
+func lockWait(restartedByReload bool) time.Duration {
+	if restartedByReload {
+		return 15 * time.Second
+	}
+	return 0
 }
 
 // formatDomainLimits 把域名额度排成稳定顺序的 "host=rate" 列表。
