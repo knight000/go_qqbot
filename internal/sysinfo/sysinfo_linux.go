@@ -93,21 +93,39 @@ func parseKB(s string) uint64 {
 	return n * 1024
 }
 
-// processRSS 读 /proc/self/statm 的第二个字段（常驻页数）。
-func processRSS() uint64 {
-	data, err := os.ReadFile("/proc/self/statm")
+// processMemory 读 /proc/self/status 的 VmRSS 与 VmHWM（峰值常驻）。
+// 两个值取自同一个快照，所以峰值一定不小于当前值；分成两次读（statm +
+// status）会在两次读取之间自相矛盾。
+func processMemory() (rss, peak uint64, err error) {
+	f, err := os.Open("/proc/self/status")
 	if err != nil {
-		return 0
+		return 0, 0, fmt.Errorf("打开 /proc/self/status: %w", err)
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		return 0
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[0] {
+		case "VmRSS:":
+			rss = parseKB(fields[1])
+		case "VmHWM:":
+			peak = parseKB(fields[1])
+		}
+		if rss > 0 && peak > 0 {
+			return rss, peak, nil
+		}
 	}
-	pages, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0
+	if err := sc.Err(); err != nil {
+		return 0, 0, fmt.Errorf("读取 /proc/self/status: %w", err)
 	}
-	return pages * uint64(os.Getpagesize())
+	if rss == 0 {
+		return 0, 0, fmt.Errorf("/proc/self/status 缺少 VmRSS")
+	}
+	return 0, 0, fmt.Errorf("/proc/self/status 缺少 VmHWM")
 }
 
 // diskUsage 用 statfs 取分区容量。Bavail 是普通用户可用块数。
