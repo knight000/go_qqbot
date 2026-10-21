@@ -172,7 +172,7 @@ func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 		}
 
 		start := len(out)
-		for _, r := range s.text {
+		for _, r := range expandInline(s.text) {
 			pref := familyOfRune(r)
 			if (s.code || s.mono) && !isCJK(r) {
 				pref = FontMono
@@ -204,6 +204,32 @@ func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 		}
 	}
 	return out, nil
+}
+
+// expandInline 是行内文本的**唯一**预处理点：tab 展开成 4 个空格（与代码块
+// 的展开一致）、控制字符丢弃。
+//
+// 字体里没有 tab 与多数 C0/C1 控制字符的字形：不预处理就会被当成缺字画成
+// 方框，还会让"字体子集外"的 warn 误报——那是一条会把真正缺字淹掉的假警报。
+// 代码块路径早在 codeLines 里展开过 tab，行内是漏掉的另一半。控制字符连
+// 推进量都不占：它们没有可画的形态，留白只会让行距看着莫名变大。
+func expandInline(s string) string {
+	if !strings.ContainsFunc(s, func(r rune) bool { return r == '\t' || unicode.IsControl(r) }) {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			sb.WriteString("    ")
+		case unicode.IsControl(r):
+			// 丢弃。
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
 }
 
 // pickFace 按回退链接逐族取字形，返回第一个**真有该字形**的 face 及其推进量。
