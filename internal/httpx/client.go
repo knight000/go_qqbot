@@ -24,6 +24,10 @@ import (
 
 const maxBodyBytes = 8 << 20 // 单次响应读取上限，防慢速大文件打满内存
 
+// maxRedirects 与 net/http 的默认策略一致（10 跳）。自己实现 CheckRedirect
+// 就必须自己带上这个上限，否则等于把默认策略整个丢掉。
+const maxRedirects = 10
+
 type Options struct {
 	Timeout    time.Duration
 	Retries    int
@@ -38,8 +42,10 @@ type Options struct {
 	// HTTPClient 注入传输层实现，nil 时由 New 自己构造。
 	//
 	// 用途有二：测试可以注入信任自签证书的客户端；将来接代理或双向 TLS
-	// 时不必再改构造函数。注入后 Timeout 不再生效——调用方给的客户端
-	// 被原样使用；WithTimeout 仍会基于它的 Transport 重建。
+	// 时不必再改构造函数。注入后 Timeout 不再生效——调用方给的客户端的
+	// 参数被原样沿用（连接池、超时、自带的 CheckRedirect），但会拷一份
+	// 再挂上本包的重定向策略，不会改动调用方的对象；WithTimeout 仍会基于
+	// 它的 Transport 重建。
 	HTTPClient *http.Client
 
 	// Log 用于告警被忽略的非法域名额度；nil 时静默。
@@ -66,6 +72,13 @@ type Client struct {
 	allowed    []string // 仅在 restricted=true 时生效
 	restricted bool     // true = 该客户端属于插件，未声明域名一律拒绝
 	disableTPS bool
+
+	// nextRedirect 是注入 client 自带的 CheckRedirect（通常为 nil）。
+	//
+	// 克隆时原样继承、而不是叠加父 Client 的策略：插件 client 是 WithDomains
+	// 从根客户端克隆出来的，父的白名单可能与本克隆的不同，叠加会把"父没声明
+	// 的域名"也拒掉。本包自己的校验永远只有一份（见 newRequestClient）。
+	nextRedirect func(*http.Request, []*http.Request) error
 }
 
 // New 构造核心客户端（进程内唯一的根客户端）。
@@ -84,11 +97,34 @@ func New(o Options) *Client {
 		}
 		hc = &http.Client{Transport: tr, Timeout: o.Timeout}
 	}
-	return &Client{
-		hc:      hc,
-		retries: o.Retries,
-		buckets: newBucketSet(o.RatePerMin, o.DomainRatePerMin, o.Log),
+	c := &Client{
+		retries:      o.Retries,
+		buckets:      newBucketSet(o.RatePerMin, o.DomainRatePerMin, o.Log),
+		nextRedirect: hc.CheckRedirect,
 	}
+	c.hc = c.newRequestClient(hc)
+	return c
+}
+
+// newRequestClient 复用 hc 的连接池与超时设置，但把重定向策略绑到**当前**
+// Client 上。
+//
+// 不能原样共享父 client：CheckRedirect 是挂在 *http.Client 上的函数值，
+// WithDomains 克隆只换了 allowed，闭包却仍指向父 client 的空白名单——
+// 每一跳都会按"核心客户端"放行，P2-9 原样复发。
+func (c *Client) newRequestClient(hc *http.Client) *http.Client {
+	out := *hc
+	next := c.nextRedirect
+	out.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := c.checkRedirect(req, via); err != nil {
+			return err
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		return nil
+	}
+	return &out
 }
 
 // DomainLimits 返回实际生效的域名独立额度（非法条目已剔除），供启动日志核对。
@@ -103,6 +139,7 @@ func (c *Client) WithDomains(domains []string) *Client {
 	clone := *c
 	clone.allowed = domains
 	clone.restricted = true
+	clone.hc = clone.newRequestClient(c.hc)
 	return &clone
 }
 
@@ -112,7 +149,8 @@ func (c *Client) WithDomains(domains []string) *Client {
 // context 只能收紧不能放宽，所以必须另起一个 Client。
 func (c *Client) WithTimeout(d time.Duration) *Client {
 	clone := *c
-	clone.hc = &http.Client{Transport: c.hc.Transport, Timeout: d}
+	clone.hc = clone.newRequestClient(c.hc)
+	clone.hc.Timeout = d
 	return &clone
 }
 
@@ -131,6 +169,23 @@ func IsStatus(err error, code int) bool {
 	var he *HTTPError
 	return errors.As(err, &he) && he.Status == code
 }
+
+// RedirectError 表示重定向被本地策略拒绝：请求**没有**跟过去。
+//
+// 用独立类型而不是裸 error，调用方才能把"被白名单拦下"与"网络失败"分开：
+// 后者重试有意义，前者重试只会再撞同一堵墙。
+type RedirectError struct {
+	URL    string // 被拒绝的那一跳（重定向的目标）
+	From   string // 发起重定向的那一跳
+	Reason string // 人读原因
+	Err    error  // 具体判定失败的原因（可能是 checkParsedURL 的错误）
+}
+
+func (e *RedirectError) Error() string {
+	return fmt.Sprintf("重定向被拒绝（%s -> %s）：%s", e.From, e.URL, e.Reason)
+}
+
+func (e *RedirectError) Unwrap() error { return e.Err }
 
 func (c *Client) GetJSON(ctx context.Context, rawURL string, out any) error {
 	return c.do(ctx, http.MethodGet, rawURL, nil, nil, out)
@@ -227,6 +282,12 @@ func (c *Client) doWithRetries(ctx context.Context, method, rawURL string, heade
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			// 重定向被本地策略拒绝：重试只会再撞同一堵墙（还把源站多打几次），
+			// 直接返回可判定的错误。
+			var re *RedirectError
+			if errors.As(err, &re) {
+				return err
+			}
 			lastErr = err
 			continue
 		}
@@ -284,6 +345,44 @@ func (c *Client) checkParsedURL(u *url.URL) error {
 		}
 	}
 	return fmt.Errorf("域名 %s 未在插件 Manifest 中声明", host)
+}
+
+// checkRedirect 对**每一跳**重跑入口校验。
+//
+// 白名单是"这次请求可以去哪"的承诺，不是"第一个 URL 合法"的一次性盖章：
+// 被声明的域名一被攻陷或存在开放重定向，就能把请求带去 127.0.0.1:8500
+// 或 169.254.169.254，插件隔离随之失效（SSRF）。
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	var from *url.URL
+	if len(via) > 0 {
+		from = via[len(via)-1].URL
+	}
+	fromStr := ""
+	if from != nil {
+		fromStr = from.String()
+	}
+	if len(via) >= maxRedirects {
+		return &RedirectError{
+			From: fromStr, URL: req.URL.String(),
+			Reason: fmt.Sprintf("重定向超过 %d 跳", maxRedirects),
+		}
+	}
+	// 任何 scheme 变化都拒绝，包括 http→https：
+	//   - "只允许 https" 是入口校验的一部分，一次重定向就改掉它，等于让被
+	//     声明的域名替另一个协议背书；
+	//   - 实际只可能发生 https→http（降级即明文出网），那本来也被
+	//     checkParsedURL 拦住，这里显式判一次是为了让错误说清"是重定向改写了
+	//     scheme"，而不是笼统的"非 https"。
+	if from != nil && req.URL.Scheme != from.Scheme {
+		return &RedirectError{
+			From: fromStr, URL: req.URL.String(),
+			Reason: fmt.Sprintf("拒绝 scheme 变化 %s→%s", from.Scheme, req.URL.Scheme),
+		}
+	}
+	if err := c.checkParsedURL(req.URL); err != nil {
+		return &RedirectError{From: fromStr, URL: req.URL.String(), Reason: err.Error(), Err: err}
+	}
+	return nil
 }
 
 func backoff(attempt int) time.Duration {
