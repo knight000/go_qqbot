@@ -51,6 +51,8 @@ type activeUsageStore interface {
 	// TakeActiveBudget 原子地占一格当日额度；false 表示当日已满。
 	// 返回 error 表示账本不可用，调用方必须拒发（见 sendActiveOne）。
 	TakeActiveBudget(ctx context.Context, key store.ActiveUsageKey, limit int) (bool, error)
+	// RefundActiveBudget 归还一格：只在平台明确拒绝（err_code 非 0）时调用。
+	RefundActiveBudget(ctx context.Context, key store.ActiveUsageKey) error
 }
 
 // Sender 负责 passive/active 两类出站。
@@ -202,12 +204,34 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 	body.MsgSeq = seq
 
 	if err := s.api.SendMessage(ctx, string(ev.Scene), ev.PeerID, body); err != nil {
+		// 平台明确拒绝（200 + err_code）说明这条没发出去，把占掉的那一格还回去：
+		// 否则连着几条被风控挡掉，正常回复也会发不出去。
+		s.releasePassiveOnBusinessError(ev.MsgID, err)
 		if httpx.IsStatus(err, 429) {
 			return seq, fmt.Errorf("%w (seq=%d): %v", ErrRateLimited, seq, err)
 		}
 		return seq, fmt.Errorf("发送消息(seq=%d): %w", seq, err)
 	}
 	return seq, nil
+}
+
+// releasePassiveOnBusinessError 把一格被动配额还回去。
+//
+// 只认业务错误：网络失败/超时时请求可能已经到达平台，还回去等于允许实际发送
+// 超过窗口上限（群 5 次/5 分钟、单聊 4 次/小时都是平台硬约束）。
+//
+// seq 不回退：被拒的那次可能已经占用平台的 (msg_id, msg_seq) 判重记录，
+// 回退会让下一条撞上同一个序号。
+func (s *Sender) releasePassiveOnBusinessError(msgID string, cause error) {
+	var be *api.BusinessError
+	if !errors.As(cause, &be) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w, ok := s.windows[msgID]; ok && w.used > 0 {
+		w.used--
+	}
 }
 
 // bodyFor 组装请求体；带图时先把图片上传换成 file_info。
@@ -393,15 +417,52 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 
 	body, err := s.bodyFor(ctx, scene, peerID, msg)
 	if err != nil {
+		// 上传被平台拒绝时消息还没发出去，那一格预算不该记在账上。
+		s.refundActiveBudgetOnBusinessError(ctx, scene, peerID, err)
 		return err
 	}
 	if err := s.api.SendMessage(ctx, string(scene), peerID, body); err != nil {
+		s.refundActiveBudgetOnBusinessError(ctx, scene, peerID, err)
 		if httpx.IsStatus(err, 429) {
 			return fmt.Errorf("%w: %v", ErrRateLimited, err)
 		}
 		return fmt.Errorf("发送主动消息: %w", err)
 	}
 	return nil
+}
+
+// refundActiveBudgetOnBusinessError 在平台明确拒绝时归还一格主动消息日预算。
+//
+// 只认业务错误：网络失败/超时时消息可能已经发出，归还等于超发。这是既定
+// 取舍——宁可少发一条，也不能把平台每天 1000 条的配额当成无限量烧掉。
+//
+// 归还本身失败只告警：额度账本坏了是运维问题，不该让一次发送错误再叠一层
+// 无从处理的错误；但必须留日志，否则"账多了/少了"永远查不到原因。
+func (s *Sender) refundActiveBudgetOnBusinessError(ctx context.Context, scene host.Scene, peerID string, cause error) {
+	var be *api.BusinessError
+	if !errors.As(cause, &be) {
+		return
+	}
+	if s.active.DailyPerPeer <= 0 || s.usage == nil {
+		return
+	}
+	key := s.usageKey(scene, peerID)
+	if err := s.usage.RefundActiveBudget(ctx, key); err != nil {
+		s.log.Warn("归还主动消息额度失败", "scene", scene, "peer", peerID, "err", err)
+	}
+}
+
+// usageKey 是主动消息日预算的账本坐标。
+//
+// 占格与归还必须算出同一个 key，否则"还到别的桶"等于没还。切日时区与 cron
+// 同源（平台配额按这个自然日重置），所以只能有一处格式化。
+func (s *Sender) usageKey(scene host.Scene, peerID string) store.ActiveUsageKey {
+	return store.ActiveUsageKey{
+		// 与 cron 同一个时区：平台配额按这个自然日重置，换桶也必须按它。
+		Day:   s.now().In(s.loc).Format("2006-01-02"),
+		Scene: string(scene),
+		Peer:  peerID,
+	}
 }
 
 // takeActiveBudget 占一格日预算；ok=false 表示当日已用尽。
@@ -416,11 +477,6 @@ func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID 
 		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
 		return false, errors.New("未配置主动消息额度账本")
 	}
-	key := store.ActiveUsageKey{
-		// 与 cron 同一个时区：平台配额按这个自然日重置，换桶也必须按它。
-		Day:   s.now().In(s.loc).Format("2006-01-02"),
-		Scene: string(scene),
-		Peer:  peerID,
-	}
+	key := s.usageKey(scene, peerID)
 	return s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
 }
