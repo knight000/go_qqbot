@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,7 +116,15 @@ func (p *fakePlatform) opList() []int {
 // waitOps 等平台收到第 n 轮握手（超时算测试失败）。
 func (p *fakePlatform) waitOps(n int) {
 	p.t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	p.waitOpsWithin(n, 20*time.Second)
+}
+
+// waitOpsWithin 是带期限的版本：握手超时的用例必须证明"重连发生在平台自己
+// 断线之前"。fake 平台的服务端 15s 后会自行超时，踩着那个点重连也能通过
+// ——把定时器删掉照样绿，测试就白写了。
+func (p *fakePlatform) waitOpsWithin(n int, d time.Duration) {
+	p.t.Helper()
+	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		p.mu.Lock()
 		got := len(p.ops)
@@ -125,7 +134,7 @@ func (p *fakePlatform) waitOps(n int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	p.t.Fatalf("等待第 %d 轮握手超时，实际收到 %v", n, p.opList())
+	p.t.Fatalf("等待第 %d 轮握手超时（%v），实际收到 %v", n, d, p.opList())
 }
 
 // client 组装一个指向假平台的网关：Store 是真的（要验证持久化 session 的去留），
@@ -271,6 +280,87 @@ func TestInvalidTokenCloseCodeInvalidatesToken(t *testing.T) {
 	case <-invalidated:
 	case <-time.After(20 * time.Second):
 		t.Fatalf("4004 之后应作废缓存 token，实际没有调用；opcode 序列: %v", p.opList())
+	}
+}
+
+// 平台回了 hello、心跳也照常 ACK，但 READY 帧永远不来 —— 这是最难排查的故障：
+// 进程在线、心跳正常、一条消息都不回，日志里只有一条 EOF。
+// 客户端必须在握手窗口到期后**自己**断开并重连（服务端在这里从不主动断）。
+func TestHandshakeTimeoutClosesAndReconnects(t *testing.T) {
+	db := openTestStore(t)
+
+	// codes 为空 = 每一轮都只回 hello，然后一直保持连接、永不发 READY。
+	p := newFakePlatform(t)
+	c := p.client(db, false)
+	c.handshakeTimeout = 150 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	// 第二轮握手只可能来自"客户端自己超时关掉第一轮"：fake 平台 15s 后才会
+	// 自行超时，所以这里必须给一个远小于 15s 的窗口。
+	p.waitOpsWithin(2, 5*time.Second)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run 在取消后应返回 nil，实际: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("握手超时后 Run 未返回，说明仍在无限读一条永远收不到 READY 的连接")
+	}
+
+	if ops := p.opList(); len(ops) < 2 || ops[0] != opIdentify || ops[1] != opIdentify {
+		t.Fatalf("握手超时后应重新 Identify(op2)，实际 opcode 序列: %v", ops)
+	}
+}
+
+// 握手等待期间收到关停信号必须立刻返回：关停时卡住的不是"一次 Read"，
+// 而是握手定时器那一整段（默认 30s）。剩余协程也要跟着连接一起退出，
+// 否则每次重启/重载都会攒下一个握着 *websocket.Conn 的定时器。
+func TestRunCancelDuringHandshakeReturnsPromptly(t *testing.T) {
+	db := openTestStore(t)
+
+	p := newFakePlatform(t) // 只回 hello、永不 READY：客户端一直停在握手等待
+	c := p.client(db, false)
+	// 故意取远大于测试时长的超时：这里要证明的是"取消能打断它"，
+	// 不是"等它自己超时"。
+	c.handshakeTimeout = time.Minute
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	p.waitOps(1)
+	// 此刻除了 Run 自己，还挂着手握定时器与心跳两个协程。
+	during := runtime.NumGoroutine()
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run 在取消后应返回 nil，实际: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("取消后 Run 未返回，仍卡在握手等待上（握手超时设为 %v）", c.handshakeTimeout)
+	}
+	if spent := time.Since(start); spent > 2*time.Second {
+		t.Fatalf("取消后应立刻返回，实际用了 %v", spent)
+	}
+
+	// 握手定时器 + 心跳 + Run 三个协程都应退出；留一个就是漏。
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if n := runtime.NumGoroutine(); n <= during-3 {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatalf("取消后协程未收敛：握手期间 %d 个，现在 %d 个（应少 3 个）", during, n)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
