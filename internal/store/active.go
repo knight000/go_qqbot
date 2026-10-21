@@ -51,3 +51,22 @@ func (db *DB) TakeActiveBudget(ctx context.Context, key ActiveUsageKey, limit in
 	}
 	return n == 1, nil
 }
+
+// RefundActiveBudget 归还一格主动消息日预算。
+//
+// 只给"平台明确拒绝"用：HTTP 通了但 err_code 非 0，说明这条消息没有发出去，
+// 那一格不该记在账上。网络超时/5xx 不归还——请求可能已经到达平台，
+// 还回去等于允许实际发送超过上限。
+//
+// used > 0 是必须的：没有对应的占用时归还只是 no-op，账不能变成负数，
+// 否则"归还"会被一次写坏的调用放大成额外额度。
+func (db *DB) RefundActiveBudget(ctx context.Context, key ActiveUsageKey) error {
+	_, err := db.w.ExecContext(ctx,
+		`UPDATE active_usage SET used = used - 1
+		 WHERE day = ? AND scene = ? AND peer = ? AND used > 0`,
+		key.Day, key.Scene, key.Peer)
+	if err != nil {
+		return fmt.Errorf("归还主动消息额度: %w", err)
+	}
+	return nil
+}

@@ -29,6 +29,14 @@ func (r *recordingUsage) TakeActiveBudget(_ context.Context, key store.ActiveUsa
 	return true, nil
 }
 
+// RefundActiveBudget 与真账本同语义：按同一个 key 归还，账不能变成负数。
+func (r *recordingUsage) RefundActiveBudget(_ context.Context, key store.ActiveUsageKey) error {
+	if r.counts[key.Day] > 0 {
+		r.counts[key.Day]--
+	}
+	return nil
+}
+
 // 日预算的切日必须与 cron 用同一个时区来源。
 //
 // 部署单元在 UTC 机器上跑（Debian 12 默认 UTC），cron 却按 Asia/Shanghai
@@ -75,5 +83,34 @@ func TestActiveUsageDayUsesSchedulerLocation(t *testing.T) {
 		if got := usage.keys[i].Day; got != day {
 			t.Fatalf("第 %d 次记账的 Day 应为北京时间 %s，实际 %s", i+1, day, got)
 		}
+	}
+}
+
+// 归还必须落回**占格的那个桶**：跨时区部署下若归还另按进程本地时区格式化
+// Day，就会还到另一个桶——账上仍是满的，等于没还。
+func TestActiveBudgetRefundLandsInSameBucket(t *testing.T) {
+	loc := NewScheduler(nil, slog.New(slog.DiscardHandler)).Location()
+	usage := &recordingUsage{}
+	s := NewSender(&fakeAPI{bizSendAt: 1}, slog.New(slog.DiscardHandler), ActivePolicy{
+		Enabled:      true,
+		Plugins:      map[string]bool{"digest": true},
+		DailyPerPeer: 1,
+	}, usage, loc)
+	// 北京 10-22 00:01、UTC 仍是 10-21 16:01：只有这一天两个时区会分叉。
+	s.now = func() time.Time { return time.Date(2026, 10, 21, 16, 1, 0, 0, time.UTC) }
+	p := s.ForPlugin("digest")
+	ctx := context.Background()
+
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err == nil {
+		t.Fatal("平台拒绝应返回错误")
+	}
+	if len(usage.keys) != 1 {
+		t.Fatalf("应记账 1 次，实际 %d 次", len(usage.keys))
+	}
+	if got := usage.keys[0].Day; got != "2026-10-22" {
+		t.Fatalf("应记在北京时间这一天，实际 %s", got)
+	}
+	if n := usage.counts["2026-10-22"]; n != 0 {
+		t.Fatalf("归还应落回同一桶，实际该桶仍有 %d 条", n)
 	}
 }
