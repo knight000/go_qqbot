@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -70,4 +71,36 @@ func (f fakePlugin) Manifest() host.Manifest             { return host.Manifest{
 func (fakePlugin) Init(context.Context, host.Host) error { return nil }
 func (fakePlugin) Handle(context.Context, *host.Event) (*host.Reply, error) {
 	return nil, nil
+}
+
+// 信号注册必须紧跟 config.Load：字体解析（约 300ms）、拿锁、开库、迁移都在
+// 它之后。挪到它们后面，这段窗口里的 SIGTERM 会走默认处理——进程被杀、
+// 会话不落盘、systemd 记成 killed by signal（P3-21）。
+//
+// 这是源码顺序断言：这条不变量没有可注入的观察点（Windows 上也没法给自己发
+// SIGTERM），所以直接守住 run() 里几个关键调用的先后。
+func TestSignalRegistrationPrecedesSlowStartup(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(data)
+	order := []string{
+		"cfg, err := config.Load(",
+		"notifyShutdown(context.Background())",
+		"render.LoadFonts()",
+		"store.Open(",
+		"db.Migrate(",
+	}
+	prev, prevAt := "", -1
+	for _, marker := range order {
+		at := strings.Index(src, marker)
+		if at < 0 {
+			t.Fatalf("main.go 里找不到 %q：启动顺序的守卫要跟着改", marker)
+		}
+		if at < prevAt {
+			t.Fatalf("%q 必须出现在 %q 之后", marker, prev)
+		}
+		prev, prevAt = marker, at
+	}
 }
