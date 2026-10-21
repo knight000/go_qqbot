@@ -81,19 +81,21 @@ type processMemoryCountersEx struct {
 	PrivateUsage               uintptr
 }
 
-func processRSS() uint64 {
+// processMemory 用 GetProcessMemoryInfo 取当前进程的 WorkingSetSize 与
+// PeakWorkingSetSize。两者来自同一次调用，峰值一定不小于当前值。
+func processMemory() (rss, peak uint64, err error) {
 	h, _, _ := procGetCurrentProcess.Call()
 	var c processMemoryCountersEx
 	c.Cb = uint32(unsafe.Sizeof(c))
-	r, _, _ := procGetProcessMemoryInfo.Call(
+	r, _, e := procGetProcessMemoryInfo.Call(
 		h,
 		uintptr(unsafe.Pointer(&c)),
 		uintptr(c.Cb),
 	)
 	if r == 0 {
-		return 0
+		return 0, 0, fmt.Errorf("GetProcessMemoryInfo: %v", e)
 	}
-	return uint64(c.WorkingSetSize)
+	return uint64(c.WorkingSetSize), uint64(c.PeakWorkingSetSize), nil
 }
 
 // diskUsage 取路径所在分区的总量与可用量（配额感知）。

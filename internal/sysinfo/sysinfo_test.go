@@ -118,8 +118,26 @@ func TestReadMemory(t *testing.T) {
 	if m.Percent < 0 || m.Percent > 100 {
 		t.Errorf("Percent = %f，越界", m.Percent)
 	}
-	if m.ProcessRSS == 0 {
-		t.Error("ProcessRSS = 0，应能取到当前进程常驻内存")
+}
+
+// 峰值 RSS 是"这台机器上这个进程最多吃过多少内存"的唯一线索：OOM 之后
+// 当前 RSS 会掉下来，只有峰值还记得当时发生了什么。
+func TestReadProcessMemory(t *testing.T) {
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
+		t.Skip("当前平台不采集本进程内存")
+	}
+	pm, err := ReadProcessMemory()
+	if err != nil {
+		t.Fatalf("ReadProcessMemory: %v", err)
+	}
+	if pm.RSS == 0 {
+		t.Error("RSS = 0，应能取到当前进程常驻内存")
+	}
+	if pm.Peak == 0 {
+		t.Error("Peak = 0，应能取到进程峰值常驻内存")
+	}
+	if pm.Peak < pm.RSS {
+		t.Errorf("Peak(%d) < RSS(%d)，峰值不可能小于当前", pm.Peak, pm.RSS)
 	}
 }
 

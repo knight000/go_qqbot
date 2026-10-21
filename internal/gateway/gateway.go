@@ -287,7 +287,9 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 			c.lg.Warn("忽略无法解析的帧", "err", err)
 			continue
 		}
-		if p.S > 0 {
+		// 可确认 seq 的推进时机（P3-11）：非 dispatch 帧没有 Handler，收到即可
+		// 确认；dispatch 帧必须等 Handler 返回，见下面的 setSeq。
+		if p.Op != opDispatch && p.S > 0 {
 			c.setSeq(ctx, p.S)
 		}
 
@@ -305,6 +307,13 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 				readySince = time.Now()
 			} else {
 				c.dispatch(ctx, p.T, p.D)
+			}
+			// 走到这里说明这一帧已经处理完（Handler 已返回，或事件被解码丢弃）。
+			// 提前置位会让崩溃落在"seq 已落盘、事件未处理"的窗口里：下次 Resume
+			// 从已确认 seq 之后开始，那一条就永久丢了（P3-11）。落盘仍有 10s
+			// 节流，但落下去的 seq 永远是"已处理完的最大连续 seq"。
+			if p.S > 0 {
+				c.setSeq(ctx, p.S)
 			}
 		case opHeartbeat:
 			c.sendHeartbeat(ctx, ws)
@@ -519,6 +528,16 @@ func (c *Client) hasSession() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sessionID != ""
+}
+
+// confirmedSeq 返回当前可确认（已处理完）的最大连续 seq。
+//
+// 它是落盘与 Resume 的唯一来源：c.seq 只在帧处理完之后被 setSeq 推进，
+// 所以任何被持久化的 seq 都意味着它之前的 dispatch 事件都已经交给 Handler 并返回。
+func (c *Client) confirmedSeq() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seq
 }
 
 // willResume 决定这一轮握手走 Resume 还是 Identify。
