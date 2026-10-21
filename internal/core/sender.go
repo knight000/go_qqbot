@@ -66,6 +66,11 @@ type Sender struct {
 	active ActivePolicy
 	trace  *Trace
 	usage  activeUsageStore
+	// loc 是"一天"的口径。它必须与 cron 用同一个 location（由 Scheduler
+	// 注入），不能读环境变量、更不能跟进程本地时区走：部署单元默认 UTC，
+	// 而平台配额按北京时间自然日重置，两者分叉时同一个平台自然日能花掉
+	// "前一天桶里的余额 + 08:00 后的新满额"，最多 2×limit。
+	loc *time.Location
 	// now 可注入：日切、窗口过期、序号保留期都要靠时间推进来测。
 	now func() time.Time
 
@@ -86,15 +91,37 @@ type passiveWindow struct {
 	expires time.Time
 }
 
-func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore) *Sender {
+// NewSender 的 loc 是日预算的切日时区，由 Scheduler 提供（与 cron 同源）。
+// 不设默认值：一个"忘了注入就用本地时区"的兜底正是 P2-4 那个 bug 本身。
+func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore, loc *time.Location) *Sender {
 	return &Sender{
 		api:     api,
 		log:     log,
 		active:  active,
 		usage:   usage,
+		loc:     loc,
 		now:     time.Now,
 		windows: make(map[string]*passiveWindow),
 	}
+}
+
+// 回复的发送预算。纯文本 5s 够用；含上传时必须给 30s ——api 层的 30s
+// 只放宽了 http.Client.Timeout，放不宽 ctx，而 5 MB 图 base64 后约 6.7 MB，
+// 10 Mbps 上行就要 5s 以上，小预算会让图永远发不出去。
+const (
+	replyTextTimeout   = 5 * time.Second
+	replyUploadTimeout = 30 * time.Second
+)
+
+// replyBudget 按这一条消息的内容决定预算。
+//
+// 判断与降级都必须在核心内完成：host.Sender.Reply 不返回错误，插件拿不到
+// "图没发出去"这件事，只能由这里给定时间并在失败时留下 Warn。
+func replyBudget(msg host.Reply) time.Duration {
+	if msg.Image.Valid() {
+		return replyUploadTimeout
+	}
+	return replyTextTimeout
 }
 
 // Reply 发送被动回复。一条 Reply 可能被拆成两条消息（图文），
@@ -106,10 +133,18 @@ func (s *Sender) Reply(ctx context.Context, ev *host.Event, msg host.Reply) erro
 	}
 	for i, part := range parts {
 		start := time.Now()
-		seq, err := s.sendPassive(ctx, ev, part)
+		// 预算按条算：图文拆成文本 + 图片两条，各拿各的，上传慢不连累文本。
+		pctx, cancel := context.WithTimeout(ctx, replyBudget(part))
+		seq, err := s.sendPassive(pctx, ev, part)
+		cancel()
 		// 无论成败都留一条轨迹：这是"插件回了什么"的唯一出口。
 		s.trace.Sent("被动回复", ev.Scene, ev.PeerID, seq, replySummary(part), err, time.Since(start))
 		if err != nil {
+			// 拆成多条时前几条可能已经发出去了。只把错误往上返回不够：
+			// dispatch 的日志没有 peer 也没有"发到第几条"，排障时对不上。
+			s.log.Warn("被动回复未完整发出",
+				"scene", ev.Scene, "peer", ev.PeerID, "msg_id", ev.MsgID,
+				"sent", i, "total", len(parts), "err", err)
 			if i == 0 {
 				return err
 			}
@@ -382,7 +417,8 @@ func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID 
 		return false, errors.New("未配置主动消息额度账本")
 	}
 	key := store.ActiveUsageKey{
-		Day:   s.now().Format("2006-01-02"),
+		// 与 cron 同一个时区：平台配额按这个自然日重置，换桶也必须按它。
+		Day:   s.now().In(s.loc).Format("2006-01-02"),
 		Scene: string(scene),
 		Peer:  peerID,
 	}

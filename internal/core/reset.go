@@ -252,25 +252,31 @@ func (c *Core) resetConfirm(ctx context.Context, ev *host.Event, spec resetSpec,
 }
 
 // resetExecute 真正动手。auditID > 0 表示这次执行有对应的 pending 记录。
+//
+// 成功与失败写的是两种状态：failed 只进审计、不参与冷却（LastResetDoneAt
+// 只认 done）。否则 R3 失败一次就锁 24 小时，而用户看到的还是"重置失败"。
 func (c *Core) resetExecute(ctx context.Context, ev *host.Event, spec resetSpec, peer string, auditID int64) {
 	summary, err := c.runReset(ctx, spec, peer)
+
+	status := store.ResetStatusDone
+	detail := summary
 	if err != nil {
-		c.log.Error("执行重置失败", "level", spec.level, "peer", peer, "err", err)
-		if auditID > 0 {
-			_ = c.store.CloseReset(ctx, auditID, store.ResetStatusDone, "失败: "+err.Error())
-		} else {
-			_ = c.store.AuditResetDone(ctx, ev.SenderID, peer, spec.level, "失败: "+err.Error())
-		}
-		c.replyText(ctx, ev, "重置失败，已中止："+err.Error())
-		return
+		status = store.ResetStatusFailed
+		detail = "失败: " + err.Error()
 	}
 
 	if auditID > 0 {
-		if err := c.store.CloseReset(ctx, auditID, store.ResetStatusDone, summary); err != nil {
-			c.log.Warn("更新重置审计失败", "err", err)
+		if err := c.store.CloseReset(ctx, auditID, status, detail); err != nil {
+			c.log.Warn("更新重置审计失败", "status", status, "err", err)
 		}
-	} else if err := c.store.AuditResetDone(ctx, ev.SenderID, peer, spec.level, summary); err != nil {
-		c.log.Warn("写入重置审计失败", "err", err)
+	} else if err := c.store.AuditResetFinished(ctx, ev.SenderID, peer, spec.level, status, detail); err != nil {
+		c.log.Warn("写入重置审计失败", "status", status, "err", err)
+	}
+
+	if err != nil {
+		c.log.Error("执行重置失败", "level", spec.level, "peer", peer, "err", err)
+		c.replyText(ctx, ev, "重置失败，已中止："+err.Error()+"\n本次不计入冷却，可直接重试。")
+		return
 	}
 
 	c.log.Warn("执行了重置", "level", spec.level, "peer", peer, "by", ev.SenderID, "detail", summary)
@@ -468,6 +474,8 @@ func resetStatusLabel(s string) string {
 		return "已执行"
 	case store.ResetStatusPending:
 		return "待确认"
+	case store.ResetStatusFailed:
+		return "失败（未占冷却）"
 	case store.ResetStatusCancelled:
 		return "已取消"
 	case store.ResetStatusExpired:

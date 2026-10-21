@@ -135,7 +135,7 @@ func (f *fakeAPI) lastBody() (api.MessageBody, bool) {
 
 func TestSenderPassiveLimitGroup(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
 	ctx := context.Background()
 
@@ -157,7 +157,7 @@ func TestSenderPassiveLimitGroup(t *testing.T) {
 
 func TestSenderPassiveLimitC2C(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	ev := &host.Event{Scene: host.SceneC2C, PeerID: "u1", MsgID: "m2"}
 	ctx := context.Background()
 
@@ -172,7 +172,7 @@ func TestSenderPassiveLimitC2C(t *testing.T) {
 }
 
 func TestSenderActiveDisabled(t *testing.T) {
-	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	if err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
 		t.Fatalf("主动消息总开关关闭时应拒绝，实际 err=%v", err)
 	}
@@ -185,7 +185,7 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 5,
-	}, newUsageStore(t))
+	}, newUsageStore(t), time.Local)
 
 	if err := s.ForPlugin("evil").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
 		t.Fatalf("非白名单插件应被拒绝，实际 err=%v", err)
@@ -209,7 +209,7 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 // 窗口只该重置"还剩几次"，不该重置"第几条"。
 func TestSenderPassiveSeqKeepsRisingAfterWindowExpiry(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
 	s.now = func() time.Time { return now }
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
@@ -247,7 +247,7 @@ func TestSenderPassiveSeqKeepsRisingAfterWindowExpiry(t *testing.T) {
 // seq 会回到 1（(msg_id, msg_seq) 重复），比多占 ~64 字节严重得多。
 func TestSenderPassiveSeqCapYieldsToLiveWindows(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	ctx := context.Background()
 
 	send := func(msgID string) int {
@@ -278,7 +278,7 @@ func TestSenderPassiveSeqCapYieldsToLiveWindows(t *testing.T) {
 // 同时重置 passive 次数与 seq——那正是 #14 要消除的 (msg_id, msg_seq) 重复。
 func TestSenderPassiveEvictionSkipsLiveWindows(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	ctx := context.Background()
 	start := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
 	now := start
@@ -321,7 +321,7 @@ func TestSenderPassiveEvictionSkipsLiveWindows(t *testing.T) {
 // 窗口过期 24 小时后不可能再被重试，那时 seq 从头数就是安全的。
 func TestSenderPassiveSeqRetentionExpires(t *testing.T) {
 	f := &fakeAPI{}
-	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil)
+	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
 	s.now = func() time.Time { return now }
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
@@ -347,7 +347,7 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 2,
-	}, newUsageStore(t))
+	}, newUsageStore(t), time.Local)
 	p := s.ForPlugin("bootnotice")
 	ctx := context.Background()
 
@@ -375,7 +375,7 @@ func TestSenderActiveBudgetResetsNextDay(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"bootnotice": true},
 		DailyPerPeer: 1,
-	}, newUsageStore(t))
+	}, newUsageStore(t), time.Local)
 	// 23:59 与 00:01 是同一个"日预算"问题里唯一值得卡住的边界。
 	now := time.Date(2026, 10, 20, 23, 59, 0, 0, time.Local)
 	s.now = func() time.Time { return now }
@@ -405,7 +405,7 @@ func TestSenderActiveBudgetFailsClosedWithoutStore(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"digest": true},
 		DailyPerPeer: 5,
-	}, nil)
+	}, nil, time.Local)
 	p := s.ForPlugin("digest")
 
 	err := p.SendActive(context.Background(), host.SceneC2C, "u1",
@@ -432,7 +432,7 @@ func TestSenderActiveBudgetFailsClosedWhenStoreBroken(t *testing.T) {
 		Enabled:      true,
 		Plugins:      map[string]bool{"digest": true},
 		DailyPerPeer: 5,
-	}, db)
+	}, db, time.Local)
 
 	err := s.ForPlugin("digest").SendActive(context.Background(), host.SceneC2C, "u1",
 		host.Reply{Content: "x"})
@@ -472,7 +472,7 @@ func TestSenderActiveBudgetSurvivesRestart(t *testing.T) {
 
 	first := open()
 	f := &fakeAPI{}
-	p := NewSender(f, slog.New(slog.DiscardHandler), policy, first).ForPlugin("bootnotice")
+	p := NewSender(f, slog.New(slog.DiscardHandler), policy, first, time.Local).ForPlugin("bootnotice")
 	for i := 0; i < 2; i++ {
 		if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
 			t.Fatalf("第 %d 次不应失败: %v", i+1, err)
@@ -484,7 +484,7 @@ func TestSenderActiveBudgetSurvivesRestart(t *testing.T) {
 
 	second := open()
 	f2 := &fakeAPI{}
-	p2 := NewSender(f2, slog.New(slog.DiscardHandler), policy, second).ForPlugin("bootnotice")
+	p2 := NewSender(f2, slog.New(slog.DiscardHandler), policy, second, time.Local).ForPlugin("bootnotice")
 	if err := p2.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
 		t.Fatalf("重启后当日额度应仍是用尽的，实际 err=%v", err)
 	}

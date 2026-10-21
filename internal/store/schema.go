@@ -103,8 +103,9 @@ var schema = []string{
 	// ——那是插件命名空间，插件一清前缀就把额度账抹了。
 	//
 	// 没有内存镜像：发送前用一条 upsert 原子地"检查 + 自增"，于是
-	// 重启不清零、并发与多进程都不会超发。day 取本地时区的 YYYY-MM-DD，
-	// 跨日就是新主键，换桶不需要任何重置动作。
+	// 重启不清零、并发与多进程都不会超发。day 取调度时区（Asia/Shanghai，
+	// 与 cron 同源，由核心注入）的 YYYY-MM-DD，跨日就是新主键，
+	// 换桶不需要任何重置动作。
 	activeUsageTableDDL,
 
 	adminTableDDL,
@@ -144,7 +145,8 @@ var schema = []string{
 	// reset_audit 记录每一次重置尝试（§8.3）。不可逆操作必须能事后回答
 	// "谁在什么时候按的、按到了哪一级"。
 	//
-	// status: pending（等确认码）/ done / cancelled（被新的同目标请求顶掉）/ expired。
+	// status: pending（等确认码）/ done（成功）/ failed（执行失败）/ cancelled（被新的同目标请求顶掉）/ expired。
+	// done 与 failed 的区别是冷却：只有 done 参与 LastResetDoneAt，失败的尝试不占窗口。
 	// 二次确认走这张表而不是内存 map：进程重启后 pending 仍可核对，
 	// 也不会出现"审计里只有 done、看不到曾有人尝试过"的盲区。
 	// expires_at 只对 pending 有意义（确认码 60 秒）。

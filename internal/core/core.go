@@ -121,9 +121,10 @@ func New(o Options) (*Core, error) {
 		session = sessionBackend{db: o.Store, router: router, log: logger.With("component", "session")}
 		sessionRowsSrc = sessionRows{o.Store}
 	}
-	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage)
-	sender.trace = trace
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
+	// 日预算的切日与 cron 必须同源：都由调度器的 location 决定。
+	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage, sched.Location())
+	sender.trace = trace
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
 	dispatch.trace = trace
 	dispatch.denyReply = o.Config.Permission.DenyReply
