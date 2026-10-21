@@ -169,6 +169,9 @@ func (c *Core) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// 再把 Manifest.Intents 与 [bot].intents 位掩码交叉校验：缺位只告警，
+	// 见 warnIntentGaps 里"为什么不 fail-fast"。
+	c.warnIntentGaps()
 
 	for _, p := range c.plugins {
 		c.sched.Bind(p.Manifest().Name, p)
