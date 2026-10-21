@@ -2,12 +2,14 @@ package adminping
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/internal/sysinfo"
 )
 
 // fakeHost 只填本插件用到的能力（日志与配置）；鉴权已不在插件里，IsAdmin 不参与。
@@ -138,6 +140,56 @@ func TestAdminGetsFullReport(t *testing.T) {
 		t.Errorf("MsgType = %d, want 0（文本）", reply.MsgType)
 	}
 	t.Logf("报告内容:\n%s", reply.Content)
+}
+
+// 峰值 RSS 是排查 OOM 的唯一线索：进程被重启后当前 RSS 从头开始，
+// 只有峰值还记得"它死之前吃到了多少"。所以它必须出现在 /ping 里。
+//
+// 用注入的采集结果断言整段文本，而不是只查"峰值"两个字：否则把当前 RSS
+// 当成峰值打印（这正是修复前的样子）也能过。
+func TestReportShowsProcessPeakRSS(t *testing.T) {
+	orig := readProcessMemory
+	readProcessMemory = func() (sysinfo.ProcessMemory, error) {
+		return sysinfo.ProcessMemory{RSS: 8 << 20, Peak: 64 << 20}, nil
+	}
+	t.Cleanup(func() { readProcessMemory = orig })
+
+	p := newPlugin(t)
+	reply, err := p.Handle(context.Background(), ev("/ping", "/ping"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply == nil {
+		t.Fatal("应收到回复")
+	}
+	if want := "本进程 8.0 MB（峰值 64.0 MB）"; !strings.Contains(reply.Content, want) {
+		t.Errorf("报告缺少 %q：\n%s", want, reply.Content)
+	}
+}
+
+// 采集失败必须显式说出来。旧实现是"RSS 为 0 就不打印这一段"，
+// 于是采集失败与"真的 0 字节"在 /ping 上长得一样——都是没有这一行。
+func TestReportShowsProcessMemoryFailure(t *testing.T) {
+	orig := readProcessMemory
+	readProcessMemory = func() (sysinfo.ProcessMemory, error) {
+		return sysinfo.ProcessMemory{}, errors.New("注入的采集失败")
+	}
+	t.Cleanup(func() { readProcessMemory = orig })
+
+	p := newPlugin(t)
+	reply, err := p.Handle(context.Background(), ev("/ping", "/ping"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply == nil {
+		t.Fatal("应收到回复：采集失败不是整条报告失败")
+	}
+	if !strings.Contains(reply.Content, "本进程") || !strings.Contains(reply.Content, "采集失败") {
+		t.Errorf("采集失败未被显式展示：\n%s", reply.Content)
+	}
+	if strings.Contains(reply.Content, "峰值 0 B") {
+		t.Errorf("不应用 0 B 冒充峰值：\n%s", reply.Content)
+	}
 }
 
 func TestManifestDeclaresPing(t *testing.T) {
