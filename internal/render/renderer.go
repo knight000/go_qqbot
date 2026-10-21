@@ -513,12 +513,19 @@ func (l *layout) wrapMode(gs []glyph, maxW float64, keepIndent bool) [][]glyph {
 		cur, width, lastBreak = nil, 0, -1
 	}
 
-	for _, g := range gs {
+	for i := range gs {
+		g := gs[i]
 		if g.br {
 			flush()
 			continue
 		}
-		if width+g.adv > maxW && len(cur) > 0 {
+		// 一个字形相对行内前一个的推进量（含 kern）。折行判决与绘制必须
+		// 用同一个量，否则长行会提前断、行尾留缝。
+		a := g.adv
+		if n := len(cur); n > 0 {
+			a += kernOf(cur[n-1], g)
+		}
+		if width+a > maxW && len(cur) > 0 {
 			cut := lastBreak
 			if cut <= 0 {
 				// 整行没有任何合法断点：只能在字符间断开，否则会溢出画布。
@@ -534,15 +541,20 @@ func (l *layout) wrapMode(gs []glyph, maxW float64, keepIndent bool) [][]glyph {
 			}
 			cur = rest
 			width, lastBreak = 0, -1
-			for i, x := range cur {
-				width += x.adv
-				if i >= 1 && canBreak(cur[i-1].r, cur[i].r) {
-					lastBreak = i
+			for j := range cur {
+				width += pxAdvance(cur, j)
+				if j >= 1 && canBreak(cur[j-1].r, cur[j].r) {
+					lastBreak = j
 				}
+			}
+			// g 落到新行上：行首没有前一个字形，kern 不成立。
+			a = g.adv
+			if n := len(cur); n > 0 {
+				a += kernOf(cur[n-1], g)
 			}
 		}
 		cur = append(cur, g)
-		width += g.adv
+		width += a
 		if len(cur) >= 2 && canBreak(cur[len(cur)-2].r, cur[len(cur)-1].r) {
 			lastBreak = len(cur) - 1
 		}

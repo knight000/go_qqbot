@@ -148,6 +148,32 @@ func TestMutedBlockquoteLinkKeepsAccentColor(t *testing.T) {
 	}
 }
 
+// 折行判决与绘制必须用同一个推进量：font.Drawer 的测量（也是实际绘制）含
+// kern，而折行只累加 GlyphAdvance。少了 kern，长行会提前几个像素断，run
+// 边界还会留缝。
+//
+// 用一串负 kern 对（To/Ty/AV/LT…）把差值累加到几十像素，不会被舍入吃掉。
+func TestGlyphAdvancesIncludeKerning(t *testing.T) {
+	const pairs = "ToTyTeAVVaWwY.YoLT"
+	const s = pairs + pairs + pairs
+
+	l := newLayout(testRenderer(t).faces.scope(), "")
+	gs, err := l.glyphs([]span{{text: s}}, WeightRegular, fsBody)
+	if err != nil {
+		t.Fatalf("glyphs: %v", err)
+	}
+	f, err := l.faces.face(FontSans, WeightRegular, fsBody)
+	if err != nil {
+		t.Fatalf("face: %v", err)
+	}
+
+	want := measureString(f, s)
+	if got := glyphsWidth(gs); math.Abs(got-want) > 0.5 {
+		t.Errorf("字形序列推进量 = %.2f，Drawer 测量值 = %.2f，差 %.2f（折行判决漏了 kern）",
+			got, want, got-want)
+	}
+}
+
 // 五种行内样式混排在同一行：不报错、宽度仍是基线、能解出 PNG。
 func TestInlineStylesRenderTogether(t *testing.T) {
 	data := renderPNG(t, inlineSample+"\n\n同一行再来一次：**粗** *斜* `code` [链接](https://example.com/a) ~~删~~。")
