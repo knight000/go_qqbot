@@ -49,7 +49,7 @@ func TestUnknownEventNeverRoutesOrStores(t *testing.T) {
 	out := &syncBuffer{}
 	tr := NewTrace(out, LevelFull)
 	tr.SetUnknownPayload(true)
-	disp := NewDispatcher(router, NewSender(&fakeAPI{}, log, ActivePolicy{}, nil), log, time.Second)
+	disp := NewDispatcher(router, NewSender(&fakeAPI{}, log, ActivePolicy{}, nil, time.Local), log, time.Second)
 	disp.trace = tr
 
 	c := &Core{store: db, log: log, trace: tr, router: router, dispatch: disp}
@@ -95,7 +95,7 @@ func TestMessageStoresPlatformMsgType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("装配空路由: %v", err)
 	}
-	disp := NewDispatcher(router, NewSender(&fakeAPI{}, log, ActivePolicy{}, nil), log, time.Second)
+	disp := NewDispatcher(router, NewSender(&fakeAPI{}, log, ActivePolicy{}, nil, time.Local), log, time.Second)
 	c := &Core{store: db, log: log, router: router, dispatch: disp}
 
 	c.Handle(ctx, &host.Event{

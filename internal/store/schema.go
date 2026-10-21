@@ -103,8 +103,9 @@ var schema = []string{
 	// ——那是插件命名空间，插件一清前缀就把额度账抹了。
 	//
 	// 没有内存镜像：发送前用一条 upsert 原子地"检查 + 自增"，于是
-	// 重启不清零、并发与多进程都不会超发。day 取本地时区的 YYYY-MM-DD，
-	// 跨日就是新主键，换桶不需要任何重置动作。
+	// 重启不清零、并发与多进程都不会超发。day 取调度时区（Asia/Shanghai，
+	// 与 cron 同源，由核心注入）的 YYYY-MM-DD，跨日就是新主键，
+	// 换桶不需要任何重置动作。
 	activeUsageTableDDL,
 
 	adminTableDDL,

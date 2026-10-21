@@ -248,7 +248,7 @@ func newSessionDispatcher(t *testing.T, db *store.DB, plugins ...host.Plugin) (*
 		}
 	}
 	f := &fakeAPI{}
-	d := NewDispatcher(router, NewSender(f, log, ActivePolicy{}, nil), log, time.Second)
+	d := NewDispatcher(router, NewSender(f, log, ActivePolicy{}, nil, time.Local), log, time.Second)
 	d.sessions = sessionRows{db}
 	return d, f
 }
