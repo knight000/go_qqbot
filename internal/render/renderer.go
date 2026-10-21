@@ -513,12 +513,19 @@ func (l *layout) wrapMode(gs []glyph, maxW float64, keepIndent bool) [][]glyph {
 		cur, width, lastBreak = nil, 0, -1
 	}
 
-	for _, g := range gs {
+	for i := range gs {
+		g := gs[i]
 		if g.br {
 			flush()
 			continue
 		}
-		if width+g.adv > maxW && len(cur) > 0 {
+		// 一个字形相对行内前一个的推进量（含 kern）。折行判决与绘制必须
+		// 用同一个量，否则长行会提前断、行尾留缝。
+		a := g.adv
+		if n := len(cur); n > 0 {
+			a += kernOf(cur[n-1], g)
+		}
+		if width+a > maxW && len(cur) > 0 {
 			cut := lastBreak
 			if cut <= 0 {
 				// 整行没有任何合法断点：只能在字符间断开，否则会溢出画布。
@@ -534,25 +541,52 @@ func (l *layout) wrapMode(gs []glyph, maxW float64, keepIndent bool) [][]glyph {
 			}
 			cur = rest
 			width, lastBreak = 0, -1
-			for i, x := range cur {
-				width += x.adv
-				if i >= 1 && canBreak(cur[i-1].r, cur[i].r) {
-					lastBreak = i
+			for j := range cur {
+				width += pxAdvance(cur, j)
+				if j >= 1 && canBreak(cur[j-1].r, cur[j].r) {
+					lastBreak = j
 				}
+			}
+			// g 落到新行上：行首没有前一个字形，kern 不成立。
+			a = g.adv
+			if n := len(cur); n > 0 {
+				a += kernOf(cur[n-1], g)
 			}
 		}
 		cur = append(cur, g)
-		width += g.adv
+		width += a
 		if len(cur) >= 2 && canBreak(cur[len(cur)-2].r, cur[len(cur)-1].r) {
 			lastBreak = len(cur) - 1
 		}
 	}
 	flush()
+	padCodeLineStarts(lines)
 	if len(lines) == 0 {
 		// 空段落也是块：占一行高，否则 height 会与绘制遍错位。
 		lines = [][]glyph{{}}
 	}
 	return lines
+}
+
+// padCodeLineStarts 给折行后**每行**行首的代码字形补上药丸的左内边距。
+//
+// glyphs() 只把 padding 绑在 span 的首个字形上：折行把行内代码切成多行后，
+// 续行的首个字形没有这份 padding，药丸左缘会压在首字上（视觉裁切）。
+//
+// padL 必须同时加进 adv：drawLine 用 adv 之和当推进量、用 padL 当文字起点，
+// 只补 padL 不补 adv 会让文字跑出药丸的右缘（那是同一个缺陷的镜像）。
+// 代价是这些行比 maxW 宽出一个 padding，落在 padX 的右边距里，不会出画布。
+func padCodeLineStarts(lines [][]glyph) {
+	pad := inlinePad()
+	for i := 1; i < len(lines); i++ {
+		ln := lines[i]
+		// padL 非零说明这正是 span 的首字形，glyphs() 已经补过。
+		if len(ln) == 0 || !ln[0].code || ln[0].padL != 0 {
+			continue
+		}
+		ln[0].padL = pad
+		ln[0].adv += pad
+	}
 }
 
 // ---- 绘制基础件 ----

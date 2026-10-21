@@ -37,6 +37,58 @@ func TestTableLaysOutAsGrid(t *testing.T) {
 	}
 }
 
+// wideTableDoc 构造 ncol 列、每格都是 cell 的表格。
+//
+// 列多到一定数目后，内边距的下限（4px）与列宽的下限（1px）相加本身就超过
+// 可用宽度：ncol×9 > avail 时表格必然溢出，右边框被画布裁掉。
+func wideTableDoc(ncol int, cell string) string {
+	var sb strings.Builder
+	sb.WriteString("|")
+	for i := 0; i < ncol; i++ {
+		sb.WriteString(" " + cell + " |")
+	}
+	sb.WriteString("\n|")
+	for i := 0; i < ncol; i++ {
+		sb.WriteString(" --- |")
+	}
+	for row := 0; row < 2; row++ {
+		sb.WriteString("\n|")
+		for i := 0; i < ncol; i++ {
+			sb.WriteString(" " + cell + " |")
+		}
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+// 无论多少列，表格总宽都不得超过可用宽度：溢出的部分会被画布裁掉，而读者
+// 从图上看不出后面还有列。列宽被压到亚像素也比"内容静默消失"强。
+func TestWideTableNeverExceedsAvailableWidth(t *testing.T) {
+	for _, ncol := range []int{8, 16, 40, 113, 130, 300} {
+		src := wideTableDoc(ncol, "值")
+
+		l := newLayout(testRenderer(t).faces.scope(), src)
+		head, body, n := tableCells(parseTable(t, src), l.src)
+		if n != ncol {
+			t.Fatalf("%d 列表格解析出 %d 列", ncol, n)
+		}
+		tl, err := l.layoutTable(head, body, n)
+		if err != nil {
+			t.Fatalf("%d 列 layoutTable: %v", ncol, err)
+		}
+
+		avail := l.right - l.x
+		if tl.total > avail+0.5 {
+			t.Errorf("%d 列表格总宽 %.1f 超过可用宽度 %.1f，右边框会被裁掉", ncol, tl.total, avail)
+		}
+		for i, w := range tl.widths {
+			if w <= 0 {
+				t.Errorf("%d 列表格第 %d 列宽 %.3f，不允许退化成零或负宽", ncol, i, w)
+			}
+		}
+	}
+}
+
 // 单元格内容超宽时在单元格内折行，而不是把表格撑出画布。
 func TestTableWrapsWideCells(t *testing.T) {
 	short := "| 服务 | 状态 |\n| --- | --- |\n| qqbot | 运行中 |\n"
