@@ -196,6 +196,10 @@ var postMigrationStatements = []string{
 	// 旧的 (job_id, started_at) 没有任何查询用得上，只增加写放大。
 	`DROP INDEX IF EXISTS idx_job_runs`,
 	`CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at)`,
+
+	// PurgeExpiredKV 每 10 分钟一次：只给有 TTL 的行建部分索引，
+	// 永不过期的键（插件全局设置等）不付索引维护成本。
+	`CREATE INDEX IF NOT EXISTS idx_plugin_kv_expires ON plugin_kv(expires_at) WHERE expires_at IS NOT NULL`,
 }
 
 // jobTableDDL 单独提出来：旧库要把 jobs 从 id 主键重建成 (id, peer) 复合主键。
