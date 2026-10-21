@@ -2,8 +2,11 @@ package render
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
+
+	"github.com/yuin/goldmark/text"
 )
 
 // inlineSample 是行内样式的观感基准：同一行里混排加粗、斜体、行内代码、
@@ -72,6 +75,43 @@ func TestInlineTabAndControlCharsArePreprocessed(t *testing.T) {
 	}
 	if spaces <= 0 {
 		t.Error("tab 展开后的空格推进量为 0，对齐信息丢了")
+	}
+}
+
+// 折行把行内代码 span 切成多行后，**每行**行首的字形都要带药丸的左内边距：
+// 只在 span 首个字形上绑 padL 时，续行的药丸左缘会压在首字上（视觉裁切）。
+// padding 同时必须计入推进量，否则文字会跑出药丸的右缘。
+func TestCodeSpanContinuationLinesKeepLeftPad(t *testing.T) {
+	src := "前置文字 " + "`" + strings.Repeat("code ", 40) + "`"
+	l := newLayout(testRenderer(t).faces.scope(), src)
+	doc := markdown.Parser().Parse(text.NewReader([]byte(src)))
+	gs, err := l.glyphs(collectSpans(doc.FirstChild(), l.src), WeightRegular, fsBody)
+	if err != nil {
+		t.Fatalf("glyphs: %v", err)
+	}
+
+	maxW := l.right - l.x
+	pad := inlinePad()
+	continuations := 0
+	for i, ln := range l.wrap(gs, maxW) {
+		if i == 0 || len(ln) == 0 || !ln[0].code {
+			continue
+		}
+		continuations++
+		first := ln[0]
+		if first.padL != pad {
+			t.Errorf("第 %d 行（代码续行）行首 padL = %v，期望 %v", i, first.padL, pad)
+			continue
+		}
+		if adv, ok := first.f.GlyphAdvance(first.r); ok {
+			if want := float64(adv)/64 + pad; math.Abs(first.adv-want) > 0.01 {
+				t.Errorf("第 %d 行行首 adv = %.2f，期望 %.2f（字形推进量 + 药丸 padding）",
+					i, first.adv, want)
+			}
+		}
+	}
+	if continuations < 2 {
+		t.Fatalf("只有 %d 行代码续行，样例不够长，测不出折行后的 padding", continuations)
 	}
 }
 
