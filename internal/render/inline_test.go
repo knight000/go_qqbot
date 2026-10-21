@@ -115,6 +115,39 @@ func TestCodeSpanContinuationLinesKeepLeftPad(t *testing.T) {
 	}
 }
 
+// 引用块里的链接必须保留强调色：muted 只能压**非链接**正文。否则静态图里
+// 唯一的链接线索消失，链接与正文同色（GitHub 的 blockquote a 仍然是 accent）。
+func TestMutedBlockquoteLinkKeepsAccentColor(t *testing.T) {
+	src := "见 [发布页](https://example.com/releases) 与正文。"
+	l := newLayout(testRenderer(t).faces.scope(), src)
+	l.muted = true
+
+	doc := markdown.Parser().Parse(text.NewReader([]byte(src)))
+	gs, err := l.glyphs(collectSpans(doc.FirstChild(), l.src), WeightRegular, fsBody)
+	if err != nil {
+		t.Fatalf("glyphs: %v", err)
+	}
+
+	seenLink, seenMuted := 0, 0
+	for _, g := range gs {
+		switch g.r {
+		case '发', '布', '页', 'h', 'p', 's': // 链接文字与「文字 (url)」里的地址
+			seenLink++
+			if g.col != colAccent {
+				t.Errorf("链接字形 %q 的颜色 = %v，期望强调色 %v", g.r, g.col, colAccent)
+			}
+		case '正', '文':
+			seenMuted++
+			if g.col != colMuted {
+				t.Errorf("引用正文 %q 的颜色 = %v，期望 muted %v", g.r, g.col, colMuted)
+			}
+		}
+	}
+	if seenLink == 0 || seenMuted == 0 {
+		t.Fatalf("用例没有覆盖两类字形：链接 %d 个、正文 %d 个", seenLink, seenMuted)
+	}
+}
+
 // 五种行内样式混排在同一行：不报错、宽度仍是基线、能解出 PNG。
 func TestInlineStylesRenderTogether(t *testing.T) {
 	data := renderPNG(t, inlineSample+"\n\n同一行再来一次：**粗** *斜* `code` [链接](https://example.com/a) ~~删~~。")
