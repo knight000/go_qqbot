@@ -325,7 +325,7 @@ ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
 
 约 1 分钟内应收到上线私聊。**没收到就查 journalctl** —— 重启失败时进程已经退出，只能从日志里找原因。
 
-`go generate` 不带 `GOOS` 前缀（写成 `GOOS=linux go generate ...` 会让生成器按目标平台编译、在本机根本跑不起来）：它只读目录名、生成 blank import，与目标平台无关；交叉编译只加在后面的 `go build` 上。
+`go generate` 不带 `GOOS` 前缀（写成 `GOOS=linux go generate ...` 会让生成器按目标平台编译、在本机根本跑不起来）：它只做一层目录扫描 + 读 Go 源码找 `host.Register(`、生成 blank import，不编译也不加载，与目标平台无关；交叉编译只加在后面的 `go build` 上。
 
 ### 几个边界
 
