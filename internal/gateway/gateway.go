@@ -128,7 +128,7 @@ func (c *Client) Run(ctx context.Context) error {
 		// 等退避纯属白等，而且会让"我按了重置但十秒没反应"变成用户困惑。
 		if errors.Is(err, errManualReconnect) {
 			c.lg.Info("已断开当前连接，立即重连（保留 session，走 Resume）")
-			b.d = minBackoff
+			b.reset()
 			if !sleep(ctx, 100*time.Millisecond) {
 				return nil
 			}

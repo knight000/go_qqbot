@@ -117,6 +117,43 @@ func TestRateLimitedWaitsAtLeast60s(t *testing.T) {
 	}
 }
 
+// 连续"连上不到 5s 就断"必须进冷却：握手超时、token 被秒拒、平台 reset
+// 都属于这一类。只靠线性退避（1s/2s/4s）等于持续打 /gateway/bot 与 WSS 握手。
+func TestRepeatedQuickDisconnectsEnterCooldown(t *testing.T) {
+	var b backoff
+	// 前两次仍是正常退避：网络抖一下就 60s 冷却，反而把可用时间拖长。
+	b.note(0)
+	if w := b.next(0); w >= quickDisconnectCooldown {
+		t.Fatalf("第 1 次快速断连不该直接进冷却，实际等 %v", w)
+	}
+	b.note(0)
+	if w := b.next(0); w >= quickDisconnectCooldown {
+		t.Fatalf("第 2 次快速断连不该直接进冷却，实际等 %v", w)
+	}
+
+	// 第 quickDisconnectLimit 次连续快速断连：必须冷却够一个"别再来"的量级。
+	b.note(500 * time.Millisecond)
+	if w := b.next(0); w < quickDisconnectCooldown {
+		t.Fatalf("连续 %d 次快速断连后应至少等 %v，实际 %v", quickDisconnectLimit, quickDisconnectCooldown, w)
+	}
+
+	// 冷却之后计数清零：否则一次网络抖动会让之后每次重连都锁在 60s。
+	b.note(0)
+	if w := b.next(0); w >= quickDisconnectCooldown {
+		t.Fatalf("冷却已经付过一次，接下来应回到常规退避，实际 %v", w)
+	}
+
+	// 稳定 READY 过（>= stableReadyWindow）同样清零计数。
+	for i := 0; i < quickDisconnectLimit; i++ {
+		b.note(0)
+	}
+	b.note(stableReadyWindow + time.Second)
+	b.note(0)
+	if w := b.next(0); w >= quickDisconnectCooldown {
+		t.Fatalf("稳定 READY 之后快速断连计数应清零，实际等 %v", w)
+	}
+}
+
 // "连上 200ms 就断"不能把退避复位成 1s：那会让平台拒绝 token / 握手被 reset
 // 时退化成 1s 一次的快速撞墙。只有 READY 之后活够 stableReadyWindow 才复位。
 func TestBackoffResetsOnlyAfterStableReady(t *testing.T) {

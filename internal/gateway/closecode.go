@@ -164,22 +164,74 @@ const (
 // 没有上限，平台"接受 WS + 心跳回 ACK + 不回 READY"就会让读循环永久阻塞。
 const defaultHandshakeTimeout = 30 * time.Second
 
+// 快速断连的三个口径（量级取自官方 SDK 的做法：短时间连续三次失败后长冷却）。
+const (
+	// quickDisconnectWindow 是"这次算白连"的寿命门槛：连上（或压根没 READY）
+	// 不到 5s 就断，就记一次。
+	quickDisconnectWindow = 5 * time.Second
+	// quickDisconnectLimit 是连续多少次之后进冷却。
+	quickDisconnectLimit = 3
+	// quickDisconnectCooldown 是进冷却后这一轮至少等多久：不能比 4008 的
+	// 60s 更短，否则"握手超时 → 立刻重连 → 再超时"仍是每分钟打一遍平台。
+	quickDisconnectCooldown = 60 * time.Second
+)
+
 // backoff 是重连退避的状态机：Run 每轮先用 note 汇报上一条连接活了多久，
 // 再用 next 取本轮该等多久。把它抽出来是为了让"短命连接不复位"这条
 // 口径能被单测钉住，而不是埋在 Run 的循环里。
+//
+// 它同时记着"连续几次连上就没"：只有线性退避的话，平台侧持续失败
+// （token 被秒拒、握手不回 READY、NAT 半开）会变成 1s/2s/4s 一把一把地
+// 打 /gateway/bot，需要一段明确的冷却期让平台侧恢复。
 type backoff struct {
 	d time.Duration
+	// quick 是连续"寿命 < quickDisconnectWindow"的连接数；一次稳定 READY
+	// 或一次冷却之后清零。
+	quick int
 }
 
-// note 记录上一条连接的寿命，只有稳定过才复位。
+// note 记录上一条连接的寿命。
+//
+// 复位规则只有一条：READY 之后活够 stableReadyWindow 才把退避和快速断连
+// 计数一起清零。寿命落在 [quickDisconnectWindow, stableReadyWindow) 的连接
+// 不算稳定（不复位），但也说明握手成功过、链路不是秒断，所以清掉快速断连
+// 计数——否则"每次连上 10s 掉线"会莫名其妙吃到 60s 冷却。
 func (b *backoff) note(readyFor time.Duration) {
 	if readyFor >= stableReadyWindow {
 		b.d = minBackoff
+		b.quick = 0
+		return
 	}
+	if readyFor < quickDisconnectWindow {
+		b.quick++
+		return
+	}
+	b.quick = 0
+}
+
+// reset 用于手动重连（/reset reconnect）：它是人按的，不该被算作快速断连，
+// 也不该让人等退避。
+func (b *backoff) reset() {
+	b.d = minBackoff
+	b.quick = 0
 }
 
 // next 返回本轮实际等待：带抖动的当前退避，且不小于 min；随后把基础退避翻倍。
+// 连续快速断连达到上限时，本轮改为至少等 quickDisconnectCooldown，并把
+// 退避与计数一起重置——冷却已经付过，之后重新从 1s 爬。
 func (b *backoff) next(min time.Duration) time.Duration {
+	if b.quick >= quickDisconnectLimit {
+		b.quick = 0
+		b.d = minBackoff
+		if min < quickDisconnectCooldown {
+			min = quickDisconnectCooldown
+		}
+		wait := jitter(min)
+		if wait < min {
+			wait = min
+		}
+		return wait
+	}
 	base := b.d
 	if base < minBackoff {
 		base = minBackoff
