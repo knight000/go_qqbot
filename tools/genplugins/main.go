@@ -75,10 +75,15 @@ func moduleRoot() (string, error) {
 	}
 }
 
-// pluginDirs 返回 plugins/ 下所有含非测试 Go 源码的目录名，按字典序。
+// pluginDirs 返回 plugins/ 下所有"能真正注册"的插件目录名，按字典序。
 //
-// 只认直接子目录：插件的内部包（如 plugins/foo/api）由插件自己 import，
-// 不能在这里重复引导。
+// 判据不是"目录里有 package"，而是"该目录（含一层子包）出现过 host.Register("。
+// 两者不等价：插件代码放在 plugins/foo/plugin/ 里、根目录只剩一个不 import 它的
+// 空包，或者目录其实是共享库时，blank import 照样能编译通过，但 host.Registered()
+// 里永远不会有它——现场表现是"构建全绿、指令没反应"（P3-19）。
+//
+// 一层子包是必须的：插件仓的根包只做 blank import 转发（ARCHITECTURE §3.5）
+// 是合法形态，注册调用在子包里。
 func pluginDirs(root string) ([]string, error) {
 	base := filepath.Join(root, "plugins")
 	entries, err := os.ReadDir(base)
@@ -91,19 +96,71 @@ func pluginDirs(root string) ([]string, error) {
 			continue
 		}
 		name := e.Name()
-		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+		if skipEntry(name) {
 			continue
 		}
-		ok, err := hasGoSource(filepath.Join(base, name))
+		dir := filepath.Join(base, name)
+		rootSrc, err := hasGoSource(dir)
 		if err != nil {
 			return nil, err
 		}
-		if ok {
+		registered, err := hasRegisterCall(dir, 1)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case rootSrc && registered:
 			names = append(names, name)
+		case rootSrc:
+			return nil, fmt.Errorf("plugins/%s: 目录里有 Go 源码，但（含一层子包）找不到 host.Register(——它不会被注册", name)
+		case registered:
+			return nil, fmt.Errorf("plugins/%s: 注册代码只在子包里，根包没有 Go 源文件；按约定根包应 blank import 子包", name)
+		default:
+			// 既没有根包源码、也没有注册调用：不是插件（文档、共享资源目录），跳过。
 		}
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// hasRegisterCall 报告 dir 及其 depth 层子包里是否出现过 host.Register(。
+//
+// 只做文本匹配：目的不是判断代码是否合法，而是挡住"目录里有包就当成插件"
+// 这个更宽松、也更危险的判据。注册调用写在注释里会被误判为通过，代价可以接受。
+func hasRegisterCall(dir string, depth int) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			if depth <= 0 || skipEntry(name) {
+				continue
+			}
+			ok, err := hasRegisterCall(filepath.Join(dir, name), depth-1)
+			if err != nil || ok {
+				return ok, err
+			}
+			continue
+		}
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return false, err
+		}
+		if bytes.Contains(data, []byte("host.Register(")) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// skipEntry 跳过编辑器/工具目录与 Go 约定忽略的 "_" 前缀目录。
+func skipEntry(name string) bool {
+	return strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")
 }
 
 func hasGoSource(dir string) (bool, error) {
