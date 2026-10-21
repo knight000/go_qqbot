@@ -2,6 +2,9 @@
 //
 // 内置插件在本文件 blank import（P1 编译期注册，见 ARCHITECTURE.md §3.1）；
 // plugins/ 下的其余插件由 tools/genplugins 生成到 plugins_gen.go，见 §3.5。
+// 生成物不入库（.gitignore），所以构建前必须先跑 go generate ./cmd/bot：
+// 少了这一步，新放进 plugins/ 的插件不会被链接进二进制，启动日志里的插件
+// 名单也不会多出它。
 //
 //go:generate go run ../../tools/genplugins
 package main
@@ -234,18 +237,19 @@ func run() (*core.RestartRequest, error) {
 	}()
 
 	bi := buildinfo.Get()
-	log.Info("qqbot 启动完成",
-		"config", *cfgPath,
-		"db", db.Path(),
-		"lock", lock.Path(),
-		"app_lock", lock.AppPath(),
-		"sandbox", cfg.App.Sandbox,
-		"debug", cfg.Debug.Enabled,
-		"version", bi.String(),
-		"platform", bi.Platform,
-		"go", bi.GoVer,
-		"restarted", buildinfo.RestartedByReload(),
-		"plugins", len(host.Registered()))
+	logStartup(log, startupInfo{
+		ConfigPath:  *cfgPath,
+		DBPath:      db.Path(),
+		LockPath:    lock.Path(),
+		AppLockPath: lock.AppPath(),
+		Sandbox:     cfg.App.Sandbox,
+		Debug:       cfg.Debug.Enabled,
+		Version:     bi.String(),
+		Platform:    bi.Platform,
+		GoVersion:   bi.GoVer,
+		Restarted:   buildinfo.RestartedByReload(),
+		Plugins:     host.Registered(),
+	})
 	if buildinfo.RestartedByReload() {
 		log.Info("本次启动由 /reload 触发", "version", bi.String())
 	}
@@ -366,4 +370,50 @@ func formatDomainLimits(limits map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%s=%d", h, limits[h]))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// startupInfo 是"启动完成"那一行需要的事实。抽成结构体是为了让日志内容可测。
+type startupInfo struct {
+	ConfigPath  string
+	DBPath      string
+	LockPath    string
+	AppLockPath string
+	Sandbox     bool
+	Debug       bool
+	Version     string
+	Platform    string
+	GoVersion   string
+	Restarted   bool
+	Plugins     []host.Plugin
+}
+
+// logStartup 打印启动完成。插件既报数量也报名字：
+//
+// 只报 plugins=4 时，"新插件没进二进制"与"插件进去了但没注册"看起来一模一样，
+// 现场只能靠"指令没反应"反推，而构建日志里全是成功（P3-17）。
+func logStartup(log *slog.Logger, in startupInfo) {
+	log.Info("qqbot 启动完成",
+		"config", in.ConfigPath,
+		"db", in.DBPath,
+		"lock", in.LockPath,
+		"app_lock", in.AppLockPath,
+		"sandbox", in.Sandbox,
+		"debug", in.Debug,
+		"version", in.Version,
+		"platform", in.Platform,
+		"go", in.GoVersion,
+		"restarted", in.Restarted,
+		"plugins", len(in.Plugins),
+		"plugin_names", pluginNames(in.Plugins))
+}
+
+// pluginNames 把已注册插件按名字排序后用逗号连起来。
+// 排序只为两次启动能逐字比对——host.Registered() 的顺序取决于 import 顺序。
+func pluginNames(plugins []host.Plugin) string {
+	names := make([]string, 0, len(plugins))
+	for _, p := range plugins {
+		names = append(names, p.Manifest().Name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }

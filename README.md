@@ -35,7 +35,7 @@ go run ./cmd/bot          # 不填 -c 时默认读相对路径 config/config.loc
 
 默认路径是**相对当前工作目录**的 `config/config.local.toml`；换目录启动或改用 `/etc/qqbot/config.toml` 时用 `-c <路径>` 指定。
 
-私有插件放进 `plugins/<repo>/` 后，跑一次 `go generate ./cmd/bot` 把它编进二进制。生成物 `cmd/bot/plugins_gen.go` 不入库，所以核心仓克隆下来只带示例插件（见 ARCHITECTURE §3.5）。
+私有插件放进 `plugins/<repo>/` 后，跑一次 `go generate ./cmd/bot` 把它编进二进制。生成物 `cmd/bot/plugins_gen.go` 不入库，所以核心仓克隆下来只带示例插件（见 ARCHITECTURE §3.5）。启动日志的 `plugins` 数量后面跟着 `plugin_names`，可以直接看出新插件是否真的链接进来了。
 
 启动日志里会出现：
 
@@ -314,8 +314,8 @@ go run ./tools/devrun -c config/config.local.toml
 ### 部署更新的完整步骤
 
 ```bash
-# 1. 构建
-GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o qqbot ./cmd/bot
+# 1. 生成插件装配并构建（少了 go generate，新放进 plugins/ 的插件不会进二进制）
+go generate ./cmd/bot && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o qqbot ./cmd/bot
 # 2. 覆盖服务器上的二进制（Linux 允许替换正在运行的文件，不需要先停服务）
 scp qqbot server:/opt/qqbot/bin/qqbot.new
 ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
@@ -471,7 +471,7 @@ CPU  12.3%（8 核）
 生产构建：
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/bot
+go generate ./cmd/bot && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/bot
 ```
 
 > 需要 Go 1.26+：`modernc.org/sqlite v1.60` 的 `go` 指令要求。实测 `GOOS=linux` 交叉编译产物约 16 MB（`-s -w` 后更小），无需 cgo。
