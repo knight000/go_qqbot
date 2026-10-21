@@ -446,13 +446,22 @@ func (s *Sender) refundActiveBudgetOnBusinessError(ctx context.Context, scene ho
 	if s.active.DailyPerPeer <= 0 || s.usage == nil {
 		return
 	}
-	key := store.ActiveUsageKey{
-		Day:   s.now().Format("2006-01-02"),
-		Scene: string(scene),
-		Peer:  peerID,
-	}
+	key := s.usageKey(scene, peerID)
 	if err := s.usage.RefundActiveBudget(ctx, key); err != nil {
 		s.log.Warn("归还主动消息额度失败", "scene", scene, "peer", peerID, "err", err)
+	}
+}
+
+// usageKey 是主动消息日预算的账本坐标。
+//
+// 占格与归还必须算出同一个 key，否则"还到别的桶"等于没还。切日时区与 cron
+// 同源（平台配额按这个自然日重置），所以只能有一处格式化。
+func (s *Sender) usageKey(scene host.Scene, peerID string) store.ActiveUsageKey {
+	return store.ActiveUsageKey{
+		// 与 cron 同一个时区：平台配额按这个自然日重置，换桶也必须按它。
+		Day:   s.now().In(s.loc).Format("2006-01-02"),
+		Scene: string(scene),
+		Peer:  peerID,
 	}
 }
 
@@ -468,11 +477,6 @@ func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID 
 		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
 		return false, errors.New("未配置主动消息额度账本")
 	}
-	key := store.ActiveUsageKey{
-		// 与 cron 同一个时区：平台配额按这个自然日重置，换桶也必须按它。
-		Day:   s.now().In(s.loc).Format("2006-01-02"),
-		Scene: string(scene),
-		Peer:  peerID,
-	}
+	key := s.usageKey(scene, peerID)
 	return s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
 }
