@@ -24,6 +24,7 @@ var (
 	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
 	// ErrRateLimited 表示平台返回 429。官方只给状态码 + err_code + trace_id，
 	// 不提供剩余额度，也不承诺 Retry-After，因此退避策略必须由本地按维度决定。
+	// 冷却期内（见 Sender.cooldowns）也会直接返回它，且不出网。
 	ErrRateLimited = errors.New("平台限流(HTTP 429)")
 )
 
@@ -79,6 +80,12 @@ type Sender struct {
 	mu      sync.Mutex
 	windows map[string]*passiveWindow
 	lastGC  time.Time
+	// cooldowns 是 (scene, peer) 的 429 冷却截止时间。
+	//
+	// 平台罚的是会话，不是某条消息：同一 peer 换个 msg_id 再来同样撞墙，
+	// 而每撞一次都会把惩罚窗口续期、再烧一格域名桶的令牌、甚至挤掉同域的
+	// 群名刷新。冷却期内直接 ErrRateLimited、不出网，比"退避后重试"正确。
+	cooldowns map[string]time.Time
 }
 
 type passiveWindow struct {
@@ -97,13 +104,14 @@ type passiveWindow struct {
 // 不设默认值：一个"忘了注入就用本地时区"的兜底正是 P2-4 那个 bug 本身。
 func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore, loc *time.Location) *Sender {
 	return &Sender{
-		api:     api,
-		log:     log,
-		active:  active,
-		usage:   usage,
-		loc:     loc,
-		now:     time.Now,
-		windows: make(map[string]*passiveWindow),
+		api:       api,
+		log:       log,
+		active:    active,
+		usage:     usage,
+		loc:       loc,
+		now:       time.Now,
+		windows:   make(map[string]*passiveWindow),
+		cooldowns: make(map[string]time.Time),
 	}
 }
 
@@ -189,6 +197,10 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 	if ev.MsgID == "" {
 		return 0, fmt.Errorf("缺少 msg_id，无法被动回复")
 	}
+	// 冷却检查放在最前面：被 429 罚下的会话，上传与占位都不该再做一遍。
+	if wait := s.coolingDown(ev.Scene, ev.PeerID); wait > 0 {
+		return 0, rateLimitedError(ev.Scene, ev.PeerID, wait)
+	}
 
 	// 先上传再占位：图片不存在、格式不对、超限都不该吃掉一格被动配额。
 	body, err := s.bodyFor(ctx, ev.Scene, ev.PeerID, msg)
@@ -208,11 +220,66 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 		// 否则连着几条被风控挡掉，正常回复也会发不出去。
 		s.releasePassiveOnBusinessError(ev.MsgID, err)
 		if httpx.IsStatus(err, 429) {
-			return seq, fmt.Errorf("%w (seq=%d): %v", ErrRateLimited, seq, err)
+			// 冷却时长与出站层同源：httpx 已把 Retry-After（缺省 60s）解析好，
+			// 本地再拍一个值只会两层窗口不一致（短了还会撞墙，长了就是白等）。
+			wait := httpx.RetryAfter(err)
+			s.startCooldown(ev.Scene, ev.PeerID, wait)
+			return seq, fmt.Errorf("%w (seq=%d, 冷却 %s): %v", ErrRateLimited, seq, wait, err)
 		}
 		return seq, fmt.Errorf("发送消息(seq=%d): %w", seq, err)
 	}
 	return seq, nil
+}
+
+// rateLimitedError 说明"没出网"的原因与还要等多久，日志里能直接对上平台窗口。
+func rateLimitedError(scene host.Scene, peer string, wait time.Duration) error {
+	return fmt.Errorf("%w（%s %s 冷却中，还需 %s）", ErrRateLimited, scene, peer, wait.Round(time.Second))
+}
+
+// cooldownKey 用场景 + peer 定位一次限流惩罚。msg_id 不参与：平台罚的是会话。
+func cooldownKey(scene host.Scene, peer string) string {
+	return string(scene) + "\x00" + peer
+}
+
+// coolingDown 返回该会话剩余的冷却时长；0 表示可以出网。
+//
+// 过期的条目在读取时顺手删掉：冷却窗口只有几十秒，表的大小天然被
+// "这段时间内被限流过的会话数"箍住，不需要额外的 GC 周期。
+func (s *Sender) coolingDown(scene host.Scene, peer string) time.Duration {
+	key := cooldownKey(scene, peer)
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	until, ok := s.cooldowns[key]
+	if !ok {
+		return 0
+	}
+	if !now.Before(until) {
+		delete(s.cooldowns, key)
+		return 0
+	}
+	return until.Sub(now)
+}
+
+// startCooldown 记一次冷却。重复的 429 只延长、不缩短（取较晚的截止时间）：
+// 惩罚窗口是平台的事实，本地两次记账不该把它越算越短。
+func (s *Sender) startCooldown(scene host.Scene, peer string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := cooldownKey(scene, peer)
+	until := now.Add(d)
+	if cur, ok := s.cooldowns[key]; !ok || until.After(cur) {
+		s.cooldowns[key] = until
+	}
+	for k, t := range s.cooldowns {
+		if !now.Before(t) {
+			delete(s.cooldowns, k)
+		}
+	}
 }
 
 // releasePassiveOnBusinessError 把一格被动配额还回去。
@@ -400,6 +467,11 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	if peerID == "" {
 		return fmt.Errorf("缺少 peer openid")
 	}
+	// 冷却检查必须在扣日预算之前：冷却期内被挡下的请求既不出网，也不该
+	// 烧掉一格按天计的额度。
+	if wait := s.coolingDown(scene, peerID); wait > 0 {
+		return rateLimitedError(scene, peerID, wait)
+	}
 	// 主动消息的日预算比被动窗口稀缺得多（按天计），所以先扣预算再上传：
 	// 额度已尽时不该再浪费一次上传。被动回复反过来——窗口 5 分钟就过期。
 	//
@@ -424,7 +496,9 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	if err := s.api.SendMessage(ctx, string(scene), peerID, body); err != nil {
 		s.refundActiveBudgetOnBusinessError(ctx, scene, peerID, err)
 		if httpx.IsStatus(err, 429) {
-			return fmt.Errorf("%w: %v", ErrRateLimited, err)
+			wait := httpx.RetryAfter(err)
+			s.startCooldown(scene, peerID, wait)
+			return fmt.Errorf("%w（冷却 %s）: %v", ErrRateLimited, wait, err)
 		}
 		return fmt.Errorf("发送主动消息: %w", err)
 	}
