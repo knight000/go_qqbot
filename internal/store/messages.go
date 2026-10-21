@@ -101,16 +101,6 @@ func purgeResult(res sql.Result) (int64, error) {
 	return n, nil
 }
 
-// DeletePeerMessages 用于 R2 重置（脚手架阶段尚未接指令，先提供能力）。
-func (db *DB) DeletePeerMessages(ctx context.Context, peer string) (int64, error) {
-	res, err := db.w.ExecContext(ctx, `DELETE FROM messages WHERE peer_openid = ?`, peer)
-	if err != nil {
-		return 0, fmt.Errorf("清理 peer 消息: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	return n, nil
-}
-
 // IncrementalVacuum 回收空闲页，避免每月一次全库 VACUUM。
 func (db *DB) IncrementalVacuum(ctx context.Context) error {
 	if _, err := db.w.ExecContext(ctx, `PRAGMA incremental_vacuum(200)`); err != nil {
