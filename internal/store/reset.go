@@ -75,11 +75,15 @@ func (c ResetCounts) Total() int64 {
 //
 // 必须在删行**之前**调用：媒体行一旦删掉，文件就成了无引用的孤儿，
 // 只能靠扫盘发现，而扫盘在低配机上很贵（§8.3 第三条硬约定）。
+//
+// `message_id IS NULL` 的行也要算进来：它们没有会话归属，用 INNER JOIN
+// 时既不在这里出现、也不在 ClearPeerData 里被删，任何一次 R2 都碰不到。
 func (db *DB) PeerMediaPaths(ctx context.Context, peer string) ([]string, error) {
 	rows, err := db.r.QueryContext(ctx,
 		`SELECT m.path FROM media m
-		 JOIN messages msg ON msg.id = m.message_id
-		 WHERE msg.peer_openid = ? AND m.path <> ''`, peer)
+		 WHERE (m.message_id IS NULL OR m.message_id IN
+		        (SELECT id FROM messages WHERE peer_openid = ?))
+		   AND m.path <> ''`, peer)
 	if err != nil {
 		return nil, fmt.Errorf("读取 peer 媒体路径: %w", err)
 	}
@@ -173,8 +177,11 @@ func (db *DB) ClearPeerData(ctx context.Context, peer string) (ResetCounts, erro
 	defer func() { _ = tx.Rollback() }()
 
 	// 先删媒体行（此时 messages 还在，子查询能取到 id），再删消息。
+	// message_id IS NULL 的行没有会话归属，任何一次 R2 都命中不了它们，
+	// 只能在这里一并回收——否则它们会留在库里、文件也没人删。
 	res, err := tx.ExecContext(ctx,
-		`DELETE FROM media WHERE message_id IN (SELECT id FROM messages WHERE peer_openid = ?)`, peer)
+		`DELETE FROM media WHERE message_id IS NULL OR message_id IN
+			(SELECT id FROM messages WHERE peer_openid = ?)`, peer)
 	if err != nil {
 		return c, fmt.Errorf("清理媒体行: %w", err)
 	}
@@ -280,8 +287,11 @@ func (db *DB) PeerStats(ctx context.Context, peer string) (ResetCounts, error) {
 		`SELECT COUNT(*) FROM messages WHERE peer_openid = ?`, peer).Scan(&c.Messages); err != nil {
 		return c, fmt.Errorf("统计 peer 消息: %w", err)
 	}
+	// 媒体口径必须与 ClearPeerData 完全一致：预览少算一类行，就会出现
+	// "说清 0 个、实际删了 1 个"的账。
 	if err := db.r.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM media WHERE message_id IN (SELECT id FROM messages WHERE peer_openid = ?)`,
+		`SELECT COUNT(*) FROM media WHERE message_id IS NULL OR message_id IN
+			(SELECT id FROM messages WHERE peer_openid = ?)`,
 		peer).Scan(&c.MediaRows); err != nil {
 		return c, fmt.Errorf("统计 peer 媒体: %w", err)
 	}
