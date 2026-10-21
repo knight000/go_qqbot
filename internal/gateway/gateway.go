@@ -49,6 +49,13 @@ var ErrNotConnected = errors.New("网关当前未连接")
 // 不是链路故障，所以 Run 不该等退避。
 var errManualReconnect = errors.New("手动断开连接")
 
+// errHandshakeTimeout 表示连接建起来了，但握手没走完：发过 Identify/Resume，
+// 在 defaultHandshakeTimeout 内没收到 READY/RESUMED。
+//
+// 它必须与普通读错误区分开——两者在日志里都长成一条 EOF，而现场的含义完全不同：
+// 前者是"这条连接从没可用过"，后者是"用过的连接断了"。
+var errHandshakeTimeout = errors.New("握手超时")
+
 type Client struct {
 	o  Options
 	lg *slog.Logger
@@ -58,6 +65,10 @@ type Client struct {
 	invalidateToken func()
 	// hc 只用于 WSS 握手。
 	hc *http.Client
+
+	// handshakeTimeout 是 Identify/Resume 之后等 READY/RESUMED 的上限。
+	// 做成字段只为让测试注入短超时，正常路径永远是 defaultHandshakeTimeout。
+	handshakeTimeout time.Duration
 
 	mu        sync.Mutex
 	sessionID string
@@ -75,7 +86,7 @@ func New(o Options) *Client {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	c := &Client{o: o, lg: o.Log.With("component", "gateway")}
+	c := &Client{o: o, lg: o.Log.With("component", "gateway"), handshakeTimeout: defaultHandshakeTimeout}
 	if o.API != nil {
 		c.invalidateToken = o.API.InvalidateToken
 	}
@@ -117,7 +128,7 @@ func (c *Client) Run(ctx context.Context) error {
 		// 等退避纯属白等，而且会让"我按了重置但十秒没反应"变成用户困惑。
 		if errors.Is(err, errManualReconnect) {
 			c.lg.Info("已断开当前连接，立即重连（保留 session，走 Resume）")
-			b.d = minBackoff
+			b.reset()
 			if !sleep(ctx, 100*time.Millisecond) {
 				return nil
 			}
@@ -216,6 +227,9 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 
+	// hsOp 记录这一轮实际发出的握手请求：超时日志要能看出是 Identify 还是
+	// Resume 没被回应，两者的处置方向不同。
+	hsOp := opIdentify
 	if c.willResume() {
 		if err := c.sendResume(ctx, ws, token); err != nil {
 			c.lg.Warn("发送 Resume 失败，改为 Identify", "err", err)
@@ -224,6 +238,7 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 				return 0, err
 			}
 		} else {
+			hsOp = opResume
 			c.mu.Lock()
 			sid, seq := c.sessionID, c.seq
 			c.mu.Unlock()
@@ -235,6 +250,15 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 		}
 	}
 
+	// 握手定时器：Identify/Resume 只是"请求接入"，READY/RESUMED 才是"接入成功"。
+	// 缺了这一段，平台接受 WS、心跳照常回 ACK、但 READY 帧丢失（或 Identify
+	// 未被授权）时，下面的读循环会永远阻塞——Run 不返回、不重连，表现是
+	// "进程在线、心跳正常、一条消息都不回"，而日志里连异常都没有。
+	hsCtx, hsCancel := context.WithCancel(ctx)
+	defer hsCancel()
+	hs := &handshakeState{}
+	go c.watchHandshake(hsCtx, ws, hsOp, hs)
+
 	var ackMu sync.Mutex
 	acked := true
 	go c.heartbeatLoop(hbCtx, ws, interval, &ackMu, &acked)
@@ -244,6 +268,12 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 		if err != nil {
 			if c.takeManual() {
 				return 0, errManualReconnect
+			}
+			if hs.aborted() {
+				// 不再往下走 onReadError：这条连接从没 READY 过，关闭码是
+				// 我们自己发的，拿它做 session 迁移没有意义。
+				return 0, fmt.Errorf("%w（%s 发出后 %s 内未收到 READY/RESUMED）: %v",
+					errHandshakeTimeout, opcodeName(hsOp), c.handshakeTimeout, err)
 			}
 			// 关闭码在这里被翻译成"下一步做什么"：session 的迁移必须发生在
 			// 读错误出口，否则下一轮 connectOnce 还会做出同样的错误选择。
@@ -264,9 +294,13 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 		switch p.Op {
 		case opDispatch:
 			if p.T == "READY" {
+				hs.markReady()
+				hsCancel()
 				c.onReady(ctx, p.D)
 				readySince = time.Now()
 			} else if p.T == "RESUMED" {
+				hs.markReady()
+				hsCancel()
 				c.lg.Info("Resume 成功，事件不中断")
 				readySince = time.Now()
 			} else {
@@ -289,6 +323,73 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 		default:
 			c.lg.Debug("未处理的 opcode", "op", p.Op)
 		}
+	}
+}
+
+// handshakeState 记录这一轮握手的结果：读循环的错误出口靠它区分
+// 「握手超时」与「连接断开」——两者在日志里都只是一条 EOF。
+type handshakeState struct {
+	mu    sync.Mutex
+	ready bool
+	timed bool
+}
+
+// markReady 在 READY/RESUMED 到达时调用。定时器随后会自行退出。
+func (h *handshakeState) markReady() {
+	h.mu.Lock()
+	h.ready = true
+	h.mu.Unlock()
+}
+
+// aborted 报告"这条连接是因为握手没完成、被我们自己断掉的"。
+// 定时器和 READY 可能几乎同时到达：只要 READY 已经被处理过就不算超时，
+// 否则日志会把一条刚接通的连接说成握手失败。
+func (h *handshakeState) aborted() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.timed && !h.ready
+}
+
+// watchHandshake 是握手截止：窗口内没等到 READY/RESUMED 就主动关连接，
+// 让读循环立刻从 ws.Read 返回，Run 随后走常规重连。
+//
+// 它不能省成"心跳没 ACK 才断"：心跳只证明链路活着，不证明这次接入成功。
+func (c *Client) watchHandshake(ctx context.Context, ws *websocket.Conn, op int, hs *handshakeState) {
+	t := time.NewTimer(c.handshakeTimeout)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-t.C:
+		hs.mu.Lock()
+		if hs.ready {
+			hs.mu.Unlock()
+			return
+		}
+		hs.timed = true
+		hs.mu.Unlock()
+
+		c.lg.Error("握手超时：已发出握手但未收到 READY/RESUMED，主动断开重连",
+			"op", opcodeName(op), "opcode", op,
+			"timeout", c.handshakeTimeout.String(),
+			"note", "心跳 ACK 正常不代表这条连接可用")
+		// 用 CloseNow 而不是 Close：宽限期里对端大概率也在傻等（平台侧
+		// 就是把 READY 弄丢的那一方），而 Close 要等它回 close 帧——最多 5s，
+		// 正好把一次干净的快速重连拖成"连上就卡"。
+		_ = ws.CloseNow()
+	}
+}
+
+// opcodeName 只为人读日志：握手超时要看得出是哪一步没完成。
+func opcodeName(op int) string {
+	switch op {
+	case opIdentify:
+		return "Identify"
+	case opResume:
+		return "Resume"
+	default:
+		return fmt.Sprintf("op%d", op)
 	}
 }
 
