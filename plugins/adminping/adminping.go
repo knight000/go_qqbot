@@ -31,6 +31,10 @@ import (
 
 func init() { host.Register(&Plugin{}) }
 
+// readProcessMemory 是本进程内存的采集入口。做成变量只为一件事：支持平台上
+// 真实采集几乎不会失败，"采集失败"分支只能靠注入来验证。
+var readProcessMemory = sysinfo.ReadProcessMemory
+
 type Plugin struct {
 	log *slog.Logger
 }
@@ -58,8 +62,12 @@ func (p *Plugin) Init(ctx context.Context, h host.Host) error {
 	return nil
 }
 
+// Handle 只认路由层填好的 Event.Command：`/ping` 命中的事件才投递过来，
+// 匹配规则（含大小写敏感、词边界）由 core.argsAfterPrefix 统一决定。
+// 插件不再按原文再判一次——那会让"这是不是一条指令"出现第二个仲裁者，
+// 也会把路由层刻意排除的大小写变体（`/PING`）放进来。
 func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
-	if !isPing(ev.Content) {
+	if ev.Command != "/ping" {
 		return nil, nil
 	}
 
@@ -70,13 +78,6 @@ func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error
 		return &host.Reply{Content: "/pong（指标采集失败：" + err.Error() + "）"}, nil
 	}
 	return &host.Reply{Content: text}, nil
-}
-
-// isPing 只认精确的 /ping，避免 /pingxxx 被误判。
-// Manifest 里的前缀匹配是粗筛，真正"这是不是一条指令"由这里决定。
-func isPing(content string) bool {
-	fields := strings.Fields(strings.TrimSpace(content))
-	return len(fields) > 0 && strings.EqualFold(fields[0], "/ping")
 }
 
 func (p *Plugin) report(ctx context.Context) (string, error) {
@@ -111,19 +112,23 @@ func (p *Plugin) report(ctx context.Context) (string, error) {
 		fmt.Fprintf(&b, "CPU  %.1f%%（%d 核）\n", cpu.Percent, cpu.Cores)
 	}
 
-	// 3. 内存
+	// 3. 内存：整机一行、本进程一行。两者是独立数据源，整机取不到不该把
+	// 本进程也抹掉；本进程取不到要显式说"采集失败"，而不是让整行消失。
 	mem, memErr := sysinfo.ReadMemory()
 	if memErr != nil {
 		fmt.Fprintf(&b, "内存 采集失败（%v）\n", memErr)
 	} else {
-		fmt.Fprintf(&b, "内存 %s / %s（%.1f%%）",
+		fmt.Fprintf(&b, "内存 %s / %s（%.1f%%）\n",
 			sysinfo.HumanBytes(int64(mem.Used)),
 			sysinfo.HumanBytes(int64(mem.Total)),
 			mem.Percent)
-		if mem.ProcessRSS > 0 {
-			fmt.Fprintf(&b, "｜本进程 %s", sysinfo.HumanBytes(int64(mem.ProcessRSS)))
-		}
-		b.WriteString("\n")
+	}
+	if pm, err := readProcessMemory(); err != nil {
+		fmt.Fprintf(&b, "本进程 采集失败（%v）\n", err)
+	} else {
+		fmt.Fprintf(&b, "本进程 %s（峰值 %s）\n",
+			sysinfo.HumanBytes(int64(pm.RSS)),
+			sysinfo.HumanBytes(int64(pm.Peak)))
 	}
 
 	// 4. 分区余量（当前目录所在分区）
