@@ -268,17 +268,13 @@ func run() (*core.RestartRequest, error) {
 		}
 	}
 
-	var req *core.RestartRequest
-	var gwFatal error
-	select {
-	case <-ctx.Done():
-	case r := <-coreImpl.RestartRequests():
-		req = &r
-	case <-gwDone:
-		// 网关自己退出了。正常退出只发生在 ctx 取消之后，所以走到这里往往是
-		// 永久性错误（4001/4002/4010–4014/4914/4915）：再连也不会好，
-		// 但也不能留着一个"进程在跑、机器人已死"的躯壳。
-		gwFatal = <-gwRes
+	req, dropped, gwFatal := waitExit(ctx, coreImpl.RestartRequests(), gwDone, gwRes)
+	// select 在 ctx.Done 与 /reload 同时就绪时是随机选：选中请求就把一次
+	// Ctrl-C 变成"重新执行自身"，systemd 记成异常重启。waitExit 已经把这种
+	// 请求丢掉，这里只负责把现场写进日志（P3-22）。
+	if dropped != nil {
+		log.Warn("退出信号与重启请求同时到达，按关停处理",
+			"by", dropped.By, "role", dropped.Role, "reason", dropped.Reason)
 	}
 	stop()
 
@@ -355,6 +351,28 @@ func rawDumpFunc(cfg *config.Config, c *core.Core) func(string, []byte) {
 // 迁移都在这段窗口里，晚注册就会让期间的 SIGTERM 走默认处理（P3-21）。
 func notifyShutdown(parent context.Context) (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+}
+
+// waitExit 等待本次运行的结束原因：关停信号、/reload 请求，或网关自己退出。
+//
+// dropped 非 nil 表示 /reload 请求确实到了，但与退出信号同时就绪。select 对
+// 同时就绪的多个 case 是随机选，选中请求就会把一次 Ctrl-C 变成"重新执行自身"。
+// 所以这里先判 ctx：信号已到就一律按关停走（P3-22）。
+func waitExit(ctx context.Context, restarts <-chan core.RestartRequest, gwDone <-chan struct{}, gwRes <-chan error) (req, dropped *core.RestartRequest, gwFatal error) {
+	select {
+	case <-ctx.Done():
+	case r := <-restarts:
+		req = &r
+	case <-gwDone:
+		// 网关自己退出了。正常退出只发生在 ctx 取消之后，所以走到这里往往是
+		// 永久性错误（4001/4002/4010–4014/4914/4915）：再连也不会好，
+		// 但也不能留着一个"进程在跑、机器人已死"的躯壳。
+		gwFatal = <-gwRes
+	}
+	if ctx.Err() != nil && req != nil {
+		dropped, req = req, nil
+	}
+	return req, dropped, gwFatal
 }
 
 // lockWait 决定等单实例锁的上限。
