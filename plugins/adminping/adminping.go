@@ -58,8 +58,12 @@ func (p *Plugin) Init(ctx context.Context, h host.Host) error {
 	return nil
 }
 
+// Handle 只认路由层填好的 Event.Command：`/ping` 命中的事件才投递过来，
+// 匹配规则（含大小写敏感、词边界）由 core.argsAfterPrefix 统一决定。
+// 插件不再按原文再判一次——那会让"这是不是一条指令"出现第二个仲裁者，
+// 也会把路由层刻意排除的大小写变体（`/PING`）放进来。
 func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
-	if !isPing(ev.Content) {
+	if ev.Command != "/ping" {
 		return nil, nil
 	}
 
@@ -70,13 +74,6 @@ func (p *Plugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error
 		return &host.Reply{Content: "/pong（指标采集失败：" + err.Error() + "）"}, nil
 	}
 	return &host.Reply{Content: text}, nil
-}
-
-// isPing 只认精确的 /ping，避免 /pingxxx 被误判。
-// Manifest 里的前缀匹配是粗筛，真正"这是不是一条指令"由这里决定。
-func isPing(content string) bool {
-	fields := strings.Fields(strings.TrimSpace(content))
-	return len(fields) > 0 && strings.EqualFold(fields[0], "/ping")
 }
 
 func (p *Plugin) report(ctx context.Context) (string, error) {

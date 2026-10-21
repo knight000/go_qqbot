@@ -40,7 +40,9 @@ func newPlugin(t *testing.T) *Plugin {
 	return p
 }
 
-func ev(content string) *host.Event {
+// ev 构造一条投递到本插件的事件。command 是路由层填好的 Event.Command
+// （未命中任何命令时为空串，例如会话接管消息）。
+func ev(command, content string) *host.Event {
 	return &host.Event{
 		ID:       "e1",
 		Kind:     host.KindMessage,
@@ -49,6 +51,7 @@ func ev(content string) *host.Event {
 		PeerID:   "group-1",
 		SenderID: "user-1",
 		MsgID:    "m1",
+		Command:  command,
 		Content:  content,
 		Actor: host.Principal{
 			OpenID: "user-1", Scene: host.SceneGroup, PeerID: "group-1",
@@ -57,23 +60,18 @@ func ev(content string) *host.Event {
 	}
 }
 
-func TestIsPing(t *testing.T) {
-	cases := []struct {
-		in   string
-		want bool
-	}{
-		{"/ping", true},
-		{"  /ping  ", true},
-		{"/PING", true},
-		{"/ping 忽略多余参数", true},
-		{"/pingpong", false},
-		{"!ping", false},
-		{"", false},
+// 命令匹配归路由层：core.argsAfterPrefix 用大小写敏感的 strings.CutPrefix 切前缀，
+// 所以 `/PING` 永远不会投递到本插件。插件只认 ev.Command，不再自己按原文再判一次——
+// 那种"假保险"会把路由层刻意排除的大小写变体又放进来，而且让"谁决定这是指令"
+// 出现第二个仲裁者（echo / md 都只认 ev.Command）。
+func TestUpperCasePingIsNotHandled(t *testing.T) {
+	p := newPlugin(t)
+	reply, err := p.Handle(context.Background(), ev("", "/PING"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
-	for _, c := range cases {
-		if got := isPing(c.in); got != c.want {
-			t.Errorf("isPing(%q) = %v, want %v", c.in, got, c.want)
-		}
+	if reply != nil {
+		t.Errorf("/PING 不应被当作 ping（路由层大小写敏感，不会投递它）：%q", reply.Content)
 	}
 }
 
@@ -107,20 +105,24 @@ func TestManifestRequiresBotAdmin(t *testing.T) {
 
 func TestOtherCommandsIgnored(t *testing.T) {
 	p := newPlugin(t)
-	for _, c := range []string{"hello", "/reset", "/pingpong"} {
-		reply, err := p.Handle(context.Background(), ev(c))
+	for _, c := range []struct{ command, content string }{
+		{"", "hello"},        // 没有命中任何命令（例如会话接管消息）
+		{"/reset", "/reset"}, // 命中别的插件
+		{"/md", "/md # 标题"},  // 同上，带参数
+	} {
+		reply, err := p.Handle(context.Background(), ev(c.command, c.content))
 		if err != nil {
-			t.Fatalf("Handle(%q): %v", c, err)
+			t.Fatalf("Handle(%q): %v", c.content, err)
 		}
 		if reply != nil {
-			t.Errorf("%q 不应被本插件处理", c)
+			t.Errorf("%q 不应被本插件处理", c.content)
 		}
 	}
 }
 
 func TestAdminGetsFullReport(t *testing.T) {
 	p := newPlugin(t)
-	reply, err := p.Handle(context.Background(), ev("/ping"))
+	reply, err := p.Handle(context.Background(), ev("/ping", "/ping"))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
