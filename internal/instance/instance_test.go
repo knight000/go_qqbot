@@ -122,13 +122,16 @@ func TestSameAppIDDifferentDataDirIsRejected(t *testing.T) {
 		t.Fatalf("应能断言为 *LockedError: %v", err)
 	}
 	// 报错必须能定位到"哪个 bot、哪台机、谁占着"，否则用户只能猜。
+	if locked.Scope != ScopeAppID {
+		t.Fatalf("应指出是 appID 冲突，实际 %q", locked.Scope)
+	}
 	if locked.Holder.AppID != testAppID {
 		t.Fatalf("冲突信息应指出持有者的 appID: %+v", locked.Holder)
 	}
 	if locked.Holder.Host == "" {
 		t.Fatalf("冲突信息应指出持有者所在主机: %+v", locked.Holder)
 	}
-	for _, want := range []string{"另一个实例正在运行", testAppID} {
+	for _, want := range []string{"另一个实例正在运行", "appID " + testAppID + " 已被占用"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("错误文案应包含 %q: %v", want, err)
 		}
@@ -203,9 +206,18 @@ func TestDifferentAppIDSameDataDirBlockedByDataLock(t *testing.T) {
 	if !errors.As(err, &locked) {
 		t.Fatalf("应能断言为 *LockedError: %v", err)
 	}
-	// 挡住它的是数据目录锁，报错必须指向那份库，而不是它的 appID。
+	// 挡住它的是数据目录锁：文案要说"数据目录已被占用"并带上占用者的 appID，
+	// 而不是含糊的"已被占用"——两者该做的事完全不同（结束进程 vs 改路径）。
+	if locked.Scope != ScopeDataDir {
+		t.Fatalf("应指出是数据目录冲突，实际 %q", locked.Scope)
+	}
 	if locked.Path != path {
 		t.Fatalf("冲突应指向数据目录锁 %s，实际 %s", path, locked.Path)
+	}
+	for _, want := range []string{"数据目录已被占用", "appID " + testAppID, "[store].path"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误文案应包含 %q: %v", want, err)
+		}
 	}
 }
 
