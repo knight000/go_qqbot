@@ -36,6 +36,10 @@ type Options struct {
 	Handler    func(ctx context.Context, ev *host.Event)
 	// RawDump 非空时，每条 dispatch 事件在解码前把原始 JSON 交出去（调试用）。
 	RawDump func(typ string, raw []byte)
+
+	// HTTPClient 注入 WSS 握手的传输层，nil 时用 15s 超时的默认客户端。
+	// 与 httpx 的 HTTPClient 同一个用途：自签证书、将来接代理时不必改构造函数。
+	HTTPClient *http.Client
 }
 
 // ErrNotConnected 表示当前没有活着的连接可断——通常是网关正在退避重连。
@@ -48,6 +52,12 @@ var errManualReconnect = errors.New("手动断开连接")
 type Client struct {
 	o  Options
 	lg *slog.Logger
+
+	// invalidateToken 作废缓存 token（*api.Client.InvalidateToken 的方法值）。
+	// 抽成字段只为了让"4004 会作废 token"这条接线可测；Options.API 为 nil 时留空。
+	invalidateToken func()
+	// hc 只用于 WSS 握手。
+	hc *http.Client
 
 	mu        sync.Mutex
 	sessionID string
@@ -65,46 +75,58 @@ func New(o Options) *Client {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Client{o: o, lg: o.Log.With("component", "gateway")}
+	c := &Client{o: o, lg: o.Log.With("component", "gateway")}
+	if o.API != nil {
+		c.invalidateToken = o.API.InvalidateToken
+	}
+	c.hc = o.HTTPClient
+	if c.hc == nil {
+		c.hc = &http.Client{Timeout: 15 * time.Second}
+	}
+	return c
 }
 
-// Run 是长期协程：断线后指数退避重连，成功 READY 后退避复位。
-func (c *Client) Run(ctx context.Context) {
+// Run 是长期协程：断线后指数退避重连；只有连接稳定 READY 过才复位退避。
+//
+// 返回非 nil 只发生在永久性错误（*FatalError：下架/封禁/intents 无权限/分片参数
+// 错误）——这时再连也不会好，必须让调用方看见原因并决定进程去向，不能静默重试。
+func (c *Client) Run(ctx context.Context) error {
 	if c.o.Handler == nil {
 		c.lg.Error("未设置事件处理器，网关不启动")
-		return
+		return nil
 	}
 	c.loadState(ctx)
 
-	backoff := time.Second
+	b := &backoff{d: minBackoff}
 	for {
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
-		ready, err := c.connectOnce(ctx)
+		readyFor, err := c.connectOnce(ctx)
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
-		if ready {
-			backoff = time.Second
+
+		var fatal *FatalError
+		if errors.As(err, &fatal) {
+			return fatal
 		}
+
+		b.note(readyFor)
 		// 手动重连（/reset reconnect）：链路本身可能就是好的，
 		// 等退避纯属白等，而且会让"我按了重置但十秒没反应"变成用户困惑。
 		if errors.Is(err, errManualReconnect) {
 			c.lg.Info("已断开当前连接，立即重连（保留 session，走 Resume）")
-			backoff = time.Second
+			b.d = minBackoff
 			if !sleep(ctx, 100*time.Millisecond) {
-				return
+				return nil
 			}
 			continue
 		}
-		c.lg.Warn("连接断开，准备重连", "err", err, "backoff", backoff.String())
-		if !sleep(ctx, jitter(backoff)) {
-			return
-		}
-		backoff *= 2
-		if backoff > 60*time.Second {
-			backoff = 60 * time.Second
+		wait := b.next(closeDelay(err))
+		c.lg.Warn("连接断开，准备重连", "err", err, "backoff", wait.String())
+		if !sleep(ctx, wait) {
+			return nil
 		}
 	}
 }
@@ -139,23 +161,32 @@ func (c *Client) takeManual() bool {
 	return m
 }
 
-func (c *Client) connectOnce(ctx context.Context) (bool, error) {
+// connectOnce 建立一条连接并跑到它断开为止。
+//
+// readyFor 是"READY/RESUMED 之后这条连接还活着多久"：用来判断连接是否稳定过，
+// 从而决定 Run 里的退避要不要复位。没收到 READY/RESUMED 时为 0。
+func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err error) {
+	var readySince time.Time
+	defer func() {
+		if !readySince.IsZero() {
+			readyFor = time.Since(readySince)
+		}
+	}()
+
 	gwURL, err := c.o.API.GatewayURL(ctx)
 	if err != nil {
-		return false, fmt.Errorf("获取网关地址: %w", err)
+		return 0, fmt.Errorf("获取网关地址: %w", err)
 	}
 	token, err := c.o.API.AccessToken(ctx)
 	if err != nil {
-		return false, fmt.Errorf("获取 token: %w", err)
+		return 0, fmt.Errorf("获取 token: %w", err)
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	ws, _, err := websocket.Dial(dialCtx, gwURL, &websocket.DialOptions{
-		HTTPClient: &http.Client{Timeout: 15 * time.Second},
-	})
+	ws, _, err := websocket.Dial(dialCtx, gwURL, &websocket.DialOptions{HTTPClient: c.hc})
 	cancel()
 	if err != nil {
-		return false, fmt.Errorf("连接网关: %w", err)
+		return 0, fmt.Errorf("连接网关: %w", err)
 	}
 	ws.SetReadLimit(1 << 20)
 
@@ -178,19 +209,19 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 	interval, err := c.readHello(helloCtx, ws)
 	hcancel()
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	c.lg.Info("网关握手完成", "heartbeat", interval.String())
 
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 
-	if c.hasSession() && c.o.Resume {
+	if c.willResume() {
 		if err := c.sendResume(ctx, ws, token); err != nil {
 			c.lg.Warn("发送 Resume 失败，改为 Identify", "err", err)
 			c.clearSession(ctx)
 			if err := c.sendIdentify(ctx, ws, token); err != nil {
-				return false, err
+				return 0, err
 			}
 		} else {
 			c.mu.Lock()
@@ -200,7 +231,7 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 		}
 	} else {
 		if err := c.sendIdentify(ctx, ws, token); err != nil {
-			return false, err
+			return 0, err
 		}
 	}
 
@@ -208,14 +239,15 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 	acked := true
 	go c.heartbeatLoop(hbCtx, ws, interval, &ackMu, &acked)
 
-	ready := false
 	for {
 		typ, data, err := ws.Read(ctx)
 		if err != nil {
 			if c.takeManual() {
-				return ready, errManualReconnect
+				return 0, errManualReconnect
 			}
-			return ready, c.closeReason(err)
+			// 关闭码在这里被翻译成"下一步做什么"：session 的迁移必须发生在
+			// 读错误出口，否则下一轮 connectOnce 还会做出同样的错误选择。
+			return 0, c.onReadError(ctx, err)
 		}
 		if typ != websocket.MessageText {
 			continue
@@ -233,10 +265,10 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 		case opDispatch:
 			if p.T == "READY" {
 				c.onReady(ctx, p.D)
-				ready = true
+				readySince = time.Now()
 			} else if p.T == "RESUMED" {
 				c.lg.Info("Resume 成功，事件不中断")
-				ready = true
+				readySince = time.Now()
 			} else {
 				c.dispatch(ctx, p.T, p.D)
 			}
@@ -247,11 +279,11 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 			acked = true
 			ackMu.Unlock()
 		case opReconnect:
-			return ready, errors.New("服务端要求重连(op7)")
+			return 0, errors.New("服务端要求重连(op7)")
 		case opInvalidSession:
 			c.lg.Warn("session 失效(op9)，清除后重新 Identify")
 			c.clearSession(ctx)
-			return ready, errors.New("session 失效(op9)")
+			return 0, errors.New("session 失效(op9)")
 		case opHello:
 			// 重复 hello：忽略
 		default:
@@ -388,6 +420,12 @@ func (c *Client) hasSession() bool {
 	return c.sessionID != ""
 }
 
+// willResume 决定这一轮握手走 Resume 还是 Identify。
+// 它只读当下的 session 状态，所以"清掉 session"与"下一轮 Identify"是同一件事。
+func (c *Client) willResume() bool {
+	return c.o.Resume && c.hasSession()
+}
+
 func (c *Client) clearSession(ctx context.Context) {
 	c.mu.Lock()
 	c.sessionID = ""
@@ -448,18 +486,42 @@ func (c *Client) saveState(ctx context.Context, force bool) {
 	}
 }
 
-func (c *Client) closeReason(err error) error {
+// onReadError 是读循环的唯一错误出口：按关闭码做状态迁移，并给出 Run 需要的
+// "要不要再连、最短等多久"。
+//
+// 关键点是**在这里**改 session 状态——只在日志里换文案，下一轮 connectOnce
+// 仍会按旧状态发 Resume，于是一个死 session 会被永远 Resume 下去。
+func (c *Client) onReadError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
-	code := websocket.CloseStatus(err)
-	switch code {
-	case 4006, 4009:
-		return fmt.Errorf("session 不可用(%d): %w", code, err)
-	case 4914, 4915:
-		return fmt.Errorf("intents 非法(%d)，检查 bot.intents 配置: %w", code, err)
+	code := int(websocket.CloseStatus(err))
+	d := classifyClose(code)
+
+	switch d.action {
+	case actionReIdentify:
+		c.lg.Warn("关闭码要求重新 Identify，清除 session 后重连", "code", code, "reason", d.reason)
+		c.clearSession(ctx)
+	case actionResume:
+		// 官方明确 4009 应 Resume：这里保留 session_id / seq，事件不中断。
+		c.lg.Info("连接已过期，保留 session 重连（走 Resume）", "code", code, "reason", d.reason)
+	case actionInvalidToken:
+		c.lg.Warn("token 已失效，作废后重连", "code", code, "reason", d.reason)
+		if c.invalidateToken != nil {
+			c.invalidateToken()
+		}
+	case actionRateLimited:
+		c.lg.Warn("平台要求降频，本轮会等到频控窗口过去再连",
+			"code", code, "reason", d.reason, "delay", d.delay.String())
+	case actionFatal:
+		c.lg.Error("网关遇到永久性错误，停止重连", "code", code, "reason", d.reason)
+		return &FatalError{Code: code, Reason: d.reason, Err: err}
+	default:
+		// 未识别的关闭码/无关闭帧：保持原始错误文本，按普通链路故障退避重连，
+		// session 原样保留（能不能 Resume 让平台自己回答）。
+		return err
 	}
-	return err
+	return &closeError{delay: d.delay, reason: d.reason, err: err}
 }
 
 func stableEventID(t string, raw json.RawMessage) string {

@@ -58,9 +58,13 @@ const (
 func main() {
 	req, err := run()
 	if err != nil {
-		if errors.Is(err, errShutdown) {
+		var fatal *gateway.FatalError
+		switch {
+		case errors.As(err, &fatal):
+			fmt.Fprintln(os.Stderr, "网关永久性错误，已停止重连:", fatal.Reason)
+		case errors.Is(err, errShutdown):
 			fmt.Fprintln(os.Stderr, "关停失败:", err)
-		} else {
+		default:
 			fmt.Fprintln(os.Stderr, "启动失败:", err)
 		}
 		os.Exit(1)
@@ -218,10 +222,13 @@ func run() (*core.RestartRequest, error) {
 	// 反过来（先起 gw.Run 再 SetReconnector）就是数据竞争。
 	coreImpl.SetReconnector(gw)
 
+	// gwRes 收 Run 的返回值：正常退出（ctx 取消）是 nil，永久性错误
+	// （下架/封禁/intents 无权限）是一个可判定的 *gateway.FatalError。
 	gwDone := make(chan struct{})
+	gwRes := make(chan error, 1)
 	go func() {
 		defer close(gwDone)
-		gw.Run(ctx)
+		gwRes <- gw.Run(ctx)
 	}()
 
 	bi := buildinfo.Get()
@@ -251,17 +258,26 @@ func run() (*core.RestartRequest, error) {
 	}
 
 	var req *core.RestartRequest
+	var gwFatal error
 	select {
 	case <-ctx.Done():
 	case r := <-coreImpl.RestartRequests():
 		req = &r
+	case <-gwDone:
+		// 网关自己退出了。正常退出只发生在 ctx 取消之后，所以走到这里往往是
+		// 永久性错误（4001/4002/4010–4014/4914/4915）：再连也不会好，
+		// 但也不能留着一个"进程在跑、机器人已死"的躯壳。
+		gwFatal = <-gwRes
 	}
 	stop()
 
-	if req != nil {
+	switch {
+	case req != nil:
 		log.Warn("收到重启请求，开始关闭",
 			"by", req.By, "role", req.Role, "reason", req.Reason)
-	} else {
+	case gwFatal != nil:
+		log.Error("网关永久性错误，停止重连，开始关闭", "err", gwFatal)
+	default:
 		log.Info("收到退出信号，开始关闭")
 	}
 
@@ -304,6 +320,11 @@ func run() (*core.RestartRequest, error) {
 		}
 	} else {
 		log.Info("已退出")
+	}
+	if gwFatal != nil {
+		// 交给退出码：Restart=on-failure 的 StartLimit 会把"反复因封禁而重启"
+		// 收敛成一次人工介入，而不是每 60s 一条无人看的重连日志。
+		return nil, gwFatal
 	}
 	return req, nil
 }
