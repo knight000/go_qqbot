@@ -14,7 +14,9 @@ func readMem() (total, avail uint64, err error) {
 	return 0, 0, fmt.Errorf("当前平台不支持内存采集")
 }
 
-func processRSS() uint64 { return 0 }
+func processMemory() (rss, peak uint64, err error) {
+	return 0, 0, fmt.Errorf("当前平台不支持本进程内存采集")
+}
 
 func diskUsage(path string) (total, free uint64, err error) {
 	return 0, 0, fmt.Errorf("当前平台不支持磁盘采集")
