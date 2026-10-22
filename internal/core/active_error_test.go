@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,5 +149,92 @@ func TestSenderActiveErrorsMatchHostSentinels(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestActiveDisabledErrorNamesTheGate 是 #35 的验收：两条配置闸门的错误串
+// 必须自己说清卡在哪一条。它们都映射到 host.ErrActiveDisabled，所以上面的
+// 矩阵测试对"两条串完全同形"照样绿——这正是缺陷的藏身处：
+// 总开关关闭时日志说"插件不在白名单"，运维照着改白名单，改完仍然发不出去。
+//
+// 错误串不是契约（§3.3 写明不得解析），正因如此它是唯一的排障线索，
+// 所以这里直接断言串里的关键片段，而不是只看 errors.Is。
+func TestActiveDisabledErrorNamesTheGate(t *testing.T) {
+	cases := []struct {
+		name string
+		// policy 里的白名单在第一种场景下**包含**被测插件：总开关关掉时
+		// 白名单里有没有它都无意义，错误串不该把运维指向白名单。
+		policy        ActivePolicy
+		plugin        string
+		wantFragments []string
+		// unwanted 断言两条串互不包含对方的特征片段，否则"分开了"只是
+		// 换了个说法的同形串。
+		unwanted string
+	}{
+		{
+			name: "总开关关闭",
+			policy: ActivePolicy{
+				Enabled:      false,
+				Plugins:      map[string]bool{"probe": true},
+				DailyPerPeer: 2,
+			},
+			plugin:        "probe",
+			wantFragments: []string{"[active].enabled", "c2c", "u1"},
+			unwanted:      "白名单",
+		},
+		{
+			name: "插件不在白名单",
+			policy: ActivePolicy{
+				Enabled:      true,
+				Plugins:      map[string]bool{"someone-else": true},
+				DailyPerPeer: 2,
+			},
+			plugin:        "digest",
+			wantFragments: []string{"digest", "c2c", "u1", "白名单"},
+			unwanted:      "[active].enabled",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), tc.policy,
+				quotaUsageStore{ok: true}, time.UTC).ForPlugin(tc.plugin)
+
+			err := sender.SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "hi"})
+			if err == nil {
+				t.Fatal("被闸门挡下时应返回错误")
+			}
+			if !errors.Is(err, host.ErrActiveDisabled) {
+				t.Fatalf("errors.Is(err, host.ErrActiveDisabled)=false；err=%v", err)
+			}
+			got := err.Error()
+			for _, frag := range tc.wantFragments {
+				if !strings.Contains(got, frag) {
+					t.Errorf("错误串缺少 %q，看不出是哪一条闸门/哪个会话；err=%s", frag, got)
+				}
+			}
+			if strings.Contains(got, tc.unwanted) {
+				t.Errorf("错误串不应含 %q：两个原因被混在一起，运维会照着错的那条改；err=%s",
+					tc.unwanted, got)
+			}
+		})
+	}
+}
+
+// TestActiveDisabledErrorOnCoreSenderNamesPeer 覆盖 sendActiveOne 那条路径：
+// 核心自己的群生命周期通知不经 ForPlugin，直接调 (*Sender).SendActive，
+// 总开关关闭时曾经返回裸哨兵，日志里只剩"主动消息未开启"，没有场景也没有 peer。
+func TestActiveDisabledErrorOnCoreSenderNamesPeer(t *testing.T) {
+	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.UTC)
+
+	err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "hi"})
+	if !errors.Is(err, host.ErrActiveDisabled) {
+		t.Fatalf("主动消息总开关关闭时应拒绝，实际 err=%v", err)
+	}
+	got := err.Error()
+	for _, frag := range []string{"[active].enabled", "group", "g1"} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("错误串缺少 %q；err=%s", frag, got)
+		}
 	}
 }
