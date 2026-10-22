@@ -477,8 +477,20 @@ func (p *pluginSender) Reply(ctx context.Context, ev *host.Event, msg host.Reply
 }
 
 func (p *pluginSender) SendActive(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
-	if !p.parent.active.Enabled || !p.parent.active.Plugins[p.name] {
-		err := fmt.Errorf("%w: 插件 %s 不在 [active].plugins 白名单内", host.ErrActiveDisabled, p.name)
+	// 两条闸门分开报，且都带场景与 peer（#35）：错误串不是契约、不许解析
+	// （§3.3），它就是唯一的排障线索。合并成一个条件时，总开关关闭会被报成
+	// "插件不在白名单"，运维照着改白名单，改完仍然发不出去；串里只有插件名
+	// 时，同一个插件推给多个管理员也看不出是哪一条被挡。
+	//
+	// 先判总开关：它关着的时候，白名单是否包含该插件都无意义。
+	var err error
+	switch {
+	case !p.parent.active.Enabled:
+		err = fmt.Errorf("%w（%s %s：总开关 [active].enabled=false）", host.ErrActiveDisabled, scene, peerID)
+	case !p.parent.active.Plugins[p.name]:
+		err = fmt.Errorf("%w（%s %s：插件 %s 不在 [active].plugins 白名单内）", host.ErrActiveDisabled, scene, peerID, p.name)
+	}
+	if err != nil {
 		p.parent.trace.Sent("主动消息", scene, peerID, 0, msg.Content, err, 0)
 		return err
 	}
@@ -509,7 +521,10 @@ func (s *Sender) SendActive(ctx context.Context, scene host.Scene, peerID string
 
 func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
 	if !s.active.Enabled {
-		return host.ErrActiveDisabled
+		// 与 pluginSender 的同一条闸门共用文案：核心自己的群生命周期通知
+		// 走这条路径，不经 ForPlugin。裸哨兵在日志里只剩"主动消息未开启"，
+		// 既没有场景也没有 peer，看不出是哪一条通知被挡（#35）。
+		return fmt.Errorf("%w（%s %s：总开关 [active].enabled=false）", host.ErrActiveDisabled, scene, peerID)
 	}
 	if peerID == "" {
 		return fmt.Errorf("缺少 peer openid")
