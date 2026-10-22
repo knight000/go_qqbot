@@ -22,12 +22,19 @@ import (
 	"github.com/coder/websocket"
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/host"
-	"github.com/knight000/go_qqbot/internal/store"
 )
+
+// stateStore 是网关需要的全部持久化能力：session_id 与 seq 两个键。
+// 用窄接口而不是 *store.DB，是为了让"删库失败"这类现场在单测里可造。
+type stateStore interface {
+	GetState(ctx context.Context, key string) (string, bool, error)
+	PutState(ctx context.Context, key, value string) error
+	DeleteState(ctx context.Context, key string) error
+}
 
 type Options struct {
 	API        *api.Client
-	Store      *store.DB
+	Store      stateStore
 	Log        *slog.Logger
 	Intents    uint64
 	ShardTotal int
@@ -551,8 +558,15 @@ func (c *Client) clearSession(ctx context.Context) {
 	c.sessionID = ""
 	c.seq = 0
 	c.mu.Unlock()
-	_ = c.o.Store.DeleteState(ctx, "session_id")
-	_ = c.o.Store.DeleteState(ctx, "seq")
+	// 删库失败只告警，但必须留痕：内存里的 session 已经清掉，若库里还留着
+	// session_id，下次启动会继续 Resume 一个死 session——P1-1 在持久化层复发，
+	// 而现场日志里只会看到"怎么又在 Resume"。
+	for _, k := range [...]string{"session_id", "seq"} {
+		if err := c.o.Store.DeleteState(ctx, k); err != nil {
+			c.lg.Warn("清理 session 持久化失败，重启后可能仍 Resume 旧 session",
+				"key", k, "err", err)
+		}
+	}
 }
 
 func (c *Client) setSeq(ctx context.Context, seq int64) {

@@ -38,6 +38,13 @@ type Dispatcher struct {
 	stopLoops context.CancelFunc
 	loops     sync.WaitGroup
 
+	// sendCtx 是发送的生命周期：与 handler 的 3s 截止解耦（否则图片上传会被
+	// 压回 5s），但只由关停取消。Wait 到期时掐断在途发送，避免一条 30s 上传
+	// 把关库拖到发送之后（现场就是 "database is closed"），也让关停不必为
+	// 一条发不出去的图超期退出。
+	sendCtx     context.Context
+	cancelSends context.CancelFunc
+
 	mu    sync.Mutex
 	peers map[string]*peerQueue
 	// inflight 是"已入队、尚未处理完"的事件数，Wait 靠它判断排空。
@@ -65,15 +72,18 @@ func NewDispatcher(r *Router, s *Sender, log *slog.Logger, handlerTimeout time.D
 		handlerTimeout = 3 * time.Second
 	}
 	runCtx, stopLoops := context.WithCancel(context.Background())
+	sendCtx, cancelSends := context.WithCancel(context.Background())
 	return &Dispatcher{
-		router:    r,
-		sender:    s,
-		log:       log,
-		handler:   handlerTimeout,
-		sem:       make(chan struct{}, workerLimit),
-		runCtx:    runCtx,
-		stopLoops: stopLoops,
-		peers:     make(map[string]*peerQueue),
+		router:      r,
+		sender:      s,
+		log:         log,
+		handler:     handlerTimeout,
+		sem:         make(chan struct{}, workerLimit),
+		runCtx:      runCtx,
+		stopLoops:   stopLoops,
+		sendCtx:     sendCtx,
+		cancelSends: cancelSends,
+		peers:       make(map[string]*peerQueue),
 	}
 }
 
@@ -178,7 +188,12 @@ func (d *Dispatcher) Wait(ctx context.Context) bool {
 		select {
 		case <-idle:
 		case <-ctx.Done():
-			drained = false
+			// 关停期限已到：在途发送必须立刻放手，否则一条 30s 的上传会
+			// 把关库推到发送之后（写库撞 "database is closed"），关停也
+			// 必然以超期收场。掐断后再给 handler 一点收尾时间——发送一旦
+			// 返回，剩下的只是记日志，正常在毫秒级结束。
+			d.cancelSends()
+			drained = waitClosed(idle, sendCancelGrace)
 		}
 		if !drained {
 			break
@@ -194,10 +209,35 @@ func (d *Dispatcher) Wait(ctx context.Context) bool {
 		d.loops.Wait()
 		close(exited)
 	}()
+
+	// ctx 可能已经到期（超时路径）。不能再用它等协程退出：select 在两个
+	// case 同时就绪时随机选，会让"排空已顺利完成"随机报成失败。
+	waitCtx, cancel := ctx, context.CancelFunc(func() {})
+	if ctx.Err() != nil {
+		waitCtx, cancel = context.WithTimeout(context.Background(), sendCancelGrace)
+	}
+	defer cancel()
+
 	select {
 	case <-exited:
 		return drained
-	case <-ctx.Done():
+	case <-waitCtx.Done():
+		return false
+	}
+}
+
+// sendCancelGrace 是掐断在途发送之后等 handler 收尾的窗口。发送已经返回，
+// 剩下的只有日志与返回，正常在毫秒级；给 2s 只为容忍一次日志落盘。
+const sendCancelGrace = 2 * time.Second
+
+// waitClosed 在 d 时间内等 ch 关闭，false 表示没等到。
+func waitClosed(ch <-chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
 		return false
 	}
 }
@@ -415,9 +455,10 @@ func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {
 
 	// 发送预算由 Sender 按回复内容决定（纯文本 5s、含上传 30s），这里只剥掉
 	// handler 的截止时间，不再自己拍一个 5s——那会把上传的 30s 压回 5s。
+	// 但剥掉的取消权必须由关停接手（sendCtx）：否则关停只能干等满一整条
+	// 上传预算，30s 之后才开始关库。
 	// 插件拿不到 Reply 的错误，超时判断与降级只能在核心内做。
-	rctx := context.WithoutCancel(ctx)
-	if err := d.sender.Reply(rctx, ev, *reply); err != nil {
+	if err := d.sender.Reply(d.sendCtx, ev, *reply); err != nil {
 		if errors.Is(err, ErrRateLimited) {
 			// 429 是平台侧事实，本地账本需要据此校正；不能盲目重试（重试可能仍是 429）
 			d.log.Warn("回复被平台限流(429)，请检查本地额度与平台配额",
