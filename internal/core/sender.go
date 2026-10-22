@@ -163,7 +163,11 @@ func (s *Sender) Reply(ctx context.Context, ev *host.Event, msg host.Reply) erro
 				// 一条都没发出去、且失败的是图片时，用户那边什么都看不到：
 				// 核心没有别的通道能告诉插件"图没发出去"（Reply 不返回错误），
 				// 只能补一句文本。前面已发过文本的不补——用户已经看到内容了。
-				if part.Image.Valid() {
+				//
+				// 两种例外不补：① 根本没走到发送（本地超限、上传失败）——
+				// 补发会烧掉一格被动配额，与"上传失败不消耗配额"直接冲突；
+				// ② 已被 429 罚下——冷却期内补发只会再失败一次。
+				if part.Image.Valid() && !isNotSent(err) && !errors.Is(err, ErrRateLimited) {
 					s.sendImageFailureNotice(ctx, ev)
 				}
 				return err
@@ -172,6 +176,21 @@ func (s *Sender) Reply(ctx context.Context, ev *host.Event, msg host.Reply) erro
 		}
 	}
 	return nil
+}
+
+// notSentError 标记"消息根本没走到发送这一步"（本地校验失败、上传被拒）。
+//
+// 只为了区分降级策略：走到发送才失败时用户什么都没收到，值得补一句文本；
+// 连发送都没尝试时补发等于白烧一格被动配额（§7「上传失败不消耗配额」）。
+// Error/Unwrap 原样透传，错误文案不受影响。
+type notSentError struct{ err error }
+
+func (e notSentError) Error() string { return e.err.Error() }
+func (e notSentError) Unwrap() error { return e.err }
+
+func isNotSent(err error) bool {
+	var nse notSentError
+	return errors.As(err, &nse)
 }
 
 // imageFailedText 是图片发不出去时补发的说明。
@@ -238,7 +257,10 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 	// 先上传再占位：图片不存在、格式不对、超限都不该吃掉一格被动配额。
 	body, err := s.bodyFor(ctx, ev.Scene, ev.PeerID, msg)
 	if err != nil {
-		return 0, err
+		// 还没走到发送这一步（本地校验失败或上传被拒）。用类型标出来，
+		// 是因为"图片发失败要不要补一条文本"的答案不同：
+		// 这里补发等于白烧一格被动配额，正是"上传失败不消耗配额"要避免的。
+		return 0, notSentError{err}
 	}
 
 	seq, err := s.reserve(ev)
