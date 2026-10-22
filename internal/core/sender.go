@@ -101,7 +101,8 @@ type passiveWindow struct {
 }
 
 // NewSender 的 loc 是日预算的切日时区，由 Scheduler 提供（与 cron 同源）。
-// 不设默认值：一个"忘了注入就用本地时区"的兜底正是 P2-4 那个 bug 本身。
+// nil 直接 panic：一个"忘了注入就用本地时区"的兜底正是 P2-4 那个 bug 本身，
+// 而 nil 若留到 .In() 里，现场只会看到一行与配额毫无关系的空指针栈。
 func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore, loc *time.Location) *Sender {
 	return &Sender{
 		api:       api,
@@ -477,24 +478,28 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	//
 	// 扣额度是库里的一次原子 upsert（§4.1 active_usage），因此不存在
 	// "内存清零"或"重启后从 0 重来"的问题：进程只是账本的读者之一。
-	if ok, err := s.takeActiveBudget(ctx, scene, peerID); err != nil {
+	// 占格与归还共用这一个 key：归还时若重算，跨零点就会还进次日桶，
+	// 被 used>0 兜成 no-op，等于这一格白扣（#23 的时区版本）。
+	key, ok, err := s.takeActiveBudget(ctx, scene, peerID)
+	if err != nil {
 		// fail-closed：账本不可信时不发。宁可少发一条，也不能把平台
 		// 每天 1000 条的配额当成无限量烧掉——额度超发是不可撤回的。
 		// 带上场景与 peer：日志里只有"记账失败"时定位不到是哪个会话
 		// 把账本写坏了（规则 7：错误必须指得回它发生在谁身上）。
 		return fmt.Errorf("%w（额度记账失败，按保守策略拒发；%s %s）: %v", ErrActiveQuota, scene, peerID, err)
-	} else if !ok {
+	}
+	if !ok {
 		return fmt.Errorf("%w（%s %s）", ErrActiveQuota, scene, peerID)
 	}
 
 	body, err := s.bodyFor(ctx, scene, peerID, msg)
 	if err != nil {
 		// 上传被平台拒绝时消息还没发出去，那一格预算不该记在账上。
-		s.refundActiveBudgetOnBusinessError(ctx, scene, peerID, err)
+		s.refundActiveBudgetOnBusinessError(ctx, key, scene, peerID, err)
 		return err
 	}
 	if err := s.api.SendMessage(ctx, string(scene), peerID, body); err != nil {
-		s.refundActiveBudgetOnBusinessError(ctx, scene, peerID, err)
+		s.refundActiveBudgetOnBusinessError(ctx, key, scene, peerID, err)
 		if httpx.IsStatus(err, 429) {
 			wait := httpx.RetryAfter(err)
 			s.startCooldown(scene, peerID, wait)
@@ -510,9 +515,14 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 // 只认业务错误：网络失败/超时时消息可能已经发出，归还等于超发。这是既定
 // 取舍——宁可少发一条，也不能把平台每天 1000 条的配额当成无限量烧掉。
 //
+// key 必须原样来自 takeActiveBudget，不能在这里重算：占格在 23:59、归还
+// 在次日 00:01 时，重算出来的 day 已经是新的一天，那一格会还进一个
+// used==0 的桶里（被 RefundActiveBudget 的 used>0 守卫兜成 no-op），
+// 旧桶则永远记着这笔不存在的消耗。
+//
 // 归还本身失败只告警：额度账本坏了是运维问题，不该让一次发送错误再叠一层
 // 无从处理的错误；但必须留日志，否则"账多了/少了"永远查不到原因。
-func (s *Sender) refundActiveBudgetOnBusinessError(ctx context.Context, scene host.Scene, peerID string, cause error) {
+func (s *Sender) refundActiveBudgetOnBusinessError(ctx context.Context, key store.ActiveUsageKey, scene host.Scene, peerID string, cause error) {
 	var be *api.BusinessError
 	if !errors.As(cause, &be) {
 		return
@@ -520,7 +530,6 @@ func (s *Sender) refundActiveBudgetOnBusinessError(ctx context.Context, scene ho
 	if s.active.DailyPerPeer <= 0 || s.usage == nil {
 		return
 	}
-	key := s.usageKey(scene, peerID)
 	if err := s.usage.RefundActiveBudget(ctx, key); err != nil {
 		s.log.Warn("归还主动消息额度失败", "scene", scene, "peer", peerID, "err", err)
 	}
@@ -540,17 +549,19 @@ func (s *Sender) usageKey(scene host.Scene, peerID string) store.ActiveUsageKey 
 }
 
 // takeActiveBudget 占一格日预算；ok=false 表示当日已用尽。
+// 返回的 key 是这次占格用的账本坐标，调用方归还时必须原样带回来。
 // error 表示账本本身不可用（库没打开、写失败、ctx 取消），调用方必须拒发。
-func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID string) (bool, error) {
+func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID string) (store.ActiveUsageKey, bool, error) {
 	// 不限量时不必记账：DailyPerPeer<=0 是测试与"临时全开"的用法，
 	// 写库只会给一个永不读取的桶添行。注意这与"额度用尽"是两回事。
 	if s.active.DailyPerPeer <= 0 {
-		return true, nil
+		return store.ActiveUsageKey{}, true, nil
 	}
 	if s.usage == nil {
 		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
-		return false, errors.New("未配置主动消息额度账本")
+		return store.ActiveUsageKey{}, false, errors.New("未配置主动消息额度账本")
 	}
 	key := s.usageKey(scene, peerID)
-	return s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
+	ok, err := s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
+	return key, ok, err
 }
