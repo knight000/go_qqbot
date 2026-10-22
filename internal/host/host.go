@@ -49,8 +49,15 @@ import (
 //   - Event.Session 非 nil 表示这条消息是对本插件 Await 的回应，内容是
 //     Await 时写入的 state，此时 Command / Args 恒为空。
 //
+// 版本 10：Host 的两处**可观察语义**变了（签名未变，所以最容易漏改）：
+//   - Params.Str 不再把「键存在但值为空串」当成未设置：此时返回 ""，
+//     不回退默认值。想表达"没配置"就不要写这个键；
+//   - Store.Query 的只读改由 SQLite 的 query_only 连接保证（`WITH … DELETE`
+//     之类也会被拒），SQL 原样执行、不再自动追加 LIMIT，行数在取行时
+//     截断到 1000。写语句以前可能"碰巧能过"，现在一定失败。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "9"
+const APIVersion = "10"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //
@@ -268,6 +275,10 @@ type Sender interface {
 type Row map[string]any
 
 // QueryStore 只读、参数化、行数上限 1000；不允许 DDL/写操作。
+//
+// 只读不是在 SQL 文本上判首词，而是执行侧保证：查询走 SQLite 的只读连接
+// （PRAGMA query_only），`WITH … DELETE` 这类写法会在执行时报错。行数上限
+// 同样在取行时截断——SQL 按插件写的原样执行，不会被拼上额外的 LIMIT。
 type QueryStore interface {
 	Query(ctx context.Context, query string, args ...any) ([]Row, error)
 }
@@ -481,8 +492,13 @@ func NewParams(name string, vals map[string]any) Params {
 // Name 返回配置段名。
 func (p Params) Name() string { return p.name }
 
+// Str 返回字符串配置：**只看键在不在，不看值空不空**。
+//
+// ConfigSchema 里明确写了 `key = ""` 是「存在但为空」，对 string 合法，
+// 与「缺失」可区分；这里必须与那条文档一致，否则声明为必填的键被配成
+// 空串时，插件拿到的是默认值（例如想把 api_base 置空，结果仍打生产地址）。
 func (p Params) Str(key, def string) string {
-	if v, ok := p.vals[key].(string); ok && v != "" {
+	if v, ok := p.vals[key].(string); ok {
 		return v
 	}
 	return def

@@ -87,10 +87,15 @@ func (l *layout) listItem(li *ast.ListItem, marker string, task, checked bool) e
 	for c := li.FirstChild(); c != nil; c = c.NextSibling() {
 		switch v := c.(type) {
 		case *ast.Paragraph:
-			if err := l.textBlock(collectSpans(v, l.src), WeightRegular, fsBody, lhBody); err != nil {
+			// 松散列表项的段落是**独立块**：走 paragraphLines 才会做
+			// margin collapsing（gap(0)+bottom(mbPara)）。直接 textBlock
+			// 会让第二段零间距，也会吃掉代码块/嵌套列表之后的段间距。
+			if err := l.paragraph(v); err != nil {
 				return err
 			}
 		case *ast.TextBlock:
+			// 紧凑列表项只有一行内容（CommonMark 定义），没有块间距可折叠，
+			// 保持原路径。
 			if err := l.textBlock(collectSpans(v, l.src), WeightRegular, fsBody, lhBody); err != nil {
 				return err
 			}

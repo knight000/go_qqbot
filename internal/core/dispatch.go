@@ -30,8 +30,30 @@ type Dispatcher struct {
 
 	sem chan struct{}
 
+	// runCtx 是 peerLoop 的生命周期，与网关收到的 ctx 解耦：关停时先要把
+	// 队列排空（排空期间的写库不能被打断），排空之后才由 Wait 取消它让协程
+	// 退出。直接复用网关 ctx 的话，信号一到协程就退出，队列里剩下的事件被
+	// 丢掉、正在 Handle 里的写库也会 context canceled（P2-7）。
+	runCtx    context.Context
+	stopLoops context.CancelFunc
+	loops     sync.WaitGroup
+
+	// sendCtx 是发送的生命周期：与 handler 的 3s 截止解耦（否则图片上传会被
+	// 压回 5s），但只由关停取消。Wait 到期时掐断在途发送，避免一条 30s 上传
+	// 把关库拖到发送之后（现场就是 "database is closed"），也让关停不必为
+	// 一条发不出去的图超期退出。
+	sendCtx     context.Context
+	cancelSends context.CancelFunc
+
 	mu    sync.Mutex
 	peers map[string]*peerQueue
+	// inflight 是"已入队、尚未处理完"的事件数，Wait 靠它判断排空。
+	inflight int
+	// idle 在 inflight 从 0 变正时重建、归零时关闭，供 Wait 使用。
+	idle chan struct{}
+	// draining 为 true 之后 Dispatch 不再接收新事件：关停中的进程不该再
+	// 往队列里塞东西，否则 Wait 永远等不到归零。
+	draining bool
 }
 
 type peerQueue struct {
@@ -49,38 +71,69 @@ func NewDispatcher(r *Router, s *Sender, log *slog.Logger, handlerTimeout time.D
 	if handlerTimeout <= 0 {
 		handlerTimeout = 3 * time.Second
 	}
+	runCtx, stopLoops := context.WithCancel(context.Background())
+	sendCtx, cancelSends := context.WithCancel(context.Background())
 	return &Dispatcher{
-		router:  r,
-		sender:  s,
-		log:     log,
-		handler: handlerTimeout,
-		sem:     make(chan struct{}, workerLimit),
-		peers:   make(map[string]*peerQueue),
+		router:      r,
+		sender:      s,
+		log:         log,
+		handler:     handlerTimeout,
+		sem:         make(chan struct{}, workerLimit),
+		runCtx:      runCtx,
+		stopLoops:   stopLoops,
+		sendCtx:     sendCtx,
+		cancelSends: cancelSends,
+		peers:       make(map[string]*peerQueue),
 	}
 }
 
 // Dispatch 只做入队，不阻塞 WSS 读循环。
-func (d *Dispatcher) Dispatch(ctx context.Context, ev *host.Event) {
+func (d *Dispatcher) Dispatch(ev *host.Event) {
 	key := string(ev.Scene) + ":" + ev.PeerID
 
 	d.mu.Lock()
+	if d.draining {
+		d.mu.Unlock()
+		d.log.Warn("关停中，丢弃新事件", "peer", key, "event", ev.ID, "name", ev.Name)
+		return
+	}
 	q, ok := d.peers[key]
 	if !ok || q.closed {
 		q = &peerQueue{ch: make(chan *host.Event, queueDepth)}
 		d.peers[key] = q
-		go d.peerLoop(ctx, key, q)
+		d.loops.Add(1)
+		go d.peerLoop(key, q)
 	}
-	d.mu.Unlock()
 
+	// 入队与计数必须和"查找队列"在同一个临界区：peerLoop 的空闲回收会
+	// 摘掉空队列，若在解锁之后才发送，事件会落进没人读的 channel ——
+	// inflight 永远不归零，Wait 只能等到超时。
+	if d.inflight == 0 {
+		d.idle = make(chan struct{})
+	}
+	d.inflight++
 	select {
 	case q.ch <- ev:
+		d.mu.Unlock()
 	default:
+		d.finishOne()
+		d.mu.Unlock()
 		// 背压：队列满说明该 peer 处理不过来，宁可丢事件也不拖垮全局
 		d.log.Warn("peer 队列已满，丢弃事件", "peer", key, "event", ev.ID, "name", ev.Name)
 	}
 }
 
-func (d *Dispatcher) peerLoop(ctx context.Context, key string, q *peerQueue) {
+// finishOne 记账"一条事件处理完了"，并在归零时唤醒 Wait。
+func (d *Dispatcher) finishOne() {
+	d.inflight--
+	if d.inflight == 0 {
+		close(d.idle)
+	}
+}
+
+func (d *Dispatcher) peerLoop(key string, q *peerQueue) {
+	defer d.loops.Done()
+
 	timer := time.NewTimer(idleEvictTime)
 	defer timer.Stop()
 
@@ -91,7 +144,10 @@ func (d *Dispatcher) peerLoop(ctx context.Context, key string, q *peerQueue) {
 				<-timer.C
 			}
 			timer.Reset(idleEvictTime)
-			d.handle(ctx, ev)
+			d.handle(d.runCtx, ev)
+			d.mu.Lock()
+			d.finishOne()
+			d.mu.Unlock()
 
 		case <-timer.C:
 			d.mu.Lock()
@@ -104,9 +160,85 @@ func (d *Dispatcher) peerLoop(ctx context.Context, key string, q *peerQueue) {
 			d.mu.Unlock()
 			timer.Reset(idleEvictTime)
 
-		case <-ctx.Done():
+		case <-d.runCtx.Done():
 			return
 		}
+	}
+}
+
+// Wait 关掉入口、等在途与排队的事件处理完，然后让 per-peer 协程退出。
+//
+// 返回 false 表示 ctx 先到期：此时关库会与在途写并发，调用方必须以非 0
+// 退出（P3-23），不能当成"优雅关闭"糊过去。
+func (d *Dispatcher) Wait(ctx context.Context) bool {
+	d.mu.Lock()
+	d.draining = true
+	d.mu.Unlock()
+
+	drained := true
+	for {
+		d.mu.Lock()
+		if d.inflight == 0 {
+			d.mu.Unlock()
+			break
+		}
+		idle := d.idle
+		d.mu.Unlock()
+
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			// 关停期限已到：在途发送必须立刻放手，否则一条 30s 的上传会
+			// 把关库推到发送之后（写库撞 "database is closed"），关停也
+			// 必然以超期收场。掐断后再给 handler 一点收尾时间——发送一旦
+			// 返回，剩下的只是记日志，正常在毫秒级结束。
+			d.cancelSends()
+			drained = waitClosed(idle, sendCancelGrace)
+		}
+		if !drained {
+			break
+		}
+	}
+
+	// 超时也要停协程：卡住的 Handle 再不放弃，进程就退不掉了。
+	// 这一步之后的写库失败是超时的代价，已经由返回 false 报告给调用方。
+	d.stopLoops()
+
+	exited := make(chan struct{})
+	go func() {
+		d.loops.Wait()
+		close(exited)
+	}()
+
+	// ctx 可能已经到期（超时路径）。不能再用它等协程退出：select 在两个
+	// case 同时就绪时随机选，会让"排空已顺利完成"随机报成失败。
+	waitCtx, cancel := ctx, context.CancelFunc(func() {})
+	if ctx.Err() != nil {
+		waitCtx, cancel = context.WithTimeout(context.Background(), sendCancelGrace)
+	}
+	defer cancel()
+
+	select {
+	case <-exited:
+		return drained
+	case <-waitCtx.Done():
+		return false
+	}
+}
+
+// sendCancelGrace 是掐断在途发送之后等 handler 收尾的窗口。发送已经返回，
+// 剩下的只有日志与返回，正常在毫秒级；给 2s 只为容忍一次日志落盘。
+const sendCancelGrace = 2 * time.Second
+
+// waitClosed 在 d 时间内等 ch 关闭，false 表示没等到。
+func waitClosed(ch <-chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -321,10 +453,12 @@ func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {
 		return
 	}
 
-	// handler ctx 可能已被取消，回复必须用独立 ctx，否则平台侧收到空请求
-	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer rcancel()
-	if err := d.sender.Reply(rctx, ev, *reply); err != nil {
+	// 发送预算由 Sender 按回复内容决定（纯文本 5s、含上传 30s），这里只剥掉
+	// handler 的截止时间，不再自己拍一个 5s——那会把上传的 30s 压回 5s。
+	// 但剥掉的取消权必须由关停接手（sendCtx）：否则关停只能干等满一整条
+	// 上传预算，30s 之后才开始关库。
+	// 插件拿不到 Reply 的错误，超时判断与降级只能在核心内做。
+	if err := d.sender.Reply(d.sendCtx, ev, *reply); err != nil {
 		if errors.Is(err, ErrRateLimited) {
 			// 429 是平台侧事实，本地账本需要据此校正；不能盲目重试（重试可能仍是 429）
 			d.log.Warn("回复被平台限流(429)，请检查本地额度与平台配额",

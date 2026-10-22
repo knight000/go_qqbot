@@ -142,6 +142,36 @@ type glyph struct {
 // inlinePad 是行内代码的左右内边距（GitHub 的 .4em）。
 func inlinePad() float64 { return math.Round(fsCode * 0.4) }
 
+// sameRunStyle 判断两个相邻字形会不会被 drawLine 画进同一次 DrawString。
+// 分组键（face、颜色、删除线、换行、缺字）只在这里写一遍：折行时的 kern
+// （kernOf）与绘制时的分组必须用同一个判据，两处分叉会让"算出来的行宽"
+// 与"画出来的行宽"差出几个 kern，表现为行尾留缝或文字越界。
+func sameRunStyle(a, b glyph) bool {
+	return !a.br && !b.br && !a.missing && !b.missing &&
+		a.f == b.f && a.col == b.col && a.strike == b.strike
+}
+
+// kernOf 是一对相邻字形的字距调整（像素，通常为负）。跨 run 时为 0：
+// 那里不会真的应用 kern，算进推进量就会多扣一截。
+func kernOf(prev, cur glyph) float64 {
+	if !sameRunStyle(prev, cur) {
+		return 0
+	}
+	return float64(prev.f.Kern(prev.r, cur.r)) / 64
+}
+
+// pxAdvance 是第 i 个字形相对前一个的推进量：自身 adv 加与同行前一个字形
+// 的 kern。i 为 0（行首或 run 首）时没有前一个可加。
+//
+// 折行判决、绘制推进、列宽测量都必须走这一个函数：font.Drawer 测量与绘制
+// 都含 kern，只累加 GlyphAdvance 会让长行提前几个像素断、run 边界留缝。
+func pxAdvance(gs []glyph, i int) float64 {
+	if i <= 0 {
+		return gs[i].adv
+	}
+	return gs[i].adv + kernOf(gs[i-1], gs[i])
+}
+
 // glyphs 把 span 拍平成逐字符的字形。首选字族按字符选：CJK 走 FontSC，
 // 拉丁走 FontSans；行内代码用 FontMono。首选族没有该字形时沿回退链继续问，
 // 三族都没有才算缺字（见 pickFace）。
@@ -163,16 +193,18 @@ func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 			weight = WeightBold
 		}
 
+		// 颜色优先级：链接的强调色压过引用块的 muted。反过来会让引用块里的
+		// 链接与正文同色，静态图里唯一的链接线索就没了。
 		col := colFg
-		if s.link {
-			col = colAccent
-		}
 		if l.muted {
 			col = colMuted
 		}
+		if s.link {
+			col = colAccent
+		}
 
 		start := len(out)
-		for _, r := range s.text {
+		for _, r := range expandInline(s.text) {
 			pref := familyOfRune(r)
 			if (s.code || s.mono) && !isCJK(r) {
 				pref = FontMono
@@ -204,6 +236,32 @@ func (l *layout) glyphs(sp []span, w Weight, size float64) ([]glyph, error) {
 		}
 	}
 	return out, nil
+}
+
+// expandInline 是行内文本的**唯一**预处理点：tab 展开成 4 个空格（与代码块
+// 的展开一致）、控制字符丢弃。
+//
+// 字体里没有 tab 与多数 C0/C1 控制字符的字形：不预处理就会被当成缺字画成
+// 方框，还会让"字体子集外"的 warn 误报——那是一条会把真正缺字淹掉的假警报。
+// 代码块路径早在 codeLines 里展开过 tab，行内是漏掉的另一半。控制字符连
+// 推进量都不占：它们没有可画的形态，留白只会让行距看着莫名变大。
+func expandInline(s string) string {
+	if !strings.ContainsFunc(s, func(r rune) bool { return r == '\t' || unicode.IsControl(r) }) {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			sb.WriteString("    ")
+		case unicode.IsControl(r):
+			// 丢弃。
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
 }
 
 // pickFace 按回退链接逐族取字形，返回第一个**真有该字形**的 face 及其推进量。
@@ -287,10 +345,10 @@ func (l *layout) drawLine(gs []glyph, x, y, lineH float64, fallback font.Face) {
 		j := i
 		var sb strings.Builder
 		width := 0.0
-		for j < len(gs) && !gs[j].br && !gs[j].missing &&
-			gs[j].f == gs[i].f && gs[j].col == gs[i].col && gs[j].strike == gs[i].strike {
+		for j < len(gs) && sameRunStyle(gs[i], gs[j]) {
 			sb.WriteRune(gs[j].r)
-			width += gs[j].adv
+			// 与 drawLine 的分组条件一致：run 内的相邻字形才有 kern。
+			width += pxAdvance(gs, j)
 			j++
 		}
 		// 药丸左 padding 已经算在首个字形的 adv 里，文本从 padding 之后开始。
@@ -316,7 +374,7 @@ func (l *layout) drawCodePills(gs []glyph, x, baseline float64) {
 		}
 		j, w := i, 0.0
 		for j < len(gs) && gs[j].code && !gs[j].br {
-			w += gs[j].adv
+			w += pxAdvance(gs, j)
 			j++
 		}
 		asc, desc := faceAscentDescent(gs[i].f)

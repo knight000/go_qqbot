@@ -64,7 +64,7 @@ func TestTraceEndToEnd(t *testing.T) {
 		t.Fatalf("装配路由: %v", err)
 	}
 	f := &fakeAPI{}
-	sender := NewSender(f, log, ActivePolicy{}, nil)
+	sender := NewSender(f, log, ActivePolicy{}, nil, time.Local)
 	sender.trace = tr
 	disp := NewDispatcher(router, sender, log, time.Second)
 	disp.trace = tr
@@ -126,7 +126,7 @@ func TestTracePluginLevel(t *testing.T) {
 		t.Fatalf("装配路由: %v", err)
 	}
 	f := &fakeAPI{}
-	sender := NewSender(f, log, ActivePolicy{}, nil)
+	sender := NewSender(f, log, ActivePolicy{}, nil, time.Local)
 	sender.trace = tr
 	disp := NewDispatcher(router, sender, log, time.Second)
 	disp.trace = tr
@@ -387,7 +387,7 @@ func TestTraceReceivedShowsBotRole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("装配路由: %v", err)
 	}
-	sender := NewSender(&fakeAPI{}, log, ActivePolicy{}, nil)
+	sender := NewSender(&fakeAPI{}, log, ActivePolicy{}, nil, time.Local)
 	disp := NewDispatcher(router, sender, log, time.Second)
 	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
 

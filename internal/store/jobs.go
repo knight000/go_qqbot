@@ -138,16 +138,6 @@ func (db *DB) RecordJobRun(ctx context.Context, jobID, peer string, started, fin
 	return nil
 }
 
-// CountJobRuns 统计某会话的执行历史，供 R2 预览与执行前后对账。
-func (db *DB) CountJobRuns(ctx context.Context, peer string) (int64, error) {
-	var n int64
-	if err := db.r.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM job_runs WHERE peer = ?`, peer).Scan(&n); err != nil {
-		return 0, fmt.Errorf("统计任务记录: %w", err)
-	}
-	return n, nil
-}
-
 // DisableJobsExcept 停用不再由任何插件注册的任务（插件被删除后的清理）。
 //
 // keep 里是不带 peer 的任务 id（<plugin>:<name>），per-peer 实例行的 id 相同，

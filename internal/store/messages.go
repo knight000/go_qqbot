@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -65,11 +66,13 @@ func (db *DB) PurgeEvents(ctx context.Context, before int64, limit int) (int64, 
 		before, limit)
 }
 
+// purgeJobRunsSQL 是 job_runs 的分批清理语句。单独提成常量是为了让
+// 「索引是否被这条查询用上」可以在测试里对着同一份 SQL 跑 EXPLAIN QUERY PLAN。
+const purgeJobRunsSQL = `DELETE FROM job_runs WHERE id IN
+			(SELECT id FROM job_runs WHERE started_at < ? LIMIT ?)`
+
 func (db *DB) PurgeJobRuns(ctx context.Context, before int64, limit int) (int64, error) {
-	return db.purge(ctx,
-		`DELETE FROM job_runs WHERE id IN
-			(SELECT id FROM job_runs WHERE started_at < ? LIMIT ?)`,
-		before, limit)
+	return db.purge(ctx, purgeJobRunsSQL, before, limit)
 }
 
 // PurgeMediaRows 只删行；文件删除由媒体模块负责（本脚手架未启用下载）。
@@ -84,20 +87,17 @@ func (db *DB) purge(ctx context.Context, query string, args ...any) (int64, erro
 	if err != nil {
 		return 0, fmt.Errorf("分批清理: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, nil
-	}
-	return n, nil
+	return purgeResult(res)
 }
 
-// DeletePeerMessages 用于 R2 重置（脚手架阶段尚未接指令，先提供能力）。
-func (db *DB) DeletePeerMessages(ctx context.Context, peer string) (int64, error) {
-	res, err := db.w.ExecContext(ctx, `DELETE FROM messages WHERE peer_openid = ?`, peer)
+// purgeResult 读删除行数。失败必须上报：调用方（GC）用 n < batch 判断
+// "删完了没有"，把错误吞成 0 等于告诉它"这一批已经删空"，剩余行要等
+// 下个周期，且日志里没有任何痕迹。
+func purgeResult(res sql.Result) (int64, error) {
+	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("清理 peer 消息: %w", err)
+		return 0, fmt.Errorf("分批清理: 读取删除行数: %w", err)
 	}
-	n, _ := res.RowsAffected()
 	return n, nil
 }
 

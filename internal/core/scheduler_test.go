@@ -610,6 +610,58 @@ func TestStopCancelsRunningJobAndBlocksNewOnes(t *testing.T) {
 	}
 }
 
+// 关停时正在跑的任务必须把收尾状态写进库。
+//
+// 收尾写入如果沿用 Stop 已经取消的 ctx，UpdateJob/RecordJobRun 会双双失败：
+// next_run_at 停在原处、job_runs 少一行，5 分钟内重启时 DueJobs 仍认为它到期，
+// 同一个任务在同一个群里再推一遍；超过 5 分钟又被判 skipped，静默不补。
+func TestJobStatusPersistedAfterStop(t *testing.T) {
+	s, db := newTestScheduler(t)
+	hold := make(chan struct{}) // 永不关闭：任务只能靠取消退出
+	defer close(hold)
+	r := &probeRunner{plugin: "digest", hold: hold}
+	s.Bind("digest", r)
+	registerPerPeer(t, s, db, "digest", "tick", []string{"g1"})
+
+	due := time.Now().Unix() - 10
+	s.runDue()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(r.ran()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("任务未开始执行")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s.Stop()
+	waitScheduler(t, s)
+
+	ctx := context.Background()
+	rows, err := db.QueryRows(ctx,
+		`SELECT next_run_at, last_status FROM jobs WHERE id = 'digest:tick' AND peer = 'g1'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("应有一行任务状态，实际 %d", len(rows))
+	}
+	next, _ := rows[0]["next_run_at"].(int64)
+	if next <= due {
+		t.Fatalf("关停后 next_run_at 应已推进（原值 %d，实际 %d）", due, next)
+	}
+	if status, _ := rows[0]["last_status"].(string); status != "error" {
+		t.Fatalf("被取消的任务应记 error，实际 %q", status)
+	}
+
+	runs, err := db.QueryRows(ctx, `SELECT status FROM job_runs WHERE job_id = 'digest:tick'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("job_runs 应有一行，实际 %d（收尾写入被关停打断了）", len(runs))
+	}
+}
+
 // Wait 的 false 分支：任务还在跑、期限先到。
 func TestWaitReportsTimeoutWhileJobRunning(t *testing.T) {
 	s, db := newTestScheduler(t)
