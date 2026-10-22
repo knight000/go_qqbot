@@ -273,6 +273,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 7 | `Host.HTTP` 的非 2xx 统一返回 `*HTTPStatusError`，插件不必 import `internal/httpx` 就能分辨 429 与普通失败 | — |
 | 8 | ① `Manifest.Yield` 取代 `Broadcast`：是否让位由每个匹配者自己声明（§3.4），`broadcast` 字段删除；② `Event.Command` / `Event.Args` 由核心填好，前缀匹配按词边界（`/md5` 不再命中 `/md`）；③ `Event.Mentioned` / `Event.Raw` 暴露“是否 @ 了机器人”与原始载荷 | #11 / #12 / #13 |
 | 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16 |
+| 10 | ① `host.Params.Str` 区分「键缺失」与「键存在但为空串」：空串返回 `""` 而不是默认值；② `Host.Store.Query` 的只读改由 SQLite `query_only` 连接保证、SQL 原样执行（不再自动追加 `LIMIT`），行数在取行时截断到 1000 | #30 |
 
 ### 3.3 Host 能力（唯一对外通道）
 

@@ -49,8 +49,15 @@ import (
 //   - Event.Session 非 nil 表示这条消息是对本插件 Await 的回应，内容是
 //     Await 时写入的 state，此时 Command / Args 恒为空。
 //
+// 版本 10：Host 的两处**可观察语义**变了（签名未变，所以最容易漏改）：
+//   - Params.Str 不再把「键存在但值为空串」当成未设置：此时返回 ""，
+//     不回退默认值。想表达"没配置"就不要写这个键；
+//   - Store.Query 的只读改由 SQLite 的 query_only 连接保证（`WITH … DELETE`
+//     之类也会被拒），SQL 原样执行、不再自动追加 LIMIT，行数在取行时
+//     截断到 1000。写语句以前可能"碰巧能过"，现在一定失败。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "9"
+const APIVersion = "10"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //
