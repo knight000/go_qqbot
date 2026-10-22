@@ -55,9 +55,30 @@ const (
 // 变量而非常量只为让测试把长度压到 1 位，好在可枚举的范围里造出一次碰撞。
 var appHashLen = 16
 
-// tempDir 是 appID 锁文件所在目录。用变量而非常量，只为让测试把锁文件收进
-// t.TempDir()：锁文件按设计永不删除，测试不该往真实临时目录里堆垃圾。
+// tempDir 是 appID 锁文件所在目录的默认值。用变量而非常量，只为让测试把
+// 锁文件收进 t.TempDir()：锁文件按设计永不删除，测试不该往真实临时目录里堆垃圾。
 var tempDir = os.TempDir
+
+// LockDirEnv 指定 appID 锁文件所在目录，空则用系统临时目录。
+//
+// 为什么不能只依赖 os.TempDir()：部署单元设了 PrivateTmp=true（见
+// deploy/qqbot.service），/tmp 对每个 unit 是**私有命名空间**。同一 appID
+// 的第二份部署（另一个 unit，或运维手工起的进程）会看到另一个 /tmp，
+// 两把"同一把"锁互不可见，双开照样发生。所以 unit 里用
+// RuntimeDirectory=qqbot + QQBOT_LOCK_DIR=/run/qqbot 把锁放到共享位置。
+const LockDirEnv = "QQBOT_LOCK_DIR"
+
+// lockDir 返回 appID 锁目录。设了 LockDirEnv 就只用它，不回退——静默回退
+// 等于把 PrivateTmp 那个坑原地埋回去。
+func lockDir() string {
+	if d := strings.TrimSpace(os.Getenv(LockDirEnv)); d != "" {
+		// 部署单元由 RuntimeDirectory 建好目录；手工设置环境变量时兜一层，
+		// 建不出来就留给后续加锁报错，不要偷偷换成临时目录。
+		_ = os.MkdirAll(d, 0o700)
+		return d
+	}
+	return tempDir()
+}
 
 // Options 描述一次加锁。
 type Options struct {
@@ -271,7 +292,7 @@ func acquireApp(opts Options) (*fileLock, error) {
 func appLockPaths(appID string) (primary, full string) {
 	sum := sha256.Sum256([]byte(appID))
 	h := hex.EncodeToString(sum[:])
-	dir := tempDir()
+	dir := lockDir()
 	return filepath.Join(dir, "qqbot-"+h[:appHashLen]+".lock"),
 		filepath.Join(dir, "qqbot-"+h+".lock")
 }
