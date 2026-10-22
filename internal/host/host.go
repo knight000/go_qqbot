@@ -291,6 +291,8 @@ var (
 	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
 	// ErrActiveDisabled 是主动消息总开关关闭，或本插件不在 [active].plugins
 	// 白名单里。两种原因的处置相同：改配置，重试没有意义。
+	// 究竟卡在哪一条闸门写在错误串里（总开关还是白名单，带场景与 peer），
+	// 但那只供排障——判别用上面的 errors.Is。
 	ErrActiveDisabled = errors.New("主动消息未开启")
 	// ErrRateLimited 表示平台返回 429（官方只给状态码 + err_code，不承诺
 	// Retry-After）；本地 (scene, peer) 冷却期内也直接返回它，且不出网。
