@@ -188,3 +188,36 @@ func TestInlineStylesRenderTogether(t *testing.T) {
 
 	writeSample(t, "inline.png", data)
 }
+
+// 源码里的一个换行就是视觉上的一行：软换行必须和行尾两空格的硬换行画出
+// 同样的行数，真正的空格仍然留在同一行。
+//
+// 用高度断言：这是行内拍平层的外部可观察面——软换行被落成空格时整段会被
+// 折成一行，高度恰好少一个行盒（#32）。
+func TestSoftLineBreakRendersAsLineBreak(t *testing.T) {
+	soft := imgHeight(t, "甲\n乙")
+	hard := imgHeight(t, "甲  \n乙")
+	space := imgHeight(t, "甲 乙")
+
+	if soft != hard {
+		t.Errorf("软换行高 %d ≠ 硬换行高 %d，源码换行应当与行尾两空格等价", soft, hard)
+	}
+	if soft <= space {
+		t.Errorf("软换行高 %d 不大于单行 %d，源码换行被拍成了空格", soft, space)
+	}
+}
+
+// /md 的实报场景：五行输入被画成三行（后三行拼成一行）。这里用「三行正文
+// 拼成一段」的最小形态锁住它，比逐行比对像素更稳，也解释了 468 这个高度。
+func TestParagraphKeepsEverySourceLine(t *testing.T) {
+	soft := imgHeight(t, "你好\n你们 **好**\n`测试`")
+	hard := imgHeight(t, "你好  \n你们 **好**  \n`测试`")
+	joined := imgHeight(t, "你好 你们 好 测试")
+
+	if soft != hard {
+		t.Errorf("三行正文高 %d ≠ 逐行硬换行 %d，段落里的换行没有都变成换行", soft, hard)
+	}
+	if soft <= joined {
+		t.Errorf("三行正文高 %d 不大于单行 %d，三行被拼成了一行", soft, joined)
+	}
+}
