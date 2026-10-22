@@ -147,8 +147,11 @@ D5 的前提有两层，必须分清：
 - **跨 peer 并行**：工作池上限默认 16，超限排队而非丢弃。
 - 全程无阻塞 IO 占用工作池：所有 HTTP 带 `context` 超时（默认 5 s）。
 - **单实例由两把文件锁保证**，不是靠部署纪律。按「先 appID、后数据目录」的顺序取：
-  ① appID 维度 `%TMP%/qqbot-<sha256(appID)[:16]>.lock`——约束"这台机器上的这个 bot"，
-  放在系统临时目录是因为它跟数据目录在哪无关，放在库旁边就又会退化成"换个目录就能双开"；
+  ① appID 维度 `%TMP%/qqbot-<sha256(appID)[:16]>.lock`（可由 `QQBOT_LOCK_DIR` 换目录）——约束"这台机器上的这个 bot"，
+  放在系统临时目录是因为它跟数据目录在哪无关，放在库旁边就又会退化成"换个目录就能双开"。
+  部署单元带 `PrivateTmp=true` 时 `/tmp` 是 unit 私有命名空间，第二个 unit 会看到另一个
+  `/tmp`，所以 `deploy/qqbot.service` 用 `RuntimeDirectory=qqbot` + `QQBOT_LOCK_DIR=/run/qqbot`
+  把锁放到共享目录；设了该变量就只用它，不回退（静默回退等于把坑埋回去）；
   ② 数据目录维度 `<store.path>.lock`——约束一份 SQLite。两把都是操作系统级锁
   （Unix `flock` / Windows `CreateFile` 独占共享模式），进程结束由内核释放，崩溃或
   `kill -9` 都不留残留，因此锁文件**永不删除**（删掉别人正持有的锁会引入两个实例
@@ -554,6 +557,19 @@ CREATE TABLE qq_groups (
   updated_at    INTEGER NOT NULL
 );
 CREATE INDEX idx_qq_groups_mode ON qq_groups(mode, last_seen_at);
+
+-- 身份映射：openid ↔ union_openid。
+-- 鉴权不依赖它（openid 跨场景同值），它用于解析主动消息的投递地址，
+-- 并在平台回传 union_openid 时提供兜底匹配。
+CREATE TABLE identities (
+  openid       TEXT NOT NULL,
+  scene        TEXT NOT NULL,
+  peer_scope   TEXT NOT NULL DEFAULT '',
+  union_openid TEXT NOT NULL DEFAULT '',
+  last_seen    INTEGER NOT NULL,
+  PRIMARY KEY (openid, scene, peer_scope)
+);
+CREATE INDEX idx_identities_union ON identities(union_openid);
 
 -- 重置审计（不可省略：重置是不可逆操作）
 -- status: pending（等确认码）/ done（成功，参与冷却）/ failed（执行失败，不参与冷却）/

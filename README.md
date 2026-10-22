@@ -420,7 +420,7 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 
 启动时按「先 appID、后数据目录」的顺序取两把**操作系统级**文件锁，拿不到就直接退出，不连网关、不开库：
 
-- **appID 维度**：`%TMP%/qqbot-<sha256(appID) 前 16 位>.lock`，约束"这台机器上的这个 bot"——换个数据目录也躲不掉；
+- **appID 维度**：`%TMP%/qqbot-<sha256(appID) 前 16 位>.lock`（可用 `QQBOT_LOCK_DIR` 换目录，见下），约束"这台机器上的这个 bot"——换个数据目录也躲不掉；
 - **数据目录维度**：`<store.path>.lock`，约束"这份 SQLite 只被一个进程打开"。
 
 ```
@@ -446,6 +446,8 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 管理器里搜 `qqbot`，Linux 用 `ps -p <pid> -o pid,etime,cmd`。
 
 appID 锁落在系统临时目录，**临时目录不得对运行中的 bot 做自动清理**（`tmpwatch`、`systemd-tmpfiles` 之类）：Unix 的 `flock` 跟的是 inode，文件被删掉后下一个进程会在同路径另建一个，两把锁互不相识，"单实例"当场失效。
+
+systemd 单元默认带 `PrivateTmp=true`，`/tmp` 对每个 unit 是**私有命名空间**：两个 unit 会各看到一个 `/tmp`，appID 锁互不可见，"同一 bot 只能跑一个进程"被绕过。所以 `deploy/qqbot.service` 里配了 `RuntimeDirectory=qqbot` + `Environment=QQBOT_LOCK_DIR=/run/qqbot`，把锁放到同机共享、随服务生命周期创建与清理的目录。设了 `QQBOT_LOCK_DIR` 就只用它（不会静默回退到 `/tmp`，否则等于把这个坑埋回去）；手工起进程时记得指向同一个目录。
 
 同一 appID 配两份数据目录仍是双开，由 appID 锁挡住；只有 `[bot].shard_id` 不同的分片部署才是合法的多进程形态。
 
