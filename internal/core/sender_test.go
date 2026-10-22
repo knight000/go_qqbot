@@ -187,6 +187,52 @@ func TestSenderPassiveLimitC2C(t *testing.T) {
 	}
 }
 
+// 被动窗口按 msg_id 计：用尽时必须指得回是哪条消息、哪个窗口，
+// 否则一个进程里几十个会话同时回复时，日志里那行「被动回复次数已用尽」
+// 对不上现场（#36）。
+func TestSenderPassiveExhaustedErrorCarriesMsgID(t *testing.T) {
+	cases := []struct {
+		name   string
+		ev     *host.Event
+		limit  int
+		window string
+	}{
+		{"群", &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m-group"}, 5, "5 次/5 分钟"},
+		{"单聊", &host.Event{Scene: host.SceneC2C, PeerID: "u1", MsgID: "m-c2c"}, 4, "4 次/60 分钟"},
+	}
+	ctx := context.Background()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
+			for i := 1; i <= tc.limit; i++ {
+				if err := s.Reply(ctx, tc.ev, host.Reply{Content: "hi"}); err != nil {
+					t.Fatalf("第 %d 次回复不应失败: %v", i, err)
+				}
+			}
+
+			// 同一 msg_id 会连着失败：两条错误的措辞必须一致，才能按字符串聚合。
+			var first string
+			for i := 0; i < 2; i++ {
+				err := s.Reply(ctx, tc.ev, host.Reply{Content: "hi"})
+				if !errors.Is(err, ErrPassiveExhausted) {
+					t.Fatalf("超额第 %d 次应仍是 ErrPassiveExhausted，实际 err=%v", i+1, err)
+				}
+				if !strings.Contains(err.Error(), tc.ev.MsgID) {
+					t.Errorf("错误串应含 msg_id %q，实际 %q", tc.ev.MsgID, err)
+				}
+				if !strings.Contains(err.Error(), tc.window) {
+					t.Errorf("错误串应写明窗口 %q，实际 %q", tc.window, err)
+				}
+				if i == 0 {
+					first = err.Error()
+				} else if got := err.Error(); got != first {
+					t.Errorf("同一 msg_id 的重复失败应一致：%q vs %q", first, got)
+				}
+			}
+		})
+	}
+}
+
 func TestSenderActiveDisabled(t *testing.T) {
 	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
 	if err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveDisabled) {
