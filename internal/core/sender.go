@@ -18,6 +18,9 @@ import (
 //
 // 主动消息的三类失败不在这里：它们定义在 host（插件唯一能 import 的包），
 // 核心内部直接引用 host 侧的名字，不给同一个哨兵起第二个名字（#34）。
+//
+// 这一个留在 core、不进 host：被动回复的惯用法是由核心代发（插件从 Handle
+// 返回 *host.Reply），没有插件会拿到它，唯一的消费方是核心自身（#36）。
 var ErrPassiveExhausted = errors.New("被动回复次数已用尽")
 
 // ActivePolicy 是主动消息的本地闸门：总开关 + 插件白名单 + 每 peer 每日预算。
@@ -389,7 +392,11 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 		w.expires = now.Add(w.ttl)
 	}
 	if w.used >= w.limit {
-		return 0, ErrPassiveExhausted
+		// 窗口是按 msg_id 计的：日志里只说「次数已用尽」的话，一个进程里
+		// 几十个会话同时回复时对不上是哪条消息的第 6 次。%w 保住哨兵，
+		// 调用方的 errors.Is 不受影响（#36）。
+		return 0, fmt.Errorf("%w（%s %s，窗口 %d 次/%d 分钟）",
+			ErrPassiveExhausted, ev.Scene, ev.MsgID, w.limit, int(w.ttl/time.Minute))
 	}
 	w.used++
 	w.seq++
