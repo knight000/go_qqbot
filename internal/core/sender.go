@@ -18,6 +18,9 @@ import (
 //
 // 主动消息的三类失败不在这里：它们定义在 host（插件唯一能 import 的包），
 // 核心内部直接引用 host 侧的名字，不给同一个哨兵起第二个名字（#34）。
+//
+// 这一个留在 core、不进 host：被动回复的惯用法是由核心代发（插件从 Handle
+// 返回 *host.Reply），没有插件会拿到它，唯一的消费方是核心自身（#36）。
 var ErrPassiveExhausted = errors.New("被动回复次数已用尽")
 
 // ActivePolicy 是主动消息的本地闸门：总开关 + 插件白名单 + 每 peer 每日预算。
@@ -389,7 +392,11 @@ func (s *Sender) reserve(ev *host.Event) (int, error) {
 		w.expires = now.Add(w.ttl)
 	}
 	if w.used >= w.limit {
-		return 0, ErrPassiveExhausted
+		// 窗口是按 msg_id 计的：日志里只说「次数已用尽」的话，一个进程里
+		// 几十个会话同时回复时对不上是哪条消息的第 6 次。%w 保住哨兵，
+		// 调用方的 errors.Is 不受影响（#36）。
+		return 0, fmt.Errorf("%w（%s %s，窗口 %d 次/%d 分钟）",
+			ErrPassiveExhausted, ev.Scene, ev.MsgID, w.limit, int(w.ttl/time.Minute))
 	}
 	w.used++
 	w.seq++
@@ -467,6 +474,16 @@ func (s *Sender) ForPlugin(name string) host.Sender {
 	return &pluginSender{parent: s, name: name}
 }
 
+// activeDisabledError 是 [active].enabled 总开关这一道闸门的唯一文案。
+// 它有两条入口：插件经 ForPlugin 调 SendActive，核心自己的群生命周期通知
+// 直接调 (*Sender).SendActive。两条入口都得说同一句话，否则改文案时要记得
+// 改两处，漏一处也没有测试会变红。
+//
+// 白名单那道闸门不共用它：两者原因不同、参数也不同（多一个插件名）。
+func activeDisabledError(scene host.Scene, peer string) error {
+	return fmt.Errorf("%w（%s %s：总开关 [active].enabled=false）", host.ErrActiveDisabled, scene, peer)
+}
+
 type pluginSender struct {
 	parent *Sender
 	name   string
@@ -477,8 +494,20 @@ func (p *pluginSender) Reply(ctx context.Context, ev *host.Event, msg host.Reply
 }
 
 func (p *pluginSender) SendActive(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
-	if !p.parent.active.Enabled || !p.parent.active.Plugins[p.name] {
-		err := fmt.Errorf("%w: 插件 %s 不在 [active].plugins 白名单内", host.ErrActiveDisabled, p.name)
+	// 两条闸门分开报，且都带场景与 peer（#35）：错误串不是契约、不许解析
+	// （§3.3），它就是唯一的排障线索。合并成一个条件时，总开关关闭会被报成
+	// "插件不在白名单"，运维照着改白名单，改完仍然发不出去；串里只有插件名
+	// 时，同一个插件推给多个管理员也看不出是哪一条被挡。
+	//
+	// 先判总开关：它关着的时候，白名单是否包含该插件都无意义。
+	var err error
+	switch {
+	case !p.parent.active.Enabled:
+		err = activeDisabledError(scene, peerID)
+	case !p.parent.active.Plugins[p.name]:
+		err = fmt.Errorf("%w（%s %s：插件 %s 不在 [active].plugins 白名单内）", host.ErrActiveDisabled, scene, peerID, p.name)
+	}
+	if err != nil {
 		p.parent.trace.Sent("主动消息", scene, peerID, 0, msg.Content, err, 0)
 		return err
 	}
@@ -509,7 +538,11 @@ func (s *Sender) SendActive(ctx context.Context, scene host.Scene, peerID string
 
 func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
 	if !s.active.Enabled {
-		return host.ErrActiveDisabled
+		// 与 pluginSender 的同一条闸门共用 activeDisabledError 这一份文案：
+		// 核心自己的群生命周期通知走这条路径，不经 ForPlugin。裸哨兵在日志里
+		// 只剩"主动消息未开启"，既没有场景也没有 peer，看不出是哪一条通知
+		// 被挡（#35）。
+		return activeDisabledError(scene, peerID)
 	}
 	if peerID == "" {
 		return fmt.Errorf("缺少 peer openid")
