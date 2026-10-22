@@ -459,7 +459,7 @@ func (d *Dispatcher) run(ctx context.Context, m Match, ev *host.Event) {
 	// 上传预算，30s 之后才开始关库。
 	// 插件拿不到 Reply 的错误，超时判断与降级只能在核心内做。
 	if err := d.sender.Reply(d.sendCtx, ev, *reply); err != nil {
-		if errors.Is(err, ErrRateLimited) {
+		if errors.Is(err, host.ErrRateLimited) {
 			// 429 是平台侧事实，本地账本需要据此校正；不能盲目重试（重试可能仍是 429）
 			d.log.Warn("回复被平台限流(429)，请检查本地额度与平台配额",
 				"plugin", m.Manifest.Name, "scene", ev.Scene, "peer", ev.PeerID, "err", err)

@@ -291,7 +291,7 @@ func TestActiveImageBudgetCheckedBeforeUpload(t *testing.T) {
 		t.Errorf("主动图片消息应带 media 且无 msg_id，实际 %+v", body)
 	}
 
-	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Image: host.ImageFromBytes(tinyPNG())}); !errors.Is(err, ErrActiveQuota) {
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Image: host.ImageFromBytes(tinyPNG())}); !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("第二次应超出日预算，实际 err=%v", err)
 	}
 	if n := f.uploadCount(); n != 1 {
