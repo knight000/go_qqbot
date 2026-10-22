@@ -104,6 +104,9 @@ type passiveWindow struct {
 // nil 直接 panic：一个"忘了注入就用本地时区"的兜底正是 P2-4 那个 bug 本身，
 // 而 nil 若留到 .In() 里，现场只会看到一行与配额毫无关系的空指针栈。
 func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore, loc *time.Location) *Sender {
+	if loc == nil {
+		panic("core.NewSender: 必须注入调度时区；nil 会让日预算按进程本地时区切日，最多 2×limit 超发")
+	}
 	return &Sender{
 		api:       api,
 		log:       log,
