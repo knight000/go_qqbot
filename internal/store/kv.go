@@ -62,11 +62,14 @@ func (db *DB) KVDelete(ctx context.Context, plugin, peer, key string) error {
 	return nil
 }
 
+// purgeExpiredKVSQL 单独提成常量，供测试对着同一份 SQL 验证它走
+// idx_plugin_kv_expires（部分索引要求查询里出现等价的 IS NOT NULL）。
+const purgeExpiredKVSQL = `DELETE FROM plugin_kv
+	WHERE expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?`
+
 // PurgeExpiredKV 清掉过期 KV，随 GC 一起跑。
 func (db *DB) PurgeExpiredKV(ctx context.Context) (int64, error) {
-	res, err := db.w.ExecContext(ctx,
-		`DELETE FROM plugin_kv WHERE expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?`,
-		nowUnix())
+	res, err := db.w.ExecContext(ctx, purgeExpiredKVSQL, nowUnix())
 	if err != nil {
 		return 0, fmt.Errorf("清理过期 KV: %w", err)
 	}

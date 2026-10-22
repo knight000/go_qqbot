@@ -22,10 +22,15 @@ const (
 	ResetLevelAll       = "all"       // R3：清全部业务数据
 )
 
-// 审计状态机：pending → done | cancelled | expired。
+// 审计状态机：pending → done | failed | cancelled | expired。
+//
+// failed 与 done 必须分开：done 是冷却的计时起点，failed 不是——
+// 把失败记成 done 会让"一次没跑成的重置"锁住下一个冷却窗口，
+// 而审计本身也回答不了"这次到底成了还是败了"。
 const (
 	ResetStatusPending   = "pending"
 	ResetStatusDone      = "done"
+	ResetStatusFailed    = "failed"
 	ResetStatusCancelled = "cancelled"
 	ResetStatusExpired   = "expired"
 )
@@ -70,11 +75,15 @@ func (c ResetCounts) Total() int64 {
 //
 // 必须在删行**之前**调用：媒体行一旦删掉，文件就成了无引用的孤儿，
 // 只能靠扫盘发现，而扫盘在低配机上很贵（§8.3 第三条硬约定）。
+//
+// 谓词只认「该 peer 的消息」：`message_id IS NULL` 的行没有会话归属，
+// 不属于任何一个 peer，只由 R3 回收（AllMediaPaths 扫全库）。把它们算进
+// R2，任一 peer 的重置都会删掉别人的行，预览也会给每个 peer 重复计数。
 func (db *DB) PeerMediaPaths(ctx context.Context, peer string) ([]string, error) {
 	rows, err := db.r.QueryContext(ctx,
 		`SELECT m.path FROM media m
-		 JOIN messages msg ON msg.id = m.message_id
-		 WHERE msg.peer_openid = ? AND m.path <> ''`, peer)
+		 WHERE m.message_id IN (SELECT id FROM messages WHERE peer_openid = ?)
+		   AND m.path <> ''`, peer)
 	if err != nil {
 		return nil, fmt.Errorf("读取 peer 媒体路径: %w", err)
 	}
@@ -168,8 +177,12 @@ func (db *DB) ClearPeerData(ctx context.Context, peer string) (ResetCounts, erro
 	defer func() { _ = tx.Rollback() }()
 
 	// 先删媒体行（此时 messages 还在，子查询能取到 id），再删消息。
+	// 只删该 peer 的媒体：message_id IS NULL 的行没有会话归属，把它们一起删
+	// 等于"清 A 群顺手删了 B 群的媒体"。孤儿行由 R3（AllMediaPaths 扫全库）
+	// 回收。
 	res, err := tx.ExecContext(ctx,
-		`DELETE FROM media WHERE message_id IN (SELECT id FROM messages WHERE peer_openid = ?)`, peer)
+		`DELETE FROM media WHERE message_id IN
+			(SELECT id FROM messages WHERE peer_openid = ?)`, peer)
 	if err != nil {
 		return c, fmt.Errorf("清理媒体行: %w", err)
 	}
@@ -255,13 +268,14 @@ func (db *DB) ClearAllData(ctx context.Context) (ResetCounts, error) {
 	return c, nil
 }
 
-// AuditResetDone 直接记一条"已执行"。R0 / R1 不需要确认码，
-// 没有 pending 阶段，但同样必须留痕——审计的意义是"所有重置都能查到"。
-func (db *DB) AuditResetDone(ctx context.Context, actor, peer, level, detail string) error {
+// AuditResetFinished 直接记一条已结束的重置（没有 pending 阶段的直通路径，
+// 例如 R0 / R1）。状态由调用方给：成功传 done，失败传 failed——审计必须
+// 如实回答"这次到底成了没成"，而不是恒写 done 再把错误塞进 detail。
+func (db *DB) AuditResetFinished(ctx context.Context, actor, peer, level, status, detail string) error {
 	if _, err := db.w.ExecContext(ctx,
 		`INSERT INTO reset_audit(actor, peer, level, status, code, detail, created_at, expires_at, finished_at)
 		 VALUES(?, ?, ?, ?, '', ?, ?, 0, ?)`,
-		actor, peer, level, ResetStatusDone, detail, nowUnix(), nowUnix()); err != nil {
+		actor, peer, level, status, detail, nowUnix(), nowUnix()); err != nil {
 		return fmt.Errorf("写入重置审计: %w", err)
 	}
 	return nil
@@ -274,8 +288,12 @@ func (db *DB) PeerStats(ctx context.Context, peer string) (ResetCounts, error) {
 		`SELECT COUNT(*) FROM messages WHERE peer_openid = ?`, peer).Scan(&c.Messages); err != nil {
 		return c, fmt.Errorf("统计 peer 消息: %w", err)
 	}
+	// 媒体口径必须与 ClearPeerData 完全一致：预览少算一类行，就会出现
+	// "说清 0 个、实际删了 1 个"的账。孤儿行（message_id IS NULL）不在
+	// R2 的范围里，既不能算进预览，也不能被删——见 PeerMediaPaths。
 	if err := db.r.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM media WHERE message_id IN (SELECT id FROM messages WHERE peer_openid = ?)`,
+		`SELECT COUNT(*) FROM media WHERE message_id IN
+			(SELECT id FROM messages WHERE peer_openid = ?)`,
 		peer).Scan(&c.MediaRows); err != nil {
 		return c, fmt.Errorf("统计 peer 媒体: %w", err)
 	}
@@ -384,7 +402,7 @@ func (db *DB) PendingReset(ctx context.Context, actor, peer, level string) (Rese
 	return r, true, nil
 }
 
-// CloseReset 结束一条审计记录（done / cancelled / expired）并补上执行摘要。
+// CloseReset 结束一条审计记录（done / failed / cancelled / expired）并补上执行摘要。
 func (db *DB) CloseReset(ctx context.Context, id int64, status, detail string) error {
 	if _, err := db.w.ExecContext(ctx,
 		`UPDATE reset_audit SET status = ?, detail = ?, finished_at = ? WHERE id = ?`,
@@ -394,7 +412,8 @@ func (db *DB) CloseReset(ctx context.Context, id int64, status, detail string) e
 	return nil
 }
 
-// LastResetDoneAt 返回该 (level, peer) 最近一次成功执行的时间，用于冷却。
+// LastResetDoneAt 返回该 (level, peer) 最近一次**成功**执行的时间，用于冷却。
+// 只认 done：failed 记录了尝试，但没有推进任何东西，不该让用户等一个窗口。
 func (db *DB) LastResetDoneAt(ctx context.Context, level, peer string) (time.Time, bool, error) {
 	var ts int64
 	err := db.r.QueryRowContext(ctx,

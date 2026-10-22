@@ -24,6 +24,7 @@ var (
 	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
 	// ErrRateLimited 表示平台返回 429。官方只给状态码 + err_code + trace_id，
 	// 不提供剩余额度，也不承诺 Retry-After，因此退避策略必须由本地按维度决定。
+	// 冷却期内（见 Sender.cooldowns）也会直接返回它，且不出网。
 	ErrRateLimited = errors.New("平台限流(HTTP 429)")
 )
 
@@ -51,6 +52,8 @@ type activeUsageStore interface {
 	// TakeActiveBudget 原子地占一格当日额度；false 表示当日已满。
 	// 返回 error 表示账本不可用，调用方必须拒发（见 sendActiveOne）。
 	TakeActiveBudget(ctx context.Context, key store.ActiveUsageKey, limit int) (bool, error)
+	// RefundActiveBudget 归还一格：只在平台明确拒绝（err_code 非 0）时调用。
+	RefundActiveBudget(ctx context.Context, key store.ActiveUsageKey) error
 }
 
 // Sender 负责 passive/active 两类出站。
@@ -66,12 +69,23 @@ type Sender struct {
 	active ActivePolicy
 	trace  *Trace
 	usage  activeUsageStore
+	// loc 是"一天"的口径。它必须与 cron 用同一个 location（由 Scheduler
+	// 注入），不能读环境变量、更不能跟进程本地时区走：部署单元默认 UTC，
+	// 而平台配额按北京时间自然日重置，两者分叉时同一个平台自然日能花掉
+	// "前一天桶里的余额 + 08:00 后的新满额"，最多 2×limit。
+	loc *time.Location
 	// now 可注入：日切、窗口过期、序号保留期都要靠时间推进来测。
 	now func() time.Time
 
 	mu      sync.Mutex
 	windows map[string]*passiveWindow
 	lastGC  time.Time
+	// cooldowns 是 (scene, peer) 的 429 冷却截止时间。
+	//
+	// 平台罚的是会话，不是某条消息：同一 peer 换个 msg_id 再来同样撞墙，
+	// 而每撞一次都会把惩罚窗口续期、再烧一格域名桶的令牌、甚至挤掉同域的
+	// 群名刷新。冷却期内直接 ErrRateLimited、不出网，比"退避后重试"正确。
+	cooldowns map[string]time.Time
 }
 
 type passiveWindow struct {
@@ -86,15 +100,42 @@ type passiveWindow struct {
 	expires time.Time
 }
 
-func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore) *Sender {
-	return &Sender{
-		api:     api,
-		log:     log,
-		active:  active,
-		usage:   usage,
-		now:     time.Now,
-		windows: make(map[string]*passiveWindow),
+// NewSender 的 loc 是日预算的切日时区，由 Scheduler 提供（与 cron 同源）。
+// nil 直接 panic：一个"忘了注入就用本地时区"的兜底正是 P2-4 那个 bug 本身，
+// 而 nil 若留到 .In() 里，现场只会看到一行与配额毫无关系的空指针栈。
+func NewSender(api messageAPI, log *slog.Logger, active ActivePolicy, usage activeUsageStore, loc *time.Location) *Sender {
+	if loc == nil {
+		panic("core.NewSender: 必须注入调度时区；nil 会让日预算按进程本地时区切日，最多 2×limit 超发")
 	}
+	return &Sender{
+		api:       api,
+		log:       log,
+		active:    active,
+		usage:     usage,
+		loc:       loc,
+		now:       time.Now,
+		windows:   make(map[string]*passiveWindow),
+		cooldowns: make(map[string]time.Time),
+	}
+}
+
+// 回复的发送预算。纯文本 5s 够用；含上传时必须给 30s ——api 层的 30s
+// 只放宽了 http.Client.Timeout，放不宽 ctx，而 5 MB 图 base64 后约 6.7 MB，
+// 10 Mbps 上行就要 5s 以上，小预算会让图永远发不出去。
+const (
+	replyTextTimeout   = 5 * time.Second
+	replyUploadTimeout = 30 * time.Second
+)
+
+// replyBudget 按这一条消息的内容决定预算。
+//
+// 判断与降级都必须在核心内完成：host.Sender.Reply 不返回错误，插件拿不到
+// "图没发出去"这件事，只能由这里给定时间并在失败时留下 Warn。
+func replyBudget(msg host.Reply) time.Duration {
+	if msg.Image.Valid() {
+		return replyUploadTimeout
+	}
+	return replyTextTimeout
 }
 
 // Reply 发送被动回复。一条 Reply 可能被拆成两条消息（图文），
@@ -106,17 +147,73 @@ func (s *Sender) Reply(ctx context.Context, ev *host.Event, msg host.Reply) erro
 	}
 	for i, part := range parts {
 		start := time.Now()
-		seq, err := s.sendPassive(ctx, ev, part)
+		// 预算按条算：图文拆成文本 + 图片两条，各拿各的，上传慢不连累文本。
+		pctx, cancel := context.WithTimeout(ctx, replyBudget(part))
+		seq, err := s.sendPassive(pctx, ev, part)
+		cancel()
 		// 无论成败都留一条轨迹：这是"插件回了什么"的唯一出口。
 		s.trace.Sent("被动回复", ev.Scene, ev.PeerID, seq, replySummary(part), err, time.Since(start))
 		if err != nil {
+			// 拆成多条时前几条可能已经发出去了。只把错误往上返回不够：
+			// dispatch 的日志没有 peer 也没有"发到第几条"，排障时对不上。
+			s.log.Warn("被动回复未完整发出",
+				"scene", ev.Scene, "peer", ev.PeerID, "msg_id", ev.MsgID,
+				"sent", i, "total", len(parts), "err", err)
 			if i == 0 {
+				// 一条都没发出去、且失败的是图片时，用户那边什么都看不到：
+				// 核心没有别的通道能告诉插件"图没发出去"（Reply 不返回错误），
+				// 只能补一句文本。前面已发过文本的不补——用户已经看到内容了。
+				//
+				// 两种例外不补：① 根本没走到发送（本地超限、上传失败）——
+				// 补发会烧掉一格被动配额，与"上传失败不消耗配额"直接冲突；
+				// ② 已被 429 罚下——冷却期内补发只会再失败一次。
+				if part.Image.Valid() && !isNotSent(err) && !errors.Is(err, ErrRateLimited) {
+					s.sendImageFailureNotice(ctx, ev)
+				}
 				return err
 			}
 			return fmt.Errorf("%w（前 %d 条已发出）", err, i)
 		}
 	}
 	return nil
+}
+
+// notSentError 标记"消息根本没走到发送这一步"（本地校验失败、上传被拒）。
+//
+// 只为了区分降级策略：走到发送才失败时用户什么都没收到，值得补一句文本；
+// 连发送都没尝试时补发等于白烧一格被动配额（§7「上传失败不消耗配额」）。
+// Error/Unwrap 原样透传，错误文案不受影响。
+type notSentError struct{ err error }
+
+func (e notSentError) Error() string { return e.err.Error() }
+func (e notSentError) Unwrap() error { return e.err }
+
+func isNotSent(err error) bool {
+	var nse notSentError
+	return errors.As(err, &nse)
+}
+
+// imageFailedText 是图片发不出去时补发的说明。
+//
+// 纯图片回复失败时用户什么都收不到——比一条"失败"更糟：插件以为发出去了，
+// 用户以为机器人没理他。核心没有别的通道能回传这件事（Reply 不返回错误），
+// 所以只能在同一 msg_id 的被动配额里补一句。
+const imageFailedText = "图片发送失败，请稍后重试"
+
+// sendImageFailureNotice 补发图片失败的说明，best-effort。
+//
+// 不递归（sendPassive 不会再走 Reply）、不重试（失败就只留 Warn）：
+// 这条补发本身也是一个错误出口，再套一层降级就会绕成环。
+func (s *Sender) sendImageFailureNotice(ctx context.Context, ev *host.Event) {
+	start := time.Now()
+	tctx, cancel := context.WithTimeout(ctx, replyTextTimeout)
+	defer cancel()
+	seq, err := s.sendPassive(tctx, ev, host.Reply{Content: imageFailedText})
+	s.trace.Sent("降级文本", ev.Scene, ev.PeerID, seq, imageFailedText, err, time.Since(start))
+	if err != nil {
+		s.log.Warn("图片发送失败后的降级文本也未发出",
+			"scene", ev.Scene, "peer", ev.PeerID, "msg_id", ev.MsgID, "err", err)
+	}
 }
 
 // splitReply 把一条 Reply 变成平台真正能发的一条或多条消息。
@@ -152,11 +249,18 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 	if ev.MsgID == "" {
 		return 0, fmt.Errorf("缺少 msg_id，无法被动回复")
 	}
+	// 冷却检查放在最前面：被 429 罚下的会话，上传与占位都不该再做一遍。
+	if wait := s.coolingDown(ev.Scene, ev.PeerID); wait > 0 {
+		return 0, rateLimitedError(ev.Scene, ev.PeerID, wait)
+	}
 
 	// 先上传再占位：图片不存在、格式不对、超限都不该吃掉一格被动配额。
 	body, err := s.bodyFor(ctx, ev.Scene, ev.PeerID, msg)
 	if err != nil {
-		return 0, err
+		// 还没走到发送这一步（本地校验失败或上传被拒）。用类型标出来，
+		// 是因为"图片发失败要不要补一条文本"的答案不同：
+		// 这里补发等于白烧一格被动配额，正是"上传失败不消耗配额"要避免的。
+		return 0, notSentError{err}
 	}
 
 	seq, err := s.reserve(ev)
@@ -167,12 +271,89 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 	body.MsgSeq = seq
 
 	if err := s.api.SendMessage(ctx, string(ev.Scene), ev.PeerID, body); err != nil {
+		// 平台明确拒绝（200 + err_code）说明这条没发出去，把占掉的那一格还回去：
+		// 否则连着几条被风控挡掉，正常回复也会发不出去。
+		s.releasePassiveOnBusinessError(ev.MsgID, err)
 		if httpx.IsStatus(err, 429) {
-			return seq, fmt.Errorf("%w (seq=%d): %v", ErrRateLimited, seq, err)
+			// 冷却时长与出站层同源：httpx 已把 Retry-After（缺省 60s）解析好，
+			// 本地再拍一个值只会两层窗口不一致（短了还会撞墙，长了就是白等）。
+			wait := httpx.RetryAfter(err)
+			s.startCooldown(ev.Scene, ev.PeerID, wait)
+			return seq, fmt.Errorf("%w (seq=%d, 冷却 %s): %v", ErrRateLimited, seq, wait, err)
 		}
 		return seq, fmt.Errorf("发送消息(seq=%d): %w", seq, err)
 	}
 	return seq, nil
+}
+
+// rateLimitedError 说明"没出网"的原因与还要等多久，日志里能直接对上平台窗口。
+func rateLimitedError(scene host.Scene, peer string, wait time.Duration) error {
+	return fmt.Errorf("%w（%s %s 冷却中，还需 %s）", ErrRateLimited, scene, peer, wait.Round(time.Second))
+}
+
+// cooldownKey 用场景 + peer 定位一次限流惩罚。msg_id 不参与：平台罚的是会话。
+func cooldownKey(scene host.Scene, peer string) string {
+	return string(scene) + "\x00" + peer
+}
+
+// coolingDown 返回该会话剩余的冷却时长；0 表示可以出网。
+//
+// 过期的条目在读取时顺手删掉：冷却窗口只有几十秒，表的大小天然被
+// "这段时间内被限流过的会话数"箍住，不需要额外的 GC 周期。
+func (s *Sender) coolingDown(scene host.Scene, peer string) time.Duration {
+	key := cooldownKey(scene, peer)
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	until, ok := s.cooldowns[key]
+	if !ok {
+		return 0
+	}
+	if !now.Before(until) {
+		delete(s.cooldowns, key)
+		return 0
+	}
+	return until.Sub(now)
+}
+
+// startCooldown 记一次冷却。重复的 429 只延长、不缩短（取较晚的截止时间）：
+// 惩罚窗口是平台的事实，本地两次记账不该把它越算越短。
+func (s *Sender) startCooldown(scene host.Scene, peer string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := cooldownKey(scene, peer)
+	until := now.Add(d)
+	if cur, ok := s.cooldowns[key]; !ok || until.After(cur) {
+		s.cooldowns[key] = until
+	}
+	for k, t := range s.cooldowns {
+		if !now.Before(t) {
+			delete(s.cooldowns, k)
+		}
+	}
+}
+
+// releasePassiveOnBusinessError 把一格被动配额还回去。
+//
+// 只认业务错误：网络失败/超时时请求可能已经到达平台，还回去等于允许实际发送
+// 超过窗口上限（群 5 次/5 分钟、单聊 4 次/小时都是平台硬约束）。
+//
+// seq 不回退：被拒的那次可能已经占用平台的 (msg_id, msg_seq) 判重记录，
+// 回退会让下一条撞上同一个序号。
+func (s *Sender) releasePassiveOnBusinessError(msgID string, cause error) {
+	var be *api.BusinessError
+	if !errors.As(cause, &be) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w, ok := s.windows[msgID]; ok && w.used > 0 {
+		w.used--
+	}
 }
 
 // bodyFor 组装请求体；带图时先把图片上传换成 file_info。
@@ -341,50 +522,100 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	if peerID == "" {
 		return fmt.Errorf("缺少 peer openid")
 	}
+	// 冷却检查必须在扣日预算之前：冷却期内被挡下的请求既不出网，也不该
+	// 烧掉一格按天计的额度。
+	if wait := s.coolingDown(scene, peerID); wait > 0 {
+		return rateLimitedError(scene, peerID, wait)
+	}
 	// 主动消息的日预算比被动窗口稀缺得多（按天计），所以先扣预算再上传：
 	// 额度已尽时不该再浪费一次上传。被动回复反过来——窗口 5 分钟就过期。
 	//
 	// 扣额度是库里的一次原子 upsert（§4.1 active_usage），因此不存在
 	// "内存清零"或"重启后从 0 重来"的问题：进程只是账本的读者之一。
-	if ok, err := s.takeActiveBudget(ctx, scene, peerID); err != nil {
+	// 占格与归还共用这一个 key：归还时若重算，跨零点就会还进次日桶，
+	// 被 used>0 兜成 no-op，等于这一格白扣（#23 的时区版本）。
+	key, ok, err := s.takeActiveBudget(ctx, scene, peerID)
+	if err != nil {
 		// fail-closed：账本不可信时不发。宁可少发一条，也不能把平台
 		// 每天 1000 条的配额当成无限量烧掉——额度超发是不可撤回的。
 		// 带上场景与 peer：日志里只有"记账失败"时定位不到是哪个会话
 		// 把账本写坏了（规则 7：错误必须指得回它发生在谁身上）。
 		return fmt.Errorf("%w（额度记账失败，按保守策略拒发；%s %s）: %v", ErrActiveQuota, scene, peerID, err)
-	} else if !ok {
+	}
+	if !ok {
 		return fmt.Errorf("%w（%s %s）", ErrActiveQuota, scene, peerID)
 	}
 
 	body, err := s.bodyFor(ctx, scene, peerID, msg)
 	if err != nil {
+		// 上传被平台拒绝时消息还没发出去，那一格预算不该记在账上。
+		s.refundActiveBudgetOnBusinessError(ctx, key, scene, peerID, err)
 		return err
 	}
 	if err := s.api.SendMessage(ctx, string(scene), peerID, body); err != nil {
+		s.refundActiveBudgetOnBusinessError(ctx, key, scene, peerID, err)
 		if httpx.IsStatus(err, 429) {
-			return fmt.Errorf("%w: %v", ErrRateLimited, err)
+			wait := httpx.RetryAfter(err)
+			s.startCooldown(scene, peerID, wait)
+			return fmt.Errorf("%w（冷却 %s）: %v", ErrRateLimited, wait, err)
 		}
 		return fmt.Errorf("发送主动消息: %w", err)
 	}
 	return nil
 }
 
-// takeActiveBudget 占一格日预算；ok=false 表示当日已用尽。
-// error 表示账本本身不可用（库没打开、写失败、ctx 取消），调用方必须拒发。
-func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID string) (bool, error) {
-	// 不限量时不必记账：DailyPerPeer<=0 是测试与"临时全开"的用法，
-	// 写库只会给一个永不读取的桶添行。注意这与"额度用尽"是两回事。
-	if s.active.DailyPerPeer <= 0 {
-		return true, nil
+// refundActiveBudgetOnBusinessError 在平台明确拒绝时归还一格主动消息日预算。
+//
+// 只认业务错误：网络失败/超时时消息可能已经发出，归还等于超发。这是既定
+// 取舍——宁可少发一条，也不能把平台每天 1000 条的配额当成无限量烧掉。
+//
+// key 必须原样来自 takeActiveBudget，不能在这里重算：占格在 23:59、归还
+// 在次日 00:01 时，重算出来的 day 已经是新的一天，那一格会还进一个
+// used==0 的桶里（被 RefundActiveBudget 的 used>0 守卫兜成 no-op），
+// 旧桶则永远记着这笔不存在的消耗。
+//
+// 归还本身失败只告警：额度账本坏了是运维问题，不该让一次发送错误再叠一层
+// 无从处理的错误；但必须留日志，否则"账多了/少了"永远查不到原因。
+func (s *Sender) refundActiveBudgetOnBusinessError(ctx context.Context, key store.ActiveUsageKey, scene host.Scene, peerID string, cause error) {
+	var be *api.BusinessError
+	if !errors.As(cause, &be) {
+		return
 	}
-	if s.usage == nil {
-		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
-		return false, errors.New("未配置主动消息额度账本")
+	if s.active.DailyPerPeer <= 0 || s.usage == nil {
+		return
 	}
-	key := store.ActiveUsageKey{
-		Day:   s.now().Format("2006-01-02"),
+	if err := s.usage.RefundActiveBudget(ctx, key); err != nil {
+		s.log.Warn("归还主动消息额度失败", "scene", scene, "peer", peerID, "err", err)
+	}
+}
+
+// usageKey 是主动消息日预算的账本坐标。
+//
+// 占格与归还必须算出同一个 key，否则"还到别的桶"等于没还。切日时区与 cron
+// 同源（平台配额按这个自然日重置），所以只能有一处格式化。
+func (s *Sender) usageKey(scene host.Scene, peerID string) store.ActiveUsageKey {
+	return store.ActiveUsageKey{
+		// 与 cron 同一个时区：平台配额按这个自然日重置，换桶也必须按它。
+		Day:   s.now().In(s.loc).Format("2006-01-02"),
 		Scene: string(scene),
 		Peer:  peerID,
 	}
-	return s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
+}
+
+// takeActiveBudget 占一格日预算；ok=false 表示当日已用尽。
+// 返回的 key 是这次占格用的账本坐标，调用方归还时必须原样带回来。
+// error 表示账本本身不可用（库没打开、写失败、ctx 取消），调用方必须拒发。
+func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID string) (store.ActiveUsageKey, bool, error) {
+	// 不限量时不必记账：DailyPerPeer<=0 是测试与"临时全开"的用法，
+	// 写库只会给一个永不读取的桶添行。注意这与"额度用尽"是两回事。
+	if s.active.DailyPerPeer <= 0 {
+		return store.ActiveUsageKey{}, true, nil
+	}
+	if s.usage == nil {
+		// 没有账本就不发：默认值不是"放行"，因为放行的代价是平台配额。
+		return store.ActiveUsageKey{}, false, errors.New("未配置主动消息额度账本")
+	}
+	key := s.usageKey(scene, peerID)
+	ok, err := s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
+	return key, ok, err
 }

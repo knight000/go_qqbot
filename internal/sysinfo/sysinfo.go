@@ -28,12 +28,17 @@ type CPU struct {
 	Cores   int     // 逻辑核数
 }
 
-// Memory 是整机内存与当前进程常驻内存。
+// Memory 是整机内存快照。
 type Memory struct {
-	Total      uint64 // 字节
-	Used       uint64 // Total - Available
-	Percent    float64
-	ProcessRSS uint64 // 进程常驻内存，取不到为 0
+	Total   uint64 // 字节
+	Used    uint64 // Total - Available
+	Percent float64
+}
+
+// ProcessMemory 是当前进程的内存占用。
+type ProcessMemory struct {
+	RSS  uint64 // 当前常驻（working set），字节
+	Peak uint64 // 进程生命周期内的峰值常驻，字节
 }
 
 // Disk 是某个路径所在分区的容量。
@@ -102,7 +107,7 @@ func ReadCPU(ctx context.Context) (CPU, error) {
 	return CPU{Percent: pct, Cores: runtime.NumCPU()}, nil
 }
 
-// ReadMemory 返回整机内存与当前进程 RSS。
+// ReadMemory 返回整机内存占用。
 func ReadMemory() (Memory, error) {
 	total, avail, err := readMem()
 	if err != nil {
@@ -116,11 +121,23 @@ func ReadMemory() (Memory, error) {
 		used = total - avail
 	}
 	return Memory{
-		Total:      total,
-		Used:       used,
-		Percent:    clampPercent(100 * float64(used) / float64(total)),
-		ProcessRSS: processRSS(),
+		Total:   total,
+		Used:    used,
+		Percent: clampPercent(100 * float64(used) / float64(total)),
 	}, nil
+}
+
+// ReadProcessMemory 返回当前进程的常驻内存与峰值常驻内存。
+//
+// 与 ReadMemory 分开：整机内存与本进程内存是两个独立的数据源，一个取不到
+// 不该把另一个也抹掉。取不到时返回错误而不是 0——"0 字节"和"没采到"在
+// /ping 上是两种完全不同的结论（评审 §3.3 P3-25）。
+func ReadProcessMemory() (ProcessMemory, error) {
+	rss, peak, err := processMemory()
+	if err != nil {
+		return ProcessMemory{}, err
+	}
+	return ProcessMemory{RSS: rss, Peak: peak}, nil
 }
 
 // ReadDisk 返回 path 所在分区的容量。path 不存在时取其最近的已存在父目录。

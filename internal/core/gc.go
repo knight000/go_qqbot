@@ -17,6 +17,12 @@ const (
 func (c *Core) gcLoop(ctx context.Context) {
 	t := time.NewTicker(gcInterval)
 	defer t.Stop()
+	// 关停要等这个信号才允许关库：runGC 里的 Purge/vacuum 都在写库。
+	defer func() {
+		if c.gcDone != nil {
+			close(c.gcDone)
+		}
+	}()
 
 	c.runGC(ctx)
 	for {

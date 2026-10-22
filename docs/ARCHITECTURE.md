@@ -44,13 +44,25 @@ D5 的前提有两层，必须分清：
 
 | 约束 | 事实 | 后果 |
 |---|---|---|
-| 鉴权 | `POST https://bots.qq.com/app/getAppAccessToken`，`{appId, clientSecret}` → `access_token` / `expires_in: 7200`；请求头 `Authorization: QQBot {token}` | 必须缓存，到期前 60 s 刷新；旧 `Bot appid.token` 已废弃 |
+| 鉴权 | `POST https://bots.qq.com/app/getAppAccessToken`，`{appId, clientSecret}` → `access_token` / `expires_in: 7200`；请求头 `Authorization: QQBot {token}` | 必须缓存，到期前 60 s 刷新；401 时作废内存与 `bot_state` 里的 token，换新 token 重试一次（并发 401 只刷新一次）；旧 `Bot appid.token` 已废弃 |
 | 接入 | v2 仅 WebSocket 长连接：`/gateway/bot` → op10 → op2 Identify → op1 心跳 → op6 Resume | 纯出站；服务器零入站端口 |
 | 环境 | 沙箱 `https://sandbox.api.sgroup.qq.com`；**IP 白名单仅作用于正式环境** | 本机可开发，动态 IP 无影响；上线需服务器固定 IP |
 | 会话配额 | `session_start_limit: total 1000 / reset 86400000 / max_concurrency 1` | 重启风暴会耗尽日配额 → 必须退避重启 + 持久化 session |
 | 被动回复 | 群：5 分钟内、最多 5 次；单聊：60 分钟内、最多 4 次 | 回复必须快；超时即失败，不能重试硬撑 |
 | 主动消息 | 群：未认证 30 qpm / 认证 60 qpm；单聊：未认证 5 qps+30 qpm；单关系 20 qpm、每群/每用户每天 1000 条 | **默认全关**，仅白名单场景开启 |
 | 富媒体 | 先 `POST /v2/{groups\|users}/{openid}/files` 换 `file_info`，再以 `msg_type=7` + `media.file_info` 发送；`file_data` 是 base64 且 ≤ 5 MB；图片软限 20 MB、硬限 200 MB；单聊与群聊的上传文件**互不通用** | 一次发图 = 两次 HTTP；超 5 MB 必须分片上传（未实现）；图文无法合并成一条消息 |
+
+**网关关闭码**决定重连姿态，而不只是日志里的一行原因：
+
+| 关闭码 | 处置 |
+|---|---|
+| 4006 / 4007 / 4900–4913 | 清 `session_id` / `seq`，下一轮重新 Identify（不再 Resume 死 session） |
+| 4009 | 保留 session，下一轮 Resume |
+| 4004 | 作废 access_token 后重连 |
+| 4008 | 至少等 60s，抖动只加长不缩短 |
+| 4001 / 4002 / 4010–4014 / 4914 / 4915 | 永久错误：停止重连，进程以退出码 1 退出，由 systemd `StartLimit` 收敛 |
+
+历史教训是 4006/4007 只被包了一层错误文本，于是进程永远 Resume 同一个死 session——重启与 `/reset` 都救不回来，只能改库。另外两条与时长有关的口径：握手（Identify/Resume 到 READY/RESUMED）30s 截止；**退避复位门槛 = READY 后稳定 30s**，连续三次寿命 <5s 的连接进 60s 冷却。
 
 ### 1.3 资源预算
 
@@ -134,24 +146,34 @@ D5 的前提有两层，必须分清：
 - **按 peer 串行**：同一 `peer_openid` 的事件进入同一队列，串行处理。理由有两个——① `msg_seq` 必须原子递增，否则并发回复同一 `msg_id` 会撞车；② 避免插件对同一用户并发查询。会话接管的判定与投递也在这个队列里（`Dispatcher.handle` 内，ADR-0004 决策 6），所以"推进会话"与"静态路由"不会并发打到同一个 peer。
 - **跨 peer 并行**：工作池上限默认 16，超限排队而非丢弃。
 - 全程无阻塞 IO 占用工作池：所有 HTTP 带 `context` 超时（默认 5 s）。
-- **单实例由文件锁保证**，不是靠部署纪律。锁文件 `<store.path>.lock` 用操作系统
-  级锁持有（Unix `flock` / Windows `CreateFile` 独占共享模式），进程结束由内核
-  释放，崩溃或 `kill -9` 都不留残留，因此锁文件**永不删除**（删掉别人正持有的
-  锁会引入两个实例同时认为自己独占的竞态）。第二个进程默认最多等 2 s 就退出，
-  错误里带持有者的 pid、可执行文件路径与启动时间；`/reload` 拉起的进程等 15 s
-  （旧进程已先放手，只是保险），因为它是交接而不是竞争。锁按**数据目录**划分——
-  不同 `[store].path` 是两个独立
-  实例，可以同时跑。但这不等于同一 appID 可以多进程：网关 session 是按
-  appID + 分片分配的，同分片两个进程仍会互顶（`4902 reset by resume`），
-  只有 `[bot].shard_id` 不同的分片部署是合法的多进程形态。
+- **单实例由两把文件锁保证**，不是靠部署纪律。按「先 appID、后数据目录」的顺序取：
+  ① appID 维度 `%TMP%/qqbot-<sha256(appID)[:16]>.lock`（可由 `QQBOT_LOCK_DIR` 换目录）——约束"这台机器上的这个 bot"，
+  放在系统临时目录是因为它跟数据目录在哪无关，放在库旁边就又会退化成"换个目录就能双开"。
+  部署单元带 `PrivateTmp=true` 时 `/tmp` 是 unit 私有命名空间，第二个 unit 会看到另一个
+  `/tmp`，所以 `deploy/qqbot.service` 用 `RuntimeDirectory=qqbot` + `QQBOT_LOCK_DIR=/run/qqbot`
+  把锁放到共享目录；设了该变量就只用它，不回退（静默回退等于把坑埋回去）；
+  ② 数据目录维度 `<store.path>.lock`——约束一份 SQLite。两把都是操作系统级锁
+  （Unix `flock` / Windows `CreateFile` 独占共享模式），进程结束由内核释放，崩溃或
+  `kill -9` 都不留残留，因此锁文件**永不删除**（删掉别人正持有的锁会引入两个实例
+  同时认为自己独占的竞态）。第二个进程 **wait=0、立刻退出**，错误里带持有者的
+  appID、pid、可执行文件路径、启动时间与主机名；两种冲突的文案可区分（appID 冲突
+  →去结束那个进程，数据目录冲突→改 `[store].path`）。`/reload` 拉起的进程等 15 s
+  （旧进程已先放手，只是保险），因为它是交接而不是竞争。只有 `[bot].shard_id`
+  不同的分片部署是合法的多进程形态：同 appID 的多个进程即使库不同也会互顶网关
+  session（`4902 reset by resume`）。
+- **启动顺序**：`config.Load` → **注册 SIGTERM/SIGINT** → 解析字体（约 300 ms）→
+  拿单实例锁 → 开库与迁移 → 起协程。信号注册必须紧跟配置加载：晚一步，这段窗口里
+  的 Ctrl-C 就走 Go 的默认处理，进程被直接杀死，session 不落盘，systemd 记成
+  `killed by signal` 而不是一次正常退出。
 - **开发期可由 supervisor 托管**：`tools/devrun` 在前台持有终端，把 `/reload` 变成
   「退出码 75 → 重新 `go generate` + `go build` → 换掉磁盘上的二进制 → 拉起」。
   这是唯一能让**新放入 `plugins/` 的插件生效**的路径：`/reload` 本身只重新执行
   磁盘上已有的二进制，不重编译、不扫目录（插件由 `host.Register` 在 `init()` 注册，
   链接哪些包取决于 `plugins_gen.go` 的 blank import）。
   协议只有两个约定：环境变量 `QQBOT_SUPERVISOR=1`（由 devrun 注入）与退出码 75
-  （`EX_TEMPFAIL`）。生产不设置该变量——服务器上没有源码与工具链，`/reload` 仍是
-  换二进制后 execve，与本节前述行为一致。
+  （`EX_TEMPFAIL`）。反过来说，**关停未在期限内完成时退出码是 1 而不是 75**：那不是
+  "请重新编译"，supervisor 不会重启，systemd 按失败处理，等人来看。生产不设置该
+  变量——服务器上没有源码与工具链，`/reload` 仍是换二进制后 execve，与本节前述行为一致。
   Windows 没有 `execve`，supervisor 也无法让 PID 保持不变；它解决的是「终端不释放」
   与「重载前重新编译」，不是进程替换语义。
 
@@ -209,6 +231,8 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 
 `Manifest` 采用声明式而非“插件自己决定是否处理”，目的是把能用数据描述的规则放在启动期校验。**实际校验到的只有这些**：`name` 非空、`api_version` 与本核心一致、`intents` 可解析、`Permission` 位合法、每个 `Command` 恰好设置 `Prefix` 或 `Pattern` 之一、正则可编译、前缀不占用核心保留前缀、`config_schema` 里每个键在 `[plugins.<name>]` 中存在且类型相符（装配期、插件 `Init` 之前）。
 
+其中两条容易按字面误解：**保留前缀按词边界比较**——`/groupinfo` 可以加载，`/group` 被拒，否则一个插件就能劫持核心指令；**`Manifest.Intents` 与 `[bot].intents` 位掩码交叉校验**——插件订阅了网关没打开的事件类型只记一条 Warn，不 fail-fast（缺位不说明插件写错，只说明它收不到）。
+
 `config_schema` 的语义是**声明即必填**：写进去的键必须有值，缺一个就启动失败，所以有默认值的键不要写进 schema。类型只有四种，与 `Host.Config()` 的读取方法一一对应；`duration` 是字符串，必须能被 `time.ParseDuration` 解析。`key = ""` 对 `string` 是「存在但为空」，合法，与「缺失」可区分。
 
 `commands` 的匹配与回传（命令词边界与参数切分只有一份实现，在路由层）：
@@ -252,16 +276,17 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 7 | `Host.HTTP` 的非 2xx 统一返回 `*HTTPStatusError`，插件不必 import `internal/httpx` 就能分辨 429 与普通失败 | — |
 | 8 | ① `Manifest.Yield` 取代 `Broadcast`：是否让位由每个匹配者自己声明（§3.4），`broadcast` 字段删除；② `Event.Command` / `Event.Args` 由核心填好，前缀匹配按词边界（`/md5` 不再命中 `/md`）；③ `Event.Mentioned` / `Event.Raw` 暴露“是否 @ 了机器人”与原始载荷 | #11 / #12 / #13 |
 | 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16 |
+| 10 | ① `host.Params.Str` 区分「键缺失」与「键存在但为空串」：空串返回 `""` 而不是默认值；② `Host.Store.Query` 的只读改由 SQLite `query_only` 连接保证、SQL 原样执行（不再自动追加 `LIMIT`），行数在取行时截断到 1000 | #30 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
 | 能力 | 签名要点 | 门控 |
 |---|---|---|
-| `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq`；`msg_seq` 在同一 `msg_id` 下**单调递增**，窗口过期只重置剩余次数、不回退序号；`Reply.Image` 非空时先上传再发 `msg_type=7` | 走频控；图文拆分后**消耗两格**被动配额；超出被动窗口直接失败并告警 |
-| `Sender.SendActive` | 主动消息；先扣本地日预算**再**发 HTTP，预算是**持久化**的（`active_usage` 表，重启不清零、跨日按本地时区自动换桶） | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启；每 peer 每日预算由 `active_usage` 承担 |
+| `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq`；`msg_seq` 在同一 `msg_id` 下**单调递增**，窗口过期只重置剩余次数、不回退序号；`Reply.Image` 非空时先上传再发 `msg_type=7`；发送预算按条算：纯文本 5s / 含上传 30s | 走频控；图文拆分后**消耗两格**被动配额；平台明确拒绝时归还该格，`msg_seq` 不回退；超出被动窗口直接失败并告警 |
+| `Sender.SendActive` | 主动消息；先扣本地日预算**再**发 HTTP，预算是**持久化**的（`active_usage` 表，重启不清零、跨日按调度时区 `Asia/Shanghai` 自动换桶，与 cron 同源、由核心注入） | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启；每 peer 每日预算由 `active_usage` 承担 |
 | `KV` / `PeerKV(peer)` | 按插件命名空间隔离的 KV，支持 TTL；`PeerKV` 多一层会话维度 | 只能读写自己的命名空间；`/reset session` 只清 `PeerKV` 写入的部分 |
-| `Store.Query` | 只读、参数化、行数上限 1000 | 不允许 DDL/写操作 |
-| `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝 |
+| `Store.Query` | 只读、参数化、行数上限 1000。只读由读连接的 `PRAGMA query_only` 保证（`WITH … DELETE` 这类写法同样被拒，不靠语句前缀过滤）；1000 行在取行时截断，SQL 不被改写，所以插件看到的语句与自己写的一致 | 不允许 DDL/写操作 |
+| `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝；白名单在重定向的**每一跳**都重新校验（拒绝 scheme 变化）；429 按 `Retry-After` 冷却域名桶（缺省 60s），冷却期内不出网 |
 | `HTTPStatusError` | `{Status int, Body string}`；`HTTP` 的四个方法在非 2xx 时返回它，`Error()` 只含状态码 | 由 host 翻译 `*httpx.HTTPError` 而来，**插件不需要 import `internal/httpx`** 就能分辨 429 与普通失败；网络错误与 ctx 取消不包装 |
 | `Config()` | `[plugins.<name>]` 只读视图：`Str` / `Bool` / `Int` / `Duration` / `Decode(ptr)` | 只能读自己的配置段；`Manifest.config_schema` 在装配期校验（声明即必填，四种类型）；`Decode` 把整段解成结构体，错误带段名与键名 |
 | `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
@@ -332,8 +357,9 @@ qqbot-plugin-torn/              插件工作区：核心仓的克隆
 - **插件更新**：进入 `plugins/<repo>/` 提交推送，不产生任何核心仓提交。
 - **编进二进制**：放入 `plugins/<repo>/` 后跑一次 `go generate ./cmd/bot`，`tools/genplugins` 扫描目录、生成 `cmd/bot/plugins_gen.go`（一行一个 blank import）。生成物不入库，所以核心仓永远只带 `main.go` 里写死的示例插件，克隆即可构建。
 - **插件目录不能有 `go.mod`**：嵌套模块会让 `go build ./...` 静默跳过它。要单独跑测试就在工作区里 `go test ./plugins/<repo>/...`。
+- **生成器的判据是 `host.Register(`**：目录（含**一层**子包）里必须出现过这个调用，光有 `package` 不算。插件代码放在 `plugins/foo/plugin/`、根包只做 blank import 转发，是合法形态；而目录里有源码却找不到 `host.Register(` 会直接 exit 1，不会生成一个"编译全绿、指令没反应"的空 import。
 
-**为什么需要「生成」这一步**：Go 的 import 是静态的，编译器不会去发现目录里的包，`go build ./...` 只编译不链接，未 import 的包会被丢弃。所以"放入即生效"在 Go 里没有零步骤方案；生成器是成本最低的那个——它只读目录名，不解析代码，40 行，无第三方依赖。
+**为什么需要「生成」这一步**：Go 的 import 是静态的，编译器不会去发现目录里的包，`go build ./...` 只编译不链接，未 import 的包会被丢弃。所以"放入即生效"在 Go 里没有零步骤方案；生成器是成本最低的那个——它只做一层目录扫描 + 读 Go 源码找 `host.Register(`，**不编译、不加载**，不到 200 行，无第三方依赖。
 
 推论：同一个核心提交在不同工作区可能产出不同二进制（取决于 `plugins_gen.go` 生成时目录里有什么）。这是「核心不引用业务插件」的代价，换来核心仓克隆即可构建、插件仓有独立提交历史。
 
@@ -394,6 +420,7 @@ type Renderer interface {
 **管道**：`goldmark`（GFM）→ AST → 自研布局器 → `x/image/font/opentype` 光栅 → PNG → `ImageFromBytes`。
 真正的工作量在布局器：行内折行（含 CJK 禁则）、`margin collapsing`（相邻块取最大而不是相加）、
 按 `font.Metrics` 的 ascent/descent 定位基线、表格两趟列宽分配。
+极多列的表格（≳113 列）按可用宽度等比缩列宽：先压内边距，再按可收缩余量分摊，压到下限仍放不下就整体再收一档——保证不溢出画布、不丢列，代价是列宽可能小于一个字形。
 
 **视觉基线**：GitHub markdown 的 **2× 换算**。颜色取 Primer light token
 （`#f6f8fa` 代码块底、`#d0d7de` 表格与分隔线、`#d8dee4` 标题下划线、`#0969da` 链接、
@@ -484,15 +511,19 @@ CREATE TABLE plugin_kv (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (plugin, peer, k)
 );
+-- 只给有 TTL 的行建部分索引：PurgeExpiredKV 每 10 分钟一次，
+-- 永不过期的键（插件全局设置等）不付索引维护成本。
+CREATE INDEX idx_plugin_kv_expires ON plugin_kv(expires_at) WHERE expires_at IS NOT NULL;
 
 -- 主动消息的本地日预算（§3.3）。
 -- 为什么不复用 plugin_kv：那是插件命名空间，核心自己写进去等于往别人的
 -- 抽屉里塞东西，插件一 DeletePrefix 就把额度账抹了。
 -- 没有内存镜像：发送前用一条 upsert 原子地"检查 + 自增"，所以重启不清零、
--- 并发与多进程都不会超发。day 是本地时区的 2006-01-02，跨日就是新主键，
--- 换桶不需要任何重置动作。每会话每天 1 行，一年不到 400 行。
+-- 并发与多进程都不会超发。day 取调度时区（Asia/Shanghai，与 cron 同源，
+-- 由核心注入）的 2006-01-02，跨日就是新主键，换桶不需要任何重置动作。
+-- 每会话每天 1 行，一年不到 400 行。
 CREATE TABLE active_usage (
-  day   TEXT NOT NULL,                  -- 本地时区 YYYY-MM-DD
+  day   TEXT NOT NULL,                  -- 调度时区（Asia/Shanghai，与 cron 同源）YYYY-MM-DD
   scene TEXT NOT NULL,                  -- group | c2c
   peer  TEXT NOT NULL,
   used  INTEGER NOT NULL DEFAULT 0,
@@ -527,8 +558,22 @@ CREATE TABLE qq_groups (
 );
 CREATE INDEX idx_qq_groups_mode ON qq_groups(mode, last_seen_at);
 
+-- 身份映射：openid ↔ union_openid。
+-- 鉴权不依赖它（openid 跨场景同值），它用于解析主动消息的投递地址，
+-- 并在平台回传 union_openid 时提供兜底匹配。
+CREATE TABLE identities (
+  openid       TEXT NOT NULL,
+  scene        TEXT NOT NULL,
+  peer_scope   TEXT NOT NULL DEFAULT '',
+  union_openid TEXT NOT NULL DEFAULT '',
+  last_seen    INTEGER NOT NULL,
+  PRIMARY KEY (openid, scene, peer_scope)
+);
+CREATE INDEX idx_identities_union ON identities(union_openid);
+
 -- 重置审计（不可省略：重置是不可逆操作）
--- status: pending（等确认码）/ done / cancelled（被同目标的新请求顶掉）/ expired
+-- status: pending（等确认码）/ done（成功，参与冷却）/ failed（执行失败，不参与冷却）/
+--         cancelled（被同目标的新请求顶掉）/ expired
 -- peer='*' 表示全局操作（R0 / R3），不属于任何会话
 CREATE TABLE reset_audit (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -573,8 +618,10 @@ CREATE TABLE job_runs (
   status      TEXT,                        -- ok | error | timeout | skipped
   error       TEXT
 );
-CREATE INDEX idx_job_runs      ON job_runs(job_id, started_at);
-CREATE INDEX idx_job_runs_peer ON job_runs(peer, started_at);
+CREATE INDEX idx_job_runs_started ON job_runs(started_at);
+CREATE INDEX idx_job_runs_peer    ON job_runs(peer, started_at);
+-- 旧的 (job_id, started_at) 没有任何查询用得上，只增加写放大；
+-- 迁移尾部先 DROP 旧索引再建上面的新索引（幂等，重复迁移不报错）。
 
 -- 会话接管（ADR-0004）：一行 = 一个 peer 当前被某个插件占用。
 -- 主键只有 peer：同 peer 同时只允许一个持有者，场景不参与"谁能接管"的判定。
@@ -599,6 +646,7 @@ CREATE INDEX idx_sessions_plugin  ON sessions(plugin);  -- 仅排障查询，不
 ### 4.2 7 天留存的实现要点
 
 - **分批删**，不要一次 `DELETE`：每 10 分钟执行 `DELETE FROM messages WHERE created_at < ? LIMIT 5000` 循环至影响行数为 0。理由：单条大事务会长时间持有写锁，与 aria2 的磁盘 IO 叠加时造成 `database is locked`。
+- **删除行数读不出来就报错**：每批的 `RowsAffected` 失败直接返回 error，不吞成 0。GC 用 `n < batch` 判断"删完没有"，吞成 0 等于宣称"这批已经删空"，剩余行要多等一个周期，而日志里连痕迹都没有。
 - **保留期是配置项**，默认 `168h`；`processed_events` 默认 `72h`（只需覆盖 resume 窗口）。
 - `job_runs` 同样纳入 GC（默认 7 天），否则它是最容易无声膨胀的表。
 - 删除后用 `PRAGMA incremental_vacuum`（配合 `auto_vacuum=INCREMENTAL`）回收，避免每月一次全库 `VACUUM` 造成分钟级卡顿。
@@ -696,7 +744,8 @@ per-peer 的行是谁建的？插件拿不到群列表（也不该拿），所�
 
 - **同一插件的 N 个 per-peer 实例仍然串行**——20 个群 × 3 s 还是 60 s。这与票面 AC「同一 plugin 的两个 job 不会重叠执行」是同一件事的两面：AC 要求串行，就必然保留这个 60 s。调度器不替插件决定“它可以并发”，要更快只能插件自己拆分（多个任务名 = 多个桶）。**这 60 s 的收益不是变短，而是不再外溢**：其他插件照常在自己的桶里跑，下一轮 tick 也照常到点。
 - **一轮窗口 100 行**按 `next_run_at` 取，积压量极大的插件可能占满窗口，其他插件要等它这一轮结束；它的行一旦被领走就会被排除，所以不会被永久饿死。
-- **关停顺序是 Stop → Wait → 关插件 → 关库**。`Core.Shutdown` 先 `Scheduler.Stop()`：`/reload` 路径下 main 既不取消 `Start` 收到的 ctx、也不等网关，只停信号监听，不主动停就会在关库之后继续起桶。`Wait(ctx)` 只负责等在跑的任务退出——它们已被 Stop 取消，通常立刻返回；超过 10 s 期限只 warn，不阻塞退出。
+- **可确认 seq 在 `Handler` 返回后才推进**：非 dispatch 帧收到即确认，dispatch 帧必须等事件处理完，所以落盘的永远是"已处理完的最大连续 seq"（仍有 10 s 节流）。Resume 仍可能重放"已解码但未处理完"的那一条，重复由 `processed_events` 去重表挡掉——插件不会看到第二次（P3-11）。
+- **关停顺序是 停调度 → 调度收尾 → Dispatcher 排空 → GC 退出 → 关插件 → 关库**。`Core.Shutdown` 先 `Scheduler.Stop()`（`/reload` 路径下 main 既不取消 `Start` 收到的 ctx、也不等网关，只停信号监听，不主动停就会在关库之后继续起桶），再 `Wait` 等在跑的任务退出、排空派发队列、等 GC 协程退出，最后逆序关插件。**任一步超期都让 `Shutdown` 返回 error，main 以退出码 1 退出**——关停没走完就不重启自己。
 
 并行度固定 4，不做配置项：调度任务是 I/O 型（HTTP + SQLite 单写连接），低配机上的瓶颈是出站配额而不是 CPU；4 与 dispatch 的 16 令牌、render 的 2 并发形成梯度。实测（`BenchmarkRunDue`，每个任务 20 ms 模拟 I/O，单进程 i5-12500H）：
 
@@ -755,8 +804,9 @@ Torn 的响应是 `{"error": {"code": .., "error": ".."}}` 形式的业务错误
 
 | 设计点 | 方案 |
 |---|---|
-| 统一客户端 | 单一 `httpx`：连接复用、5 s 默认超时、最多 2 次重试（仅对 5xx/超时）、全抖动指数退避 |
-| 域名白名单 | 插件在 Manifest 声明（如 `api.torn.com`），未声明即拒绝，防止插件被滥用为代理。白名单视图按插件独立，连接池与限流状态全进程共享 |
+| 统一客户端 | 单一 `httpx`：连接复用、5 s 默认超时、最多 2 次重试（**仅 5xx 与网络错误**；429 与被拒的重定向都不重试）、全抖动指数退避 |
+| 域名白名单 | 插件在 Manifest 声明（如 `api.torn.com`），未声明即拒绝，防止插件被滥用为代理。白名单视图按插件独立，连接池与限流状态全进程共享。重定向的**每一跳**都重新校验：被声明的域名一旦有开放重定向，就能把请求带去内网或元数据地址，所以不放行 scheme 变化 |
+| 429 冷却 | 按 `Retry-After`（秒数 / HTTP-date，缺省 60s）冷却**域名桶**，入口域名与被重定向到的域名都冷却；冷却期内该桶直接失败、不出网。不走退避重试——重试只会续期惩罚并白烧同域令牌 |
 | 按域名分桶 | `[http.domains]` 为特定主机名配置独立额度；未列出的域名走 `[http].rate_per_min`。配置了独立额度的域名**只**使用该桶，不与默认桶叠加——叠加等于没有放宽 |
 | 桶的归属 | 所有客户端（核心与全部插件）共享同一组桶。同域名下的多个插件共用一个桶，额度不会被复制 |
 | 非法额度 | 零或负数的条目在启动期被忽略、记一条告警，回退到默认额度。不做“零等于无限”这类隐式语义 |
@@ -777,10 +827,11 @@ rate_per_min = 100          # 未列出域名的默认额度
 
 ## 7. 消息发送与频控
 
-- **被动回复**：群 5 min / 最多 5 次；单聊 60 min / 最多 4 次。核心为每个 `msg_id` 维护已用次数，插件拿到的 `Reply` 在第 6 次直接失败（不消耗 HTTP 调用）。
+- **被动回复**：群 5 min / 最多 5 次；单聊 60 min / 最多 4 次。核心为每个 `msg_id` 维护已用次数，插件拿到的 `Reply` 在第 6 次直接失败（不消耗 HTTP 调用）。每次发送的预算是纯文本 5 s、含上传 30 s，判断与降级都在核心内完成——`Reply` 不返回错误，插件拿不到"图没发出去"这件事。
 - **幂等**：`msg_id + msg_seq` 全局唯一，重试不得复用同一 `msg_seq`；这也是“每 peer 串行”的原因。
 - **令牌桶**：Bot 维度（群 30/60 qpm，单聊 5 qps+30 qpm）+ 单关系维度（20 qpm、1000 条/天）。两层都要过，缺一即 429。
-- **主动消息日预算（本地记账）**：平台只给“每群/每用户每天 1000 条”这一个上限，也没有额度查询接口，所以本地把它压到个位数并按 `(day, scene, peer)` **落库**（`active_usage`，§3.3）：先扣预算再发 HTTP，额度用尽即拒发。`day` 取进程**本地时区**的日期，跨日自动换桶；预算行重启不清零，否则“重启循环不会烧额度”只是注释里的一句话。账本不可用（库没打开、写失败、ctx 取消）时 **fail-closed**：超发不可撤回，宁可少发一条。
+- **主动消息日预算（本地记账）**：平台只给“每群/每用户每天 1000 条”这一个上限，也没有额度查询接口，所以本地把它压到个位数并按 `(day, scene, peer)` **落库**（`active_usage`，§3.3）：先扣预算再发 HTTP，额度用尽即拒发。`day` 取**调度时区**（`Asia/Shanghai`，与 cron 同源、由核心注入）的日期，跨日自动换桶；预算行重启不清零，否则“重启循环不会烧额度”只是注释里的一句话。账本不可用（库没打开、写失败、ctx 取消）时 **fail-closed**：超发不可撤回，宁可少发一条。
+- **平台拒绝要归还**：2xx + `err_code`≠0（以及 429 之外的明确拒绝）说明这条没发出去，被动占格与主动日预算都还回去——连着几条被风控挡掉时，正常回复不该跟着发不出去。网络失败/超时**不归还**：请求可能已经送达，还回去等于允许实际发送超过平台上限。`msg_seq` 同样不回退，被拒的那次可能已占用平台的 `(msg_id, msg_seq)` 判重记录。
 - **队列优先级**：被动回复插队到主动/批量之前，避免批量推送把对话消息饿死。
 - **主动消息默认关闭**（R 全部为查询类需求，本不需要）。若将来做推送，按 (插件 × 场景) 白名单逐项开启，并同时受平台每日 1000 条上限与上面的本地日预算约束。
 
@@ -841,9 +892,11 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 
 **`sessions` 跟着会话状态走，R1 就要清**（ADR-0004）：不清就等于「重置完留下一个永远等不到输入的悬挂会话」——用户的下一步输入会被一个已经忘记上下文的插件接管，比直接不响应更难排查。R2 是「这个会话重新开始」，一并清；R3 清全表；R0 只重连，不动它。
 
-**冷却按 `(level, peer)` 计**。R1/R2 换个群不受上一个群的影响——连清两个群是正常运维动作；R0/R3 是全局操作，`peer` 记为 `*`，因此全局冷却。冷却起点取 `reset_audit.finished_at`，只认 `status=done` 的行。
+**冷却按 `(level, peer)` 计**。R1/R2 换个群不受上一个群的影响——连清两个群是正常运维动作；R0/R3 是全局操作，`peer` 记为 `*`，因此全局冷却。冷却起点取 `reset_audit.finished_at`，只认 `status=done` 的行；执行失败记 `failed`（保留原因），不占冷却，可以立即重试——`/reset status` 把它显示成「失败（未占冷却）」，而不是让人等一个什么都没做的窗口。
 
 **R2 清 `job_runs` 但保留 `jobs`**：执行历史是该群的业务数据，任务定义（含 per-peer 实例行）是配置。这与“R2 不动 `qq_groups`”是同一条边界的两个方向。
+
+**媒体回收口径**：R2 只清该 peer **名下**的媒体——经 `messages` 关联到本会话的那些行，预览与实删用同一个谓词，所以回复里说的数量与真正删掉的一致。`message_id IS NULL` 的孤儿行没有会话归属，**只由 R3 回收**（扫全库路径）：塞进 R2 会让一个群的 `/reset data` 删掉全库无归属媒体，预览还会把同一批行重复计到每个 peer 头上。
 
 **`active_usage` 跟着业务数据走**：R2 清该 peer 的行，R3 清全表；R1 只清插件会话状态、R0 不动数据，都不碰它。理由是预算是平台配额账而不是会话状态——不过清数据就等于承认“这个会话重新开始”，额度也重开；反过来 R1/R0 只是让插件重来一遍或重连，凭什么免掉当天已烧的配额。预算行不计入重置摘要里的条数（那是给用户看的业务数据量，预算行属于记账）。
 
@@ -852,7 +905,7 @@ openid 是相对本机器人加密的，注册前无法预知，因此**不能�
 不可逆操作走两段式，而不是"回复 Y 确认"——`Y` 太容易误触发，也容易被群内他人抢答：
 
 1. `/reset data` → **不执行**，只回"将清空消息 128 条、媒体 6 个"，生成 6 位一次性确认码，`reset_audit` 记 `pending`，回复"60 秒内回复 `/reset data <code>`"；
-2. 用户回带码指令 → 校验 `(actor, peer, level)` 绑定 + 过期 + 冷却 → 执行，audit 置 `done` 并写入执行摘要。
+2. 用户回带码指令 → 校验 `(actor, peer, level)` 绑定 + 过期 + 冷却 → 执行，成功置 `done`、失败置 `failed`（保留原因），并写入执行摘要。
 
 确认码**绑定发起者、目标 peer 与级别**：换个会话用不了，换个人代答不了，换个级别也不行。
 
@@ -1049,7 +1102,11 @@ Type=simple
 User=qqbot
 WorkingDirectory=/opt/qqbot
 ExecStart=/opt/qqbot/bin/qqbot -c /etc/qqbot/config.toml
-EnvironmentFile=/etc/qqbot/env
+# 双保险：cron 与主动消息日预算都由程序内的 Asia/Shanghai 决定（不读 TZ），
+# 但 Debian 12 默认 UTC，日志时间戳与任何依赖本地时区的库都会偏 8 小时
+Environment=TZ=Asia/Shanghai
+# 认证已写入 /etc/qqbot/config.toml（600）。若改用环境变量覆盖，再启用下面一行
+# EnvironmentFile=-/etc/qqbot/env
 Restart=on-failure
 RestartSec=10
 StartLimitIntervalSec=300
@@ -1065,7 +1122,7 @@ ReadWritePaths=/var/lib/qqbot
 WantedBy=multi-user.target
 ```
 
-`StartLimitBurst=5 / 300 s` 是刻意配的：**防止 session 配额（1000/天）被重启循环吃掉**。配置错误时应停在 failed 状态等人看，而不是无声重试一整夜。
+`StartLimitBurst=5 / 300 s` 是刻意配的：**防止 session 配额（1000/天）被重启循环吃掉**。配置错误时应停在 failed 状态等人看，而不是无声重试一整夜。网关的**永久性关闭码**（下架 4914、封禁 4915、intents 无权限 4014、分片参数错误 4010 等）走同一条路：进程以退出码 1 退出、不再自己重连，由 `StartLimit` 把"反复因封禁而重启"收敛成一次人工介入。
 
 ### 9.2 升级流程
 
@@ -1104,7 +1161,7 @@ WantedBy=multi-user.target
 | 等级 | 风险 | 缓解 |
 |---|---|---|
 | 高 | session 配额 1000/天被重启循环耗尽 | `StartLimitBurst` + 退避 + 持久化 session（4.1 / 9.2） |
-| 高 | **两个进程共用数据目录**：网关 session 互顶（`4902 reset by resume`），且各回一遍消息、各记一遍幂等表 | 启动时按 `[store].path` 取独占文件锁，拿不到直接退出并报出持有者 pid；锁随进程退出释放，无残留（§2.1） |
+| 高 | **两个进程共用数据目录**：网关 session 互顶（`4902 reset by resume`），且各回一遍消息、各记一遍幂等表；换个 `[store].path` 也仍会互顶网关 session | 启动时按 appID（系统临时目录）与 `[store].path` 各取一把独占文件锁，拿不到直接退出并报出持有者 appID、pid 与启动时间；锁随进程退出释放，无残留（§2.1） |
 | 高 | **重置误操作**：R2/R3 不可逆，群内误触发即丢历史 | 分级 + 二次确认码 + 冷却 + `reset_audit`（第 8 章） |
 | 中 | **管理员鉴权来源单一**：平台给群内身份，不给 Bot 运维身份，只能靠本地 allowlist | 认领令牌 + owner/admin 分离 + 全局角色；官方若开放 Bot 级身份则升级为双因子 |
 | 中 | **空白名单自锁**：白名单默认开启且初始为空 → 所有群消息被丢弃 | 启动时 warn；未入名单的群里放行 Bot 管理员的 `/group allow` 自助接入；也可私聊 `/group list` 按 id 添加 |

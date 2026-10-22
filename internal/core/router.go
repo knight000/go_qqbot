@@ -22,6 +22,16 @@ var reservedPrefixes = []string{
 	"/claim", "/admin", "/group", "/reset", "/reload", "/restart",
 }
 
+// reservedConflict 判断插件前缀是否占用了核心指令，按**词边界**比较。
+//
+// 不能裸 HasPrefix：`/groupinfo`、`/reset2` 是独立的名字，与 `/group`、`/reset`
+// 无关，裸前缀比较会把它们一起拒掉（注释说的"声明相同前缀"并不成立）。
+// 边界与 argsAfterPrefix 的严格匹配一致：前缀之后必须是结尾或空白。
+// prefix 需已转小写；reservedPrefixes 本身是小写字面量。
+func reservedConflict(prefix, reserved string) bool {
+	return prefix == reserved || strings.HasPrefix(prefix, reserved+" ")
+}
+
 type compiledCommand struct {
 	prefix string
 	// loose 放宽前缀匹配：默认要求前缀之后是空白或结尾（/md5 不算 /md）。
@@ -93,8 +103,9 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 				deny:     inheritDeny(m.DenyReply, c.DenyReply),
 			}
 			if c.Prefix != "" {
+				lower := strings.ToLower(c.Prefix)
 				for _, rp := range reservedPrefixes {
-					if strings.HasPrefix(strings.ToLower(c.Prefix), rp) {
+					if reservedConflict(lower, rp) {
 						return nil, fmt.Errorf("插件 %s 声明了核心保留前缀 %s，拒绝加载", m.Name, rp)
 					}
 				}

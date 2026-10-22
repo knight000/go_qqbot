@@ -8,6 +8,16 @@ Type=simple
 User=qqbot
 WorkingDirectory=/opt/qqbot
 ExecStart=/opt/qqbot/bin/qqbot -c /etc/qqbot/config.toml
+# 双保险：cron 与主动消息日预算都由程序内的 Asia/Shanghai 决定（不读 TZ），
+# 但 Debian 12 默认 UTC，日志时间戳与任何依赖本地时区的库都会偏 8 小时。
+Environment=TZ=Asia/Shanghai
+# 单实例锁的 appID 维度默认放系统临时目录，而 PrivateTmp=true 会让 /tmp 变成
+# 本 unit 的私有命名空间：同一 appID 的第二个 unit（或手工起的进程）看到的是
+# 另一个 /tmp，两把锁互不可见，双开照样发生。改放 /run/qqbot（RuntimeDirectory
+# 创建、同机所有 qqbot 实例共享）才能在单机范围内真正互斥。
+RuntimeDirectory=qqbot
+RuntimeDirectoryMode=0700
+Environment=QQBOT_LOCK_DIR=/run/qqbot
 # 认证已写入 /etc/qqbot/config.toml（600）。若改用环境变量覆盖，
 # 再启用下面一行，AppID/Secret 不落配置文件。
 # EnvironmentFile=-/etc/qqbot/env

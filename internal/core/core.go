@@ -65,6 +65,13 @@ type Core struct {
 	// 两个并发刷新会互相打满 30 QPM 的接口配额，还会把同一批群名写两遍。
 	refreshing atomic.Bool
 
+	// gcDone 在 gcLoop 退出时关闭。关库之前必须等它：GC 的 Purge* 与
+	// vacuum 都在写库，晚于 db.Close 就是一串 database is closed（P2-7）。
+	// gcStarted 表示 Start 真的起过它——未 Start 的 Core（单元测试）
+	// 没有这个协程，Shutdown 不能在这里等。
+	gcDone    chan struct{}
+	gcStarted bool
+
 	// reconnect 是网关的主动重连入口（R0）。由 main 在起网关协程之前注入，
 	// 因此 Handle 读取它与 main 赋值之间天然有 happens-before。
 	reconnect Reconnector
@@ -114,9 +121,10 @@ func New(o Options) (*Core, error) {
 		session = sessionBackend{db: o.Store, router: router, log: logger.With("component", "session")}
 		sessionRowsSrc = sessionRows{o.Store}
 	}
-	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage)
-	sender.trace = trace
 	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
+	// 日预算的切日与 cron 必须同源：都由调度器的 location 决定。
+	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage, sched.Location())
+	sender.trace = trace
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
 	dispatch.trace = trace
 	dispatch.denyReply = o.Config.Permission.DenyReply
@@ -145,6 +153,7 @@ func New(o Options) (*Core, error) {
 		sched:     sched,
 		startedAt: time.Now(),
 		restart:   make(chan RestartRequest, 1),
+		gcDone:    make(chan struct{}),
 	}, nil
 }
 
@@ -160,6 +169,9 @@ func (c *Core) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// 再把 Manifest.Intents 与 [bot].intents 位掩码交叉校验：缺位只告警，
+	// 见 warnIntentGaps 里"为什么不 fail-fast"。
+	c.warnIntentGaps()
 
 	for _, p := range c.plugins {
 		c.sched.Bind(p.Manifest().Name, p)
@@ -202,6 +214,7 @@ func (c *Core) Start(ctx context.Context) error {
 		return err
 	}
 	c.logGroupGateState(ctx)
+	c.gcStarted = true
 	go c.gcLoop(ctx)
 
 	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.App.Sandbox)
@@ -212,17 +225,38 @@ func (c *Core) Start(ctx context.Context) error {
 // 给不同插件分配不同限流桶时只改一处。
 func (c *Core) httpClient() *httpx.Client { return c.http }
 
-func (c *Core) Shutdown(ctx context.Context) {
+// Shutdown 按固定顺序收尾：停调度 → 等调度收尾 → 等 Dispatcher 排空 →
+// 等 GC 退出 → 关插件。
+//
+// 返回非 nil 表示有一步没在期限内退出：此时调用方**不能**当成优雅关闭——
+// 关库很可能与在途写并发，必须以非 0 退出，让 systemd 的 Restart=on-failure
+// 看见（P3-23）。每一步都必须早于 main 里的 db.Close：调度任务、派发中的
+// Handle、GC 的 Purge 都在写库。
+func (c *Core) Shutdown(ctx context.Context) error {
+	var errs []error
+
 	// 先停调度并等任务收尾，再关插件：任务运行在插件的 JobRunner 里，先 Close
-	// 插件等于让任务往已经关掉的东西里写；任务本身还要写库，必须早于 main 里的
-	// db.Close。Stop 是必需的——/reload 路径下 main 不会取消 Start 收到的 ctx，
-	// 只停信号监听；不主动 Stop 就会在关库之后继续起新桶。
+	// 插件等于让任务往已经关掉的东西里写。Stop 是必需的——/reload 路径下 main
+	// 不会取消 Start 收到的 ctx，只停信号监听；不主动 Stop 就会在关库之后继续起新桶。
 	if c.sched != nil {
 		c.sched.Stop()
 		if !c.sched.Wait(ctx) {
-			c.log.Warn("调度任务未在关停期限内退出")
+			c.log.Error("调度任务未在关停期限内退出，任务状态可能未落盘")
+			errs = append(errs, fmt.Errorf("调度收尾超时: %w", ctx.Err()))
 		}
 	}
+
+	// dispatcher 同理：Handle 跑在插件里，先关插件就是让在途消息踩空。
+	// 排队中的事件也要处理完——它们已经被平台投递过，丢掉等于这条消息永远没回。
+	if c.dispatch != nil && !c.dispatch.Wait(ctx) {
+		c.log.Error("Dispatcher 未在关停期限内排空，在途消息可能丢失")
+		errs = append(errs, fmt.Errorf("派发排空超时: %w", ctx.Err()))
+	}
+
+	if err := c.waitGCLoop(ctx); err != nil {
+		errs = append(errs, err)
+	}
+
 	for i := len(c.plugins) - 1; i >= 0; i-- {
 		p := c.plugins[i]
 		if cl, ok := p.(host.Closer); ok {
@@ -230,6 +264,22 @@ func (c *Core) Shutdown(ctx context.Context) {
 				c.log.Warn("关闭插件失败", "plugin", p.Manifest().Name, "err", err)
 			}
 		}
+	}
+	return errors.Join(errs...)
+}
+
+// waitGCLoop 等 GC 协程真正退出。它每 10 分钟才醒一次，ctx 取消后能立刻
+// select 到 Done；这里等不到只可能是它正卡在一条 Purge 里。
+func (c *Core) waitGCLoop(ctx context.Context) error {
+	if !c.gcStarted || c.gcDone == nil {
+		return nil
+	}
+	select {
+	case <-c.gcDone:
+		return nil
+	case <-ctx.Done():
+		c.log.Error("GC 未在关停期限内退出，关库可能与清理写并发")
+		return fmt.Errorf("GC 收尾超时: %w", ctx.Err())
 	}
 }
 
@@ -326,7 +376,7 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	if c.handleReserved(ctx, ev) {
 		return
 	}
-	c.dispatch.Dispatch(ctx, ev)
+	c.dispatch.Dispatch(ev)
 }
 
 func (c *Core) replyText(ctx context.Context, ev *host.Event, text string) {

@@ -82,6 +82,22 @@ func TestParamsDecodeRequiresPointer(t *testing.T) {
 	}
 }
 
+// 空串是「存在但为空」，不是「没配」。声明为必填的字符串键被配成空串时，
+// 插件必须拿到空串——否则 api_base 想置空却打到了默认的生产地址。
+func TestParamsStrDistinguishesEmptyFromMissing(t *testing.T) {
+	p := NewParams("demo", map[string]any{"empty": "", "number": int64(1)})
+
+	if got := p.Str("empty", "def"); got != "" {
+		t.Errorf("显式空串应原样返回，实际 %q", got)
+	}
+	if got := p.Str("missing", "def"); got != "def" {
+		t.Errorf("缺失键应返回默认值，实际 %q", got)
+	}
+	if got := p.Str("number", "def"); got != "def" {
+		t.Errorf("非字符串应返回默认值，实际 %q", got)
+	}
+}
+
 func TestParamsAccessorsKeepDefaults(t *testing.T) {
 	p := NewParams("demo", map[string]any{"limit": int64(5), "name": "x"})
 	if got := p.Int("limit", 1); got != 5 {
