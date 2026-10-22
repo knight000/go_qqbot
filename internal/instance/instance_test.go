@@ -460,3 +460,56 @@ func TestCrossProcessLock(t *testing.T) {
 	lock := acquire(t, testAppID, path, 5*time.Second)
 	defer lock.Release()
 }
+
+// TestLockDirEnvOverridesTempDir 钉住 PrivateTmp 那个部署缺口：设了
+// QQBOT_LOCK_DIR 就必须只用它。部署单元的 /tmp 是私有命名空间，同一 appID
+// 的第二个 unit 在 os.TempDir() 下看到的是另一个目录，两把锁互不可见。
+func TestLockDirEnvOverridesTempDir(t *testing.T) {
+	isolateTemp(t, t.TempDir()) // 兜底目录故意指向别处，用来说明"没走兜底"
+	shared := t.TempDir()
+	t.Setenv(LockDirEnv, shared)
+
+	if got := lockDir(); got != shared {
+		t.Fatalf("设了 %s 应只用它，实际 %s", LockDirEnv, got)
+	}
+
+	lock := acquire(t, testAppID, dataLockPath(t), 0)
+	defer lock.Release()
+	if dir := filepath.Dir(lock.AppPath()); dir != shared {
+		t.Fatalf("appID 锁应落在 %s，实际 %s", shared, lock.AppPath())
+	}
+	// 共享目录里的锁仍然必须互斥：换目录不是绕过单实例的理由。
+	if l, err := Acquire(Options{AppID: testAppID, DataPath: dataLockPath(t), Wait: 0}); !errors.Is(err, ErrLocked) {
+		if err == nil {
+			_ = l.Release()
+		}
+		t.Fatalf("同一 appID 第二次应被拒，实际: %v", err)
+	}
+}
+
+// TestLockDirEnvCreatesMissingDir：手工设了环境变量却没建目录时，锁目录
+// 要能自建（部署单元由 RuntimeDirectory 负责，手工场景没人替它建）。
+func TestLockDirEnvCreatesMissingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "run", "qqbot")
+	t.Setenv(LockDirEnv, dir)
+
+	if got := lockDir(); got != dir {
+		t.Fatalf("锁目录应为 %s，实际 %s", dir, got)
+	}
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		t.Fatalf("锁目录应被创建: %v", err)
+	}
+}
+
+// TestLockDirFallsBackToTempDir：没设环境变量时仍用系统临时目录，
+// 这是开发机与现有部署的默认路径。
+func TestLockDirFallsBackToTempDir(t *testing.T) {
+	fallback := t.TempDir()
+	isolateTemp(t, fallback)
+	t.Setenv(LockDirEnv, "")
+
+	if got := lockDir(); got != fallback {
+		t.Fatalf("未设 %s 应回落到临时目录 %s，实际 %s", LockDirEnv, fallback, got)
+	}
+}

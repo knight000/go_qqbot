@@ -1,12 +1,18 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/api"
+	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
 )
@@ -220,5 +226,114 @@ func TestShutdownReportsTimeoutWhenDispatchStuck(t *testing.T) {
 	defer cancel()
 	if err := c.Shutdown(short); err == nil {
 		t.Fatal("派发排空超时必须以 error 报告")
+	}
+}
+
+// slowAPI 让每条发送耗时 delay，模拟"关停时正好有一条回复在发"。
+type slowAPI struct {
+	mu    sync.Mutex
+	calls int
+	delay time.Duration
+}
+
+func (a *slowAPI) SendMessage(ctx context.Context, _, _ string, _ api.MessageBody) error {
+	a.mu.Lock()
+	a.calls++
+	a.mu.Unlock()
+	select {
+	case <-time.After(a.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *slowAPI) UploadMedia(context.Context, string, string, api.MediaUpload) (api.MediaUploadResult, error) {
+	return api.MediaUploadResult{}, errors.New("本用例不该走上传")
+}
+
+func (a *slowAPI) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+// TestShutdownDrainLeavesNoClosedDatabaseErrors 是 #24 的整链断言：关停期间
+// 同时有在途 Handle 与在途回复时，排空必须等到回复发完，之后才关库。
+// 关早了不会 panic，只会在日志里留下 "database is closed" / "context canceled"，
+// 现场表现为"这条消息没落库/没回"——所以这里直接断言日志。
+func TestShutdownDrainLeavesNoClosedDatabaseErrors(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "shutdown-chain.db"))
+	if err != nil {
+		t.Fatalf("打开测试库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+
+	api := &slowAPI{delay: 120 * time.Millisecond}
+	p := newGatedPlugin()
+	router, err := NewRouter([]host.Plugin{p})
+	if err != nil {
+		t.Fatalf("装配路由: %v", err)
+	}
+	c := &Core{
+		store:     db,
+		cfg:       &config.Config{},
+		log:       log,
+		sender:    NewSender(api, log, ActivePolicy{}, nil, time.Local),
+		startedAt: time.Now(),
+		restart:   make(chan RestartRequest, 1),
+		router:    router,
+		dispatch:  NewDispatcher(router, NewSender(api, log, ActivePolicy{}, nil, time.Local), log, 5*time.Second),
+		plugins:   []host.Plugin{p},
+		sched:     NewScheduler(db, log),
+	}
+	// dispatch 里的 sender 必须与 Core 的同一个（关停断言靠它看调用次数）。
+	c.dispatch.sender = c.sender
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for _, peer := range []string{"g1", "g2"} {
+		if err := c.store.SetGroupMode(ctx, peer, store.GroupModeAllow); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 两个 peer 各一条：一个 Handle 在跑，一个回复在发（关停时两者都在途）。
+	c.Handle(ctx, adminEvent("/slow", "u1", "", host.SceneGroup, "g1"))
+	c.Handle(ctx, adminEvent("/slow", "u2", "", host.SceneGroup, "g2"))
+	<-p.entered
+	<-p.entered
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	done := make(chan error, 1)
+	go func() { done <- c.Shutdown(shutdownCtx) }()
+
+	time.Sleep(50 * time.Millisecond) // 让 Shutdown 先进到 Wait 的排空分支
+	close(p.gate)                     // 两条回复随即进入发送（各 120ms）
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("排空期间回复能发完，关停应成功: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("排空之后 Shutdown 仍未返回")
+	}
+
+	if n := api.callCount(); n != 2 {
+		t.Fatalf("在途回复都应发出，实际 %d 条", n)
+	}
+	out := buf.String()
+	for _, bad := range []string{"database is closed", "context canceled"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("关停排空期间出现 %q，说明关库早于在途处理：\n%s", bad, out)
+		}
 	}
 }
