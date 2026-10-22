@@ -142,10 +142,11 @@ type glyph struct {
 // inlinePad 是行内代码的左右内边距（GitHub 的 .4em）。
 func inlinePad() float64 { return math.Round(fsCode * 0.4) }
 
-// sameRun 判断两个相邻字形会不会被 drawLine 画进同一次 DrawString。
-// 分组键与 drawLine 的循环条件逐条对应：face、颜色、删除线任一不同，或遇到
-// 换行/缺字，都会切开一个 run——切开之后各起一个 Drawer，kern 不会被应用。
-func sameRun(a, b glyph) bool {
+// sameRunStyle 判断两个相邻字形会不会被 drawLine 画进同一次 DrawString。
+// 分组键（face、颜色、删除线、换行、缺字）只在这里写一遍：折行时的 kern
+// （kernOf）与绘制时的分组必须用同一个判据，两处分叉会让"算出来的行宽"
+// 与"画出来的行宽"差出几个 kern，表现为行尾留缝或文字越界。
+func sameRunStyle(a, b glyph) bool {
 	return !a.br && !b.br && !a.missing && !b.missing &&
 		a.f == b.f && a.col == b.col && a.strike == b.strike
 }
@@ -153,7 +154,7 @@ func sameRun(a, b glyph) bool {
 // kernOf 是一对相邻字形的字距调整（像素，通常为负）。跨 run 时为 0：
 // 那里不会真的应用 kern，算进推进量就会多扣一截。
 func kernOf(prev, cur glyph) float64 {
-	if !sameRun(prev, cur) {
+	if !sameRunStyle(prev, cur) {
 		return 0
 	}
 	return float64(prev.f.Kern(prev.r, cur.r)) / 64
@@ -344,8 +345,7 @@ func (l *layout) drawLine(gs []glyph, x, y, lineH float64, fallback font.Face) {
 		j := i
 		var sb strings.Builder
 		width := 0.0
-		for j < len(gs) && !gs[j].br && !gs[j].missing &&
-			gs[j].f == gs[i].f && gs[j].col == gs[i].col && gs[j].strike == gs[i].strike {
+		for j < len(gs) && sameRunStyle(gs[i], gs[j]) {
 			sb.WriteRune(gs[j].r)
 			// 与 drawLine 的分组条件一致：run 内的相邻字形才有 kern。
 			width += pxAdvance(gs, j)
