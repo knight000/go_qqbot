@@ -160,12 +160,41 @@ func (s *Sender) Reply(ctx context.Context, ev *host.Event, msg host.Reply) erro
 				"scene", ev.Scene, "peer", ev.PeerID, "msg_id", ev.MsgID,
 				"sent", i, "total", len(parts), "err", err)
 			if i == 0 {
+				// 一条都没发出去、且失败的是图片时，用户那边什么都看不到：
+				// 核心没有别的通道能告诉插件"图没发出去"（Reply 不返回错误），
+				// 只能补一句文本。前面已发过文本的不补——用户已经看到内容了。
+				if part.Image.Valid() {
+					s.sendImageFailureNotice(ctx, ev)
+				}
 				return err
 			}
 			return fmt.Errorf("%w（前 %d 条已发出）", err, i)
 		}
 	}
 	return nil
+}
+
+// imageFailedText 是图片发不出去时补发的说明。
+//
+// 纯图片回复失败时用户什么都收不到——比一条"失败"更糟：插件以为发出去了，
+// 用户以为机器人没理他。核心没有别的通道能回传这件事（Reply 不返回错误），
+// 所以只能在同一 msg_id 的被动配额里补一句。
+const imageFailedText = "图片发送失败，请稍后重试"
+
+// sendImageFailureNotice 补发图片失败的说明，best-effort。
+//
+// 不递归（sendPassive 不会再走 Reply）、不重试（失败就只留 Warn）：
+// 这条补发本身也是一个错误出口，再套一层降级就会绕成环。
+func (s *Sender) sendImageFailureNotice(ctx context.Context, ev *host.Event) {
+	start := time.Now()
+	tctx, cancel := context.WithTimeout(ctx, replyTextTimeout)
+	defer cancel()
+	seq, err := s.sendPassive(tctx, ev, host.Reply{Content: imageFailedText})
+	s.trace.Sent("降级文本", ev.Scene, ev.PeerID, seq, imageFailedText, err, time.Since(start))
+	if err != nil {
+		s.log.Warn("图片发送失败后的降级文本也未发出",
+			"scene", ev.Scene, "peer", ev.PeerID, "msg_id", ev.MsgID, "err", err)
+	}
 }
 
 // splitReply 把一条 Reply 变成平台真正能发的一条或多条消息。
