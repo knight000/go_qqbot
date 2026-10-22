@@ -296,7 +296,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | `Renderer` | 把 markdown 画成图片（`Markdown(ctx, src) (Image, error)`），契约见 §3.8 | 未注入时返回拒绝性 stub（错误可被 `errors.Is` 分类为超时/超大/能力缺失），不是 nil |
 | `Session()` | `Await(ctx, ev, state, ttl) error`：登记“该 peer 的下一条消息交给本插件”，并附带插件自定义 state（ADR-0004） | 同 peer 只允许一个持有者；被占用返回 `ErrSessionBusy`；state ≤ 8 KiB（超限报错，不截断）；TTL 默认 5 min、上限 1 h |
 
-被动窗口用尽（`Sender.Reply` 那一行的「超出被动窗口直接失败」）**不在这张表里**：`ErrPassiveExhausted` 留在 `internal/core`，不导出。理由是**唯一的消费方是核心自身**——被动回复的惯用法是从 `Handle` 返回 `*host.Reply` 由核心代发，全仓没有插件调用 `Sender.Reply`，插件正常拿不到这个错误；核心打那条 warn 时不需要 `host` 的导出。它的错误串同样只供排障，且比上面那几类多一维：窗口是**按 `msg_id` 计**的，所以用尽时会带上 `msg_id` 与窗口口径（群「窗口 5 次/5 分钟」、单聊「4 次/60 分钟」），一个进程里几十个会话同时回复时才对得上现场；`errors.Is` 仍判 `ErrPassiveExhausted`。等出现第二个真实消费方（插件需要自己调 `Sender.Reply` 并区分这个失败）再谈导出——与 `Manifest.Capabilities` 一样，等有真实消费方再启用。
+被动窗口用尽（`Sender.Reply` 那一行的「超出被动窗口直接失败」）**不在这张表里**：`ErrPassiveExhausted` 留在 `internal/core`，**不进 host 契约**——它是包级导出名，插件看不到它不是因为标识符没导出，而是因为插件不允许 import `internal/core`（`host` 是唯一对外通道）。理由是**唯一的消费方是核心自身**——被动回复的惯用法是从 `Handle` 返回 `*host.Reply` 由核心代发，全仓没有插件调用 `Sender.Reply`，插件正常拿不到这个错误；核心打那条 warn 时不需要 `host` 的导出。它的错误串同样只供排障，且比上面那几类多一维：窗口是**按 `msg_id` 计**的，所以用尽时会带上 `msg_id` 与窗口口径（群「窗口 5 次/5 分钟」、单聊「4 次/60 分钟」），一个进程里几十个会话同时回复时才对得上现场；`errors.Is` 仍判 `ErrPassiveExhausted`。等出现第二个真实消费方（插件需要自己调 `Sender.Reply` 并区分这个失败）再谈进 host——与 `Manifest.Capabilities` 一样，等有真实消费方再启用。
 
 **插件不直接持有 SQLite 连接、不直接持有 WS 连接、不读环境变量取密钥。** 这条边界决定了：插件可单测（Host 用 fake）、可复用（换核心只改 Host 适配层）、可审计（插件能做什么，读 Host 接口就够）。
 
