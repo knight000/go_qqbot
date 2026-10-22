@@ -42,11 +42,14 @@ func collectInline(n ast.Node, src []byte, inherit span) []span {
 			s := inherit
 			s.text = string(v.Value(src))
 			out = append(out, s)
-			if v.HardLineBreak() {
+			// 源码换行 = 视觉换行：软换行与硬换行产同样的 br。
+			//
+			// HTML 把软换行渲染成空格，是因为浏览器要留一个折行点；我们的
+			// 产物是图不是 HTML，而 canBreak 在 CJK 边界、空格之后、连字符
+			// 之后都能断，不需要那个空格兼作断点。按空格画反而会把用户
+			// 明确写下的换行吃掉（#32）：五行输入画成一行。
+			if v.HardLineBreak() || v.SoftLineBreak() {
 				out = append(out, span{br: true})
-			} else if v.SoftLineBreak() {
-				// 软换行在 HTML 里就是一个空格：折行器需要它作为断点。
-				out = append(out, span{text: " "})
 			}
 		case *ast.String:
 			s := inherit
