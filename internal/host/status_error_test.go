@@ -172,14 +172,15 @@ func TestHostHTTPContextTimeoutNotWrapped(t *testing.T) {
 	}
 }
 
-func TestAPIVersionIsTen(t *testing.T) {
+func TestAPIVersionIsEleven(t *testing.T) {
 	// 版本号就是「插件能依赖什么」的声明：Yield 取代 Broadcast、Event.Command/Args
 	// 与前缀词边界、Event.Mentioned / Raw / RawTruncated 等契约变更必须体现在这里，
 	// 否则插件按旧版本声明的能力去读新字段，核心却可能没提供。
 	// 7 引入 *HTTPStatusError，8 引入上面那一批（#11 / #12 / #13），
 	// 9 引入 Host.Session() 与 Event.Session（ADR-0004），
-	// 10 改了 Params.Str 的空串语义与 Store.Query 的只读实现（#30）。
-	if APIVersion != "10" {
-		t.Fatalf("APIVersion=%q，期望 \"10\"", APIVersion)
+	// 10 改了 Params.Str 的空串语义与 Store.Query 的只读实现（#30），
+	// 11 导出主动消息的三个失败哨兵（#34）。
+	if APIVersion != "11" {
+		t.Fatalf("APIVersion=%q，期望 \"11\"", APIVersion)
 	}
 }

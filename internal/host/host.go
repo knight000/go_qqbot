@@ -13,6 +13,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -56,8 +57,13 @@ import (
 //     之类也会被拒），SQL 原样执行、不再自动追加 LIMIT，行数在取行时
 //     截断到 1000。写语句以前可能"碰巧能过"，现在一定失败。
 //
+// 版本 11：导出主动消息的三个失败哨兵 ErrActiveQuota / ErrActiveDisabled /
+// ErrRateLimited（#34）。SendActive 的返回错误 errors.Is 可判，插件不必
+// import internal/core 就能把「日预算用尽」「配置未开启」「平台 429」
+// 分成三条处置路径。**调用签名未变**，插件只需把 api_version 改成 11。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "10"
+const APIVersion = "11"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //
@@ -265,7 +271,35 @@ type Reply struct {
 	Image   Image
 }
 
+// 主动消息的三种失败要分开处置，所以哨兵定义在这里而不是实现包里：
+// 插件不允许 import internal/core（§3.3），哨兵若留在 core，插件侧的
+// `errors.Is` 永远拿不到它，三种完全不同的原因只能塌缩成同一条笼统的 warn。
+//
+//	errors.Is(err, host.ErrActiveQuota)    // 日预算用尽：本轮推送到此为止
+//	errors.Is(err, host.ErrActiveDisabled) // 配置未开：让运维改 [active]
+//	errors.Is(err, host.ErrRateLimited)    // 平台 429：退避，不要重试
+//
+// 三者互斥。错误串多数带场景/peer 或插件名（429 还带剩余冷却），但只供排障：
+// 判别一律用哨兵，网络失败与其它本地校验失败不属于任何一类，保持 Go 的原始
+// 错误语义（如 context.DeadlineExceeded）。
+var (
+	// ErrActiveQuota 是本地主动消息日预算用尽。平台每（群/用户）每天上限
+	// 1000 条，本地把预算压到个位数并**落库**（active_usage）：重启不清零，
+	// 否则"重启循环不会烧额度"只是注释里的一句空话。
+	// 日预算账本不可用时也返回它（fail-closed）：对调用方来说"这条不能发"是
+	// 同一件事，差别只在日志里。
+	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
+	// ErrActiveDisabled 是主动消息总开关关闭，或本插件不在 [active].plugins
+	// 白名单里。两种原因的处置相同：改配置，重试没有意义。
+	ErrActiveDisabled = errors.New("主动消息未开启")
+	// ErrRateLimited 表示平台返回 429（官方只给状态码 + err_code，不承诺
+	// Retry-After）；本地 (scene, peer) 冷却期内也直接返回它，且不出网。
+	ErrRateLimited = errors.New("平台限流(HTTP 429)")
+)
+
 // Sender 负责被动回复与主动消息。msg_seq 由核心分配，插件不得自行指定。
+//
+// SendActive 的失败原因用上面那三个哨兵判别，错误串只供排障。
 type Sender interface {
 	Reply(ctx context.Context, ev *Event, msg Reply) error
 	SendActive(ctx context.Context, scene Scene, peerID string, msg Reply) error

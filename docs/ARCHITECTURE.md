@@ -277,6 +277,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 8 | ① `Manifest.Yield` 取代 `Broadcast`：是否让位由每个匹配者自己声明（§3.4），`broadcast` 字段删除；② `Event.Command` / `Event.Args` 由核心填好，前缀匹配按词边界（`/md5` 不再命中 `/md`）；③ `Event.Mentioned` / `Event.Raw` 暴露“是否 @ 了机器人”与原始载荷 | #11 / #12 / #13 |
 | 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16 |
 | 10 | ① `host.Params.Str` 区分「键缺失」与「键存在但为空串」：空串返回 `""` 而不是默认值；② `Host.Store.Query` 的只读改由 SQLite `query_only` 连接保证、SQL 原样执行（不再自动追加 `LIMIT`），行数在取行时截断到 1000 | #30 |
+| 11 | `host` 导出主动消息的三个失败哨兵 `ErrActiveQuota` / `ErrActiveDisabled` / `ErrRateLimited`：`SendActive` 的返回错误用 `errors.Is` 可判，插件不必 import `internal/core` 就能把「今日预算已满」「配置未开启」「平台 429」分成三条处置路径。**调用签名未变**，插件只需把 `api_version` 改成 11 | #34 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
@@ -284,6 +285,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 |---|---|---|
 | `Sender.Reply` | 必须带原事件 ID，核心自动分配 `msg_seq`；`msg_seq` 在同一 `msg_id` 下**单调递增**，窗口过期只重置剩余次数、不回退序号；`Reply.Image` 非空时先上传再发 `msg_type=7`；发送预算按条算：纯文本 5s / 含上传 30s | 走频控；图文拆分后**消耗两格**被动配额；平台明确拒绝时归还该格，`msg_seq` 不回退；超出被动窗口直接失败并告警 |
 | `Sender.SendActive` | 主动消息；先扣本地日预算**再**发 HTTP，预算是**持久化**的（`active_usage` 表，重启不清零、跨日按调度时区 `Asia/Shanghai` 自动换桶，与 cron 同源、由核心注入） | **默认禁用**，需在配置中按 (插件, 场景) 白名单开启；每 peer 每日预算由 `active_usage` 承担 |
+| 主动消息错误哨兵 | `host.ErrActiveQuota` / `host.ErrActiveDisabled` / `host.ErrRateLimited`：`SendActive` 的失败原因用 `errors.Is` 判别，三者互斥；错误串多数带场景/peer 或插件名（429 还带剩余冷却），只供排障 | 纯判别，不改变发送行为；`ErrActiveQuota` 同时覆盖「日预算账本不可用」的 fail-closed 拒发；网络失败与本地校验失败不属于任何一类 |
 | `KV` / `PeerKV(peer)` | 按插件命名空间隔离的 KV，支持 TTL；`PeerKV` 多一层会话维度 | 只能读写自己的命名空间；`/reset session` 只清 `PeerKV` 写入的部分 |
 | `Store.Query` | 只读、参数化、行数上限 1000。只读由读连接的 `PRAGMA query_only` 保证（`WITH … DELETE` 这类写法同样被拒，不靠语句前缀过滤）；1000 行在取行时截断，SQL 不被改写，所以插件看到的语句与自己写的一致 | 不允许 DDL/写操作 |
 | `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝；白名单在重定向的**每一跳**都重新校验（拒绝 scheme 变化）；429 按 `Retry-After` 冷却域名桶（缺省 60s），冷却期内不出网 |

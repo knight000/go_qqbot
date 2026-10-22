@@ -14,19 +14,11 @@ import (
 	"github.com/knight000/go_qqbot/internal/store"
 )
 
-var (
-	ErrPassiveExhausted = errors.New("被动回复次数已用尽")
-	ErrActiveDisabled   = errors.New("主动消息未开启")
-	// ErrActiveQuota 是本地主动消息日额度用尽。平台每用户每天上限 1000 条，
-	// 本地把预算压到个位数并**落库**（§4.1 active_usage）：重启不清零，
-	// 否则"重启循环不会烧额度"就只是注释里的一句空话。
-	// 额度账本不可用时也返回它（fail-closed），调用方只需判断这一个错误。
-	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
-	// ErrRateLimited 表示平台返回 429。官方只给状态码 + err_code + trace_id，
-	// 不提供剩余额度，也不承诺 Retry-After，因此退避策略必须由本地按维度决定。
-	// 冷却期内（见 Sender.cooldowns）也会直接返回它，且不出网。
-	ErrRateLimited = errors.New("平台限流(HTTP 429)")
-)
+// ErrPassiveExhausted 是本地被动窗口用尽（群 5 次/5 分钟、单聊 4 次/小时）。
+//
+// 主动消息的三类失败不在这里：它们定义在 host（插件唯一能 import 的包），
+// 核心内部直接引用 host 侧的名字，不给同一个哨兵起第二个名字（#34）。
+var ErrPassiveExhausted = errors.New("被动回复次数已用尽")
 
 // ActivePolicy 是主动消息的本地闸门：总开关 + 插件白名单 + 每 peer 每日预算。
 // 平台侧没有额度查询接口，只能靠本地记账（见 README「频控边界」）。
@@ -84,7 +76,7 @@ type Sender struct {
 	//
 	// 平台罚的是会话，不是某条消息：同一 peer 换个 msg_id 再来同样撞墙，
 	// 而每撞一次都会把惩罚窗口续期、再烧一格域名桶的令牌、甚至挤掉同域的
-	// 群名刷新。冷却期内直接 ErrRateLimited、不出网，比"退避后重试"正确。
+	// 群名刷新。冷却期内直接返回 host.ErrRateLimited、不出网，比"退避后重试"正确。
 	cooldowns map[string]time.Time
 }
 
@@ -167,7 +159,7 @@ func (s *Sender) Reply(ctx context.Context, ev *host.Event, msg host.Reply) erro
 				// 两种例外不补：① 根本没走到发送（本地超限、上传失败）——
 				// 补发会烧掉一格被动配额，与"上传失败不消耗配额"直接冲突；
 				// ② 已被 429 罚下——冷却期内补发只会再失败一次。
-				if part.Image.Valid() && !isNotSent(err) && !errors.Is(err, ErrRateLimited) {
+				if part.Image.Valid() && !isNotSent(err) && !errors.Is(err, host.ErrRateLimited) {
 					s.sendImageFailureNotice(ctx, ev)
 				}
 				return err
@@ -279,7 +271,7 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 			// 本地再拍一个值只会两层窗口不一致（短了还会撞墙，长了就是白等）。
 			wait := httpx.RetryAfter(err)
 			s.startCooldown(ev.Scene, ev.PeerID, wait)
-			return seq, fmt.Errorf("%w (seq=%d, 冷却 %s): %v", ErrRateLimited, seq, wait, err)
+			return seq, fmt.Errorf("%w (seq=%d, 冷却 %s): %v", host.ErrRateLimited, seq, wait, err)
 		}
 		return seq, fmt.Errorf("发送消息(seq=%d): %w", seq, err)
 	}
@@ -288,7 +280,7 @@ func (s *Sender) sendPassive(ctx context.Context, ev *host.Event, msg host.Reply
 
 // rateLimitedError 说明"没出网"的原因与还要等多久，日志里能直接对上平台窗口。
 func rateLimitedError(scene host.Scene, peer string, wait time.Duration) error {
-	return fmt.Errorf("%w（%s %s 冷却中，还需 %s）", ErrRateLimited, scene, peer, wait.Round(time.Second))
+	return fmt.Errorf("%w（%s %s 冷却中，还需 %s）", host.ErrRateLimited, scene, peer, wait.Round(time.Second))
 }
 
 // cooldownKey 用场景 + peer 定位一次限流惩罚。msg_id 不参与：平台罚的是会话。
@@ -486,7 +478,7 @@ func (p *pluginSender) Reply(ctx context.Context, ev *host.Event, msg host.Reply
 
 func (p *pluginSender) SendActive(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
 	if !p.parent.active.Enabled || !p.parent.active.Plugins[p.name] {
-		err := fmt.Errorf("%w: 插件 %s 不在 [active].plugins 白名单内", ErrActiveDisabled, p.name)
+		err := fmt.Errorf("%w: 插件 %s 不在 [active].plugins 白名单内", host.ErrActiveDisabled, p.name)
 		p.parent.trace.Sent("主动消息", scene, peerID, 0, msg.Content, err, 0)
 		return err
 	}
@@ -517,7 +509,7 @@ func (s *Sender) SendActive(ctx context.Context, scene host.Scene, peerID string
 
 func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
 	if !s.active.Enabled {
-		return ErrActiveDisabled
+		return host.ErrActiveDisabled
 	}
 	if peerID == "" {
 		return fmt.Errorf("缺少 peer openid")
@@ -540,10 +532,10 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 		// 每天 1000 条的配额当成无限量烧掉——额度超发是不可撤回的。
 		// 带上场景与 peer：日志里只有"记账失败"时定位不到是哪个会话
 		// 把账本写坏了（规则 7：错误必须指得回它发生在谁身上）。
-		return fmt.Errorf("%w（额度记账失败，按保守策略拒发；%s %s）: %v", ErrActiveQuota, scene, peerID, err)
+		return fmt.Errorf("%w（额度记账失败，按保守策略拒发；%s %s）: %v", host.ErrActiveQuota, scene, peerID, err)
 	}
 	if !ok {
-		return fmt.Errorf("%w（%s %s）", ErrActiveQuota, scene, peerID)
+		return fmt.Errorf("%w（%s %s）", host.ErrActiveQuota, scene, peerID)
 	}
 
 	body, err := s.bodyFor(ctx, scene, peerID, msg)
@@ -557,7 +549,7 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 		if httpx.IsStatus(err, 429) {
 			wait := httpx.RetryAfter(err)
 			s.startCooldown(scene, peerID, wait)
-			return fmt.Errorf("%w（冷却 %s）: %v", ErrRateLimited, wait, err)
+			return fmt.Errorf("%w（冷却 %s）: %v", host.ErrRateLimited, wait, err)
 		}
 		return fmt.Errorf("发送主动消息: %w", err)
 	}

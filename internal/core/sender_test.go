@@ -189,7 +189,7 @@ func TestSenderPassiveLimitC2C(t *testing.T) {
 
 func TestSenderActiveDisabled(t *testing.T) {
 	s := NewSender(&fakeAPI{}, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)
-	if err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
+	if err := s.SendActive(context.Background(), host.SceneGroup, "g1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveDisabled) {
 		t.Fatalf("主动消息总开关关闭时应拒绝，实际 err=%v", err)
 	}
 }
@@ -203,7 +203,7 @@ func TestSenderActiveRequiresPluginAllowlist(t *testing.T) {
 		DailyPerPeer: 5,
 	}, newUsageStore(t), time.Local)
 
-	if err := s.ForPlugin("evil").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveDisabled) {
+	if err := s.ForPlugin("evil").SendActive(context.Background(), host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveDisabled) {
 		t.Fatalf("非白名单插件应被拒绝，实际 err=%v", err)
 	}
 	if n := f.callCount(); n != 0 {
@@ -425,7 +425,7 @@ func TestSenderActiveBudgetRefundedOnBusinessError(t *testing.T) {
 	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
 		t.Fatalf("归还后当天那 1 格应可用: %v", err)
 	}
-	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("归还后仍只能发 1 条，第 3 次应超预算，实际 err=%v", err)
 	}
 }
@@ -467,7 +467,7 @@ func TestSenderActiveBudgetKeptOnNetworkError(t *testing.T) {
 	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err == nil {
 		t.Fatal("模拟网络失败应返回错误")
 	}
-	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("网络失败应保留那一格，第 2 次应超预算，实际 err=%v", err)
 	}
 }
@@ -512,7 +512,7 @@ func TestSenderActiveDailyBudget(t *testing.T) {
 			t.Fatalf("第 %d 次不应失败: %v", i+1, err)
 		}
 	}
-	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("第 3 次应超出日预算，实际 err=%v", err)
 	}
 	if n := f.callCount(); n != 2 {
@@ -541,7 +541,7 @@ func TestSenderActiveBudgetResetsNextDay(t *testing.T) {
 	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); err != nil {
 		t.Fatalf("当日第 1 次不应失败: %v", err)
 	}
-	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("当日第 2 次应超出日预算，实际 err=%v", err)
 	}
 
@@ -566,7 +566,7 @@ func TestSenderActiveBudgetFailsClosedWithoutStore(t *testing.T) {
 
 	err := p.SendActive(context.Background(), host.SceneC2C, "u1",
 		host.Reply{Image: host.ImageFromBytes(tinyPNG())})
-	if !errors.Is(err, ErrActiveQuota) {
+	if !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("没有账本时应按额度不可用拒绝，实际 err=%v", err)
 	}
 	if n := f.callCount(); n != 0 {
@@ -592,7 +592,7 @@ func TestSenderActiveBudgetFailsClosedWhenStoreBroken(t *testing.T) {
 
 	err := s.ForPlugin("digest").SendActive(context.Background(), host.SceneC2C, "u1",
 		host.Reply{Content: "x"})
-	if !errors.Is(err, ErrActiveQuota) {
+	if !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("库不可用时应拒绝，实际 err=%v", err)
 	}
 	// 账本故障是运维问题，但错误必须指得回是哪个会话说起的（规则 7）。
@@ -641,7 +641,7 @@ func TestSenderActiveBudgetSurvivesRestart(t *testing.T) {
 	second := open()
 	f2 := &fakeAPI{}
 	p2 := NewSender(f2, slog.New(slog.DiscardHandler), policy, second, time.Local).ForPlugin("bootnotice")
-	if err := p2.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrActiveQuota) {
+	if err := p2.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrActiveQuota) {
 		t.Fatalf("重启后当日额度应仍是用尽的，实际 err=%v", err)
 	}
 	if n := f2.callCount(); n != 0 {
@@ -660,15 +660,15 @@ func TestSenderRateLimitCooldownSkipsNetwork(t *testing.T) {
 	ctx := context.Background()
 
 	ev := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m1"}
-	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("429 应返回 ErrRateLimited，实际 %v", err)
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, host.ErrRateLimited) {
+		t.Fatalf("429 应返回 host.ErrRateLimited，实际 %v", err)
 	}
 
 	next := &host.Event{Scene: host.SceneGroup, PeerID: "g1", MsgID: "m2"}
 	start := time.Now()
 	err := s.Reply(ctx, next, host.Reply{Content: "hi"})
-	if !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("冷却期内应直接返回 ErrRateLimited，实际 %v", err)
+	if !errors.Is(err, host.ErrRateLimited) {
+		t.Fatalf("冷却期内应直接返回 host.ErrRateLimited，实际 %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("冷却期内应立刻失败，实际耗时 %s", elapsed)
@@ -695,11 +695,11 @@ func TestSenderRateLimitCooldownDefaultsTo60s(t *testing.T) {
 	ctx := context.Background()
 	ev := &host.Event{Scene: host.SceneC2C, PeerID: "u1", MsgID: "m1"}
 
-	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("429 应返回 ErrRateLimited，实际 %v", err)
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, host.ErrRateLimited) {
+		t.Fatalf("429 应返回 host.ErrRateLimited，实际 %v", err)
 	}
 	now = now.Add(59 * time.Second)
-	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, ErrRateLimited) {
+	if err := s.Reply(ctx, ev, host.Reply{Content: "hi"}); !errors.Is(err, host.ErrRateLimited) {
 		t.Fatalf("59s 时仍在缺省冷却窗口内，实际 %v", err)
 	}
 	now = now.Add(2 * time.Second)
@@ -722,11 +722,11 @@ func TestSenderActiveRateLimitCooldownKeepsBudget(t *testing.T) {
 	p := s.ForPlugin("bootnotice")
 	ctx := context.Background()
 
-	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("429 应返回 ErrRateLimited，实际 %v", err)
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrRateLimited) {
+		t.Fatalf("429 应返回 host.ErrRateLimited，实际 %v", err)
 	}
-	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("冷却期内应返回 ErrRateLimited，实际 %v", err)
+	if err := p.SendActive(ctx, host.SceneC2C, "u1", host.Reply{Content: "x"}); !errors.Is(err, host.ErrRateLimited) {
+		t.Fatalf("冷却期内应返回 host.ErrRateLimited，实际 %v", err)
 	}
 	if n := f.callCount(); n != 1 {
 		t.Fatalf("冷却期内不得出网，实际调用 %d 次", n)
