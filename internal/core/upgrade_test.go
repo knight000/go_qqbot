@@ -172,6 +172,31 @@ func TestUpgradeApplyRepliesBeforeHandingPlan(t *testing.T) {
 	}
 }
 
+// 核心升级里"本该升却没升成"的插件必须报出来：纯跳过在预览里说过一次，
+// 而落位/校验失败是新信息——不说，owner 会以为插件也跟着升了。
+func TestUpgradeApplyReportsPluginFailures(t *testing.T) {
+	plan := &upgrade.Plan{
+		Exe: `C:\qqbot\qqbot.exe`, From: "1.2.3", To: "1.2.4", Tag: "v1.2.4",
+		Staged: 40 << 20,
+		Plugins: []upgrade.PluginDelta{
+			{Name: "echo", From: "0.1.0", To: "0.2.0", Action: "升", Size: 1 << 20},
+			{Name: "md", From: "0.1.0", To: "0.2.0", Action: "失败（校验和不匹配）"},
+			{Name: "gone", From: "0.1.0", To: "0.1.0", Action: "跳过（发布里没有）"},
+		},
+	}
+	c, f := newUpgradeCore(t, &fakeUpgrade{plan: plan})
+	seedAdmin(t, c, "o1", "", store.RoleOwner)
+
+	c.handleReserved(context.Background(), adminEvent("/upgrade apply", "o1", "", host.SceneC2C, "o1"))
+	got := lastReply(t, f)
+	if !strings.Contains(got, "插件未升级") || !strings.Contains(got, "md") || !strings.Contains(got, "校验和不匹配") {
+		t.Errorf("应报出落位失败的插件与原因:\n%s", got)
+	}
+	if strings.Contains(got, "gone") {
+		t.Errorf("纯跳过的插件不该出现在这条回复里（预览里已说过）:\n%s", got)
+	}
+}
+
 // 升级失败必须明确说"没做任何改动，服务继续运行"，并且不重启：
 // 验收 4 要的正是这个——失败留在进程内，旧二进制与标记都不动。
 func TestUpgradeApplyFailureKeepsServing(t *testing.T) {
