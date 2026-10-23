@@ -144,6 +144,27 @@ func TestLoadedPlugins(t *testing.T) {
 	}
 }
 
+// binPlugin 是能报出自己可执行文件路径的插件（生产上是 pluginproc.proxy）。
+type binPlugin struct {
+	fakePlugin
+	bin string
+}
+
+func (p binPlugin) BinPath() string { return p.bin }
+
+// 插件是可执行文件：核心升级要把更高版本的产物落位到它旁边（同卷），
+// 所以路径必须由装配期交上来；不是子进程的插件留空，升级侧据此跳过。
+func TestLoadedPluginsCarriesBinPath(t *testing.T) {
+	got := loadedPlugins([]host.Plugin{binPlugin{fakePlugin: fakePlugin{name: "echo"}, bin: "/data/plugins/bin/echo"}})
+	if len(got) != 1 || got[0].Bin != "/data/plugins/bin/echo" {
+		t.Fatalf("应带上插件路径: %+v", got)
+	}
+	plain := loadedPlugins([]host.Plugin{fakePlugin{name: "md"}})
+	if plain[0].Bin != "" {
+		t.Errorf("没有进程的插件不该编出一个路径: %q", plain[0].Bin)
+	}
+}
+
 // 换盘计划只在 /upgrade apply 时出现：常规 /reload 的请求不该带计划，
 // 否则 main 会去换一份不存在的 .new。
 func TestReloadRequestCarriesNoPlan(t *testing.T) {

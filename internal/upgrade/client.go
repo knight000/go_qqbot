@@ -37,6 +37,8 @@ type Release struct {
 
 	// coreID 是核心产物在 API 侧的资产 id。有 token 时走它。
 	coreID int64
+	// gh 是这次发布本身：插件产物要按资产名回查 id（有 token 时走 api 通道）。
+	gh *ghRelease
 }
 
 const (
@@ -98,23 +100,20 @@ func (r *ghRelease) asset(name string) (id, size int64, ok bool) {
 	return 0, 0, false
 }
 
-// check 取元数据并拼出「要升到的那个版本」。
+// checkIndex 只取发布 tag 与 index.json，不碰核心产物清单。
 //
-// 通道语义（决策 3 + 私有仓扩展）：
-//   - index.json 与 checksums.txt **永远**走 api_base；
-//   - 没有 token 时二进制走 asset_base（可指向镜像）；
-//   - 有 token 时三份产物全走 api_base 的 release asset 端点——私有仓的
-//     资产无法在镜像上匿名取，而且 token 绝不能发给 asset_base 的主机。
-func (c *client) check(ctx context.Context) (*Release, error) {
+// 插件升级走这条：它只认 index.json（决策 11 说得很清楚——插件产物与
+// index.json 的完整性由索引里的 sha256 提供，checksums.txt 只覆盖核心）。
+// 用一个"发漏了本平台核心产物"的发布去拒绝插件升级，是把两条无关的路
+// 硬绑在一起：那种发布恰恰是最需要先升插件的现场。
+func (c *client) checkIndex(ctx context.Context) (*Release, error) {
 	rel, err := c.latest(ctx)
 	if err != nil {
 		return nil, err
 	}
-	tag := rel.TagName
-	if tag == "" {
+	if rel.TagName == "" {
 		return nil, errors.New("最新发布缺少 tag_name")
 	}
-
 	rawIndex, err := c.readAsset(ctx, rel, assetIndexName)
 	if err != nil {
 		return nil, err
@@ -123,6 +122,22 @@ func (c *client) check(ctx context.Context) (*Release, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &Release{Tag: rel.TagName, Version: idx.Core.Version, Index: idx, gh: rel}, nil
+}
+
+// check 取元数据并拼出「要升到的那个版本」（核心升级用）。
+//
+// 通道语义（决策 3 + 私有仓扩展）：
+//   - index.json 与 checksums.txt **永远**走 api_base；
+//   - 没有 token 时二进制走 asset_base（可指向镜像）；
+//   - 有 token 时三份产物全走 api_base 的 release asset 端点——私有仓的
+//     资产无法在镜像上匿名取，而且 token 绝不能发给 asset_base 的主机。
+func (c *client) check(ctx context.Context) (*Release, error) {
+	out, err := c.checkIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tag, idx, rel := out.Tag, out.Index, out.gh
 
 	rawSums, err := c.readAsset(ctx, rel, assetChecksumsName)
 	if err != nil {
@@ -143,15 +158,7 @@ func (c *client) check(ctx context.Context) (*Release, error) {
 		return nil, fmt.Errorf("发布 %s 没有资产 %s：该发布可能漏发了平台", tag, name)
 	}
 
-	out := &Release{
-		Tag:      tag,
-		Version:  idx.Core.Version,
-		Index:    idx,
-		CoreName: name,
-		CoreSize: size,
-		CoreSHA:  sha,
-		coreID:   id,
-	}
+	out.CoreName, out.CoreSize, out.CoreSHA, out.coreID = name, size, sha, id
 	if c.token != "" {
 		out.CoreURL = c.apiAssetURL(id)
 	} else {

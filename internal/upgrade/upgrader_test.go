@@ -29,8 +29,12 @@ func newTestUpgrader(t *testing.T, f *fakeRelease, current string, mutate func(*
 			{Name: "gone", Version: "0.1.0"},
 		},
 		Snapshots: &fakeSnapshotter{},
-		Log:       slog.New(slog.DiscardHandler),
-		Now:       func() time.Time { return time.Date(2026, 10, 23, 12, 0, 0, 0, time.Local) },
+		// 发布口径是 2 秒（探测只做一次 JSON 编码 + 一次进程启动），但
+		// `go test ./...` 会并行跑好几个包，冷启一个 5 MB 的产物超过 2 秒
+		// 是常事——超时本身由 probeManifest 自己的用例盯着。
+		ProbeTimeout: probeTimeoutForTest,
+		Log:          slog.New(slog.DiscardHandler),
+		Now:          func() time.Time { return time.Date(2026, 10, 23, 12, 0, 0, 0, time.Local) },
 	}
 	if mutate != nil {
 		mutate(&o)
