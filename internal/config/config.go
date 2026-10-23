@@ -7,7 +7,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"time"
@@ -312,8 +314,8 @@ func (c *Config) PluginDisabled(name string) bool {
 // Load 读取配置、套默认值、做环境变量覆盖，最后校验。
 func Load(path string) (*Config, error) {
 	c := new(Config)
-	if _, err := toml.DecodeFile(path, c); err != nil {
-		return nil, fmt.Errorf("读取配置 %s: %w", path, err)
+	if err := decodeFile(path, c); err != nil {
+		return nil, err
 	}
 	c.applyEnv()
 	c.applyDefaults()
@@ -321,6 +323,38 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// LoadForInit 读取配置、套默认值，但**不校验**。
+//
+// `qqbot init --plugins` 只需要 [store].path 来定位数据目录。init 生成的
+// 配置里 app.id/secret 本来就是留空的，用 Load 会因为"还没填 AppID"而
+// 拒绝释放插件——而那正是这个命令要救的现场（ADR-0005 决策 12）。
+func LoadForInit(path string) (*Config, error) {
+	c := new(Config)
+	if err := decodeFile(path, c); err != nil {
+		return nil, err
+	}
+	c.applyDefaults()
+	return c, nil
+}
+
+// decodeFile 读取并解析配置文件。
+//
+// 缺文件单独给一句话：那是新用户看到的第一条错误，必须直接指向
+// `qqbot init`，而不是 "open xxx: The system cannot find the file specified"。
+func decodeFile(path string, c *Config) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("配置文件 %s 不存在：运行 `qqbot init -c %s` 生成一份", path, path)
+	}
+	if err != nil {
+		return fmt.Errorf("读取配置 %s: %w", path, err)
+	}
+	if _, err := toml.Decode(string(data), c); err != nil {
+		return fmt.Errorf("解析配置 %s: %w", path, err)
+	}
+	return nil
 }
 
 func (c *Config) applyEnv() {
@@ -397,9 +431,13 @@ func (c *Config) applyDefaults() {
 func (c *Config) Validate() error {
 	var problems []string
 	if strings.TrimSpace(c.App.ID) == "" {
-		problems = append(problems, "app.id 为空（QQ 开放平台机器人 AppID）")
+		// 这条错误是新用户的第一面（init 生成的配置里 id 就是留空的），
+		// 所以必须给出两条出路：跑 init 生成配置，或直接填 [app].id。
+		problems = append(problems, "app.id 为空：运行 `qqbot init` 生成配置并填 [app].id（QQ 开放平台机器人 AppID）")
 	}
 	if strings.TrimSpace(c.App.Secret) == "" {
+		// 与 id 不同，这里不提示 init：配置已经在手上了，再跑一次 init 也
+		// 只会写出同一个空 secret，真正缺的是密钥本身。
 		problems = append(problems, "app.secret 为空（写入本地 config，勿提交 git）")
 	}
 	if c.Bot.ShardID < 0 || c.Bot.ShardID >= c.Bot.ShardTotal {
