@@ -7,7 +7,9 @@
 #   qqbot-<version>-linux-amd64
 #   qqbot-<version>-linux-arm64
 #   checksums.txt
-#   plugins/index.json          （工作流生成，不在这里）
+#   index.json                  （工作流生成，不在这里；GitHub 的资产名不能
+#                               带 /，所以仓内的 dist/plugins/index.json 上传
+#                               后只剩文件名）
 #
 # <version> 是去掉前导 v 的 tag（GoReleaser 的 {{ .Version }} 就是这个），
 # 与 -X .../buildinfo.Version 注入的值逐字相同——两处若不一致，
