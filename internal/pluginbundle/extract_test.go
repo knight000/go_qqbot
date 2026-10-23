@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"testing/fstest"
 )
@@ -103,6 +104,28 @@ func TestExtractRestoresOnlyDeleted(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(dst, "echo")); string(got) != "echo-local" {
 		t.Errorf("仍存在的 echo 不该被动，实际 %q", got)
+	}
+}
+
+// 出厂副本里一个插件都没有（干净克隆的典型现场：dist/<平台>/ 只有 .gitkeep）
+// 时，释放必须失败而不是"成功释放 0 个"。
+//
+// 静默成功会让用户以为插件已经就位，下一次启动只看到插件清单少了几项，
+// 而 ADR-0005 决策 12 把恢复的唯一入口定在 `init --plugins`——那个入口
+// 说"成功"却不补任何东西，用户就再也没有线索了。
+func TestExtractEmptyBundleIsAnError(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "plugins", "bin")
+	err := extractFS(fstest.MapFS{".gitkeep": {Data: nil}}, dst)
+	if err == nil {
+		t.Fatal("空出厂副本必须报错，不能静默释放 0 个插件")
+	}
+	for _, want := range []string{"出厂插件", "go run ./tools/build plugins", "发布版"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误串 %q 缺少 %q：用户要能从错误里看出下一步怎么办", err, want)
+		}
+	}
+	if _, statErr := os.Stat(dst); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("释放失败时不该留下空目录 %s", dst)
 	}
 }
 
