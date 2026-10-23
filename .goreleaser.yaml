@@ -1,0 +1,70 @@
+# 发布配置：tag 触发，出一份「三个平台的核心二进制 + checksums.txt」，
+# 插件产物与 plugins/index.json 由 .github/workflows/release.yml 在之后补上。
+#
+# 产物形状是 ADR-0006 决策 11 的契约，改动它等于改 /upgrade 的下载路径：
+#
+#   qqbot-<version>-windows-amd64.exe
+#   qqbot-<version>-linux-amd64
+#   qqbot-<version>-linux-arm64
+#   checksums.txt
+#   plugins/index.json          （工作流生成，不在这里）
+#
+# <version> 是去掉前导 v 的 tag（GoReleaser 的 {{ .Version }} 就是这个），
+# 与 -X .../buildinfo.Version 注入的值逐字相同——两处若不一致，
+# 启动日志会报一个 release 里找不到的版本号。
+version: 2
+
+project_name: qqbot
+
+builds:
+  - id: qqbot
+    main: ./cmd/bot
+    binary: qqbot
+    # 全仓依赖都是纯 Go（modernc.org/sqlite）：产物不该随构建机的 cgo
+    # 可用性变化，交叉编译也要求关掉它。
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      # commit 来自 Go 自动嵌入的 VCS 信息（ADR-0006 决策 11），
+      # 明写 -buildvcs=true 是为了让浅克隆/无 .git 时直接报错，
+      # 而不是静默产出一个 commit 为空的二进制。
+      - -buildvcs=true
+    ldflags:
+      - -s -w
+      - -X github.com/knight000/go_qqbot/internal/buildinfo.Version={{ .Version }}
+    goos:
+      - windows
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    # 只有这三个平台有出厂插件副本（internal/pluginbundle/dist/），
+    # windows/arm64 编译得出但没有 go:embed 的插件，发了也启动不了。
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: qqbot
+    ids:
+      - qqbot
+    # binary = 不打包，直接把可执行文件当资产。GoReleaser 会按目标平台
+    # 自动补 .exe，所以模板里不写扩展名。
+    formats:
+      - binary
+    name_template: "qqbot-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+release:
+  # 预发布 tag（v0.0.0-p3-smoke 这类）自动标成 prerelease，
+  # 免得 GH 上「latest」指向一个冒烟版本。
+  prerelease: auto
+  draft: false
+
+# 没有 changelog 的发布说明就是一份空壳；等有稳定的提交规范再开。
+changelog:
+  disable: true
