@@ -162,6 +162,9 @@ func (c *Core) upgradeApply(ctx context.Context, ev *host.Event) {
 	if ups := planUpgrades(plan.Plugins); len(ups) > 0 {
 		fmt.Fprintf(&b, "插件（只列已加载的插件）%s\n", strings.Join(ups, "、"))
 	}
+	if fails := planPluginFailures(plan.Plugins); len(fails) > 0 {
+		fmt.Fprintf(&b, "插件未升级：%s\n", strings.Join(fails, "、"))
+	}
 	b.WriteString("接下来重启进程换盘；重启后走 Resume，不额外消耗 Identify 配额。")
 	b.WriteString("用 /ping 对比版本与启动时间即可确认生效。")
 
@@ -304,6 +307,20 @@ func planUpgrades(plugins []upgrade.PluginDelta) []string {
 	for _, p := range plugins {
 		if p.Action == "升" {
 			out = append(out, p.Name+" "+p.From+"→"+p.To)
+		}
+	}
+	return out
+}
+
+// planPluginFailures 单独列"本该升却没升成"的插件。
+//
+// 纯跳过不在这里出现（预览里已经说过），而落位或校验失败是**新信息**：
+// 不说的话 owner 会以为插件跟着核心一起升了，重启之后才发现版本没变。
+func planPluginFailures(plugins []upgrade.PluginDelta) []string {
+	out := make([]string, 0, len(plugins))
+	for _, p := range plugins {
+		if strings.HasPrefix(p.Action, "失败") {
+			out = append(out, p.Name+" "+p.Action)
 		}
 	}
 	return out
