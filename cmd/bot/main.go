@@ -165,8 +165,11 @@ func run() (*core.RestartRequest, error) {
 	// 上一次升级留下的 .old 到这里就没用了（已经稳定运行过，
 	// 或刚被上面回滚用掉）。删不掉只 warn：Windows 上杀软/旧进程
 	// 可能短暂持有它，一份 40 MB 的残留不值得让机器人下线。
-	if err := upgrade.CleanOld(exePath); err != nil {
-		log.Warn("清理旧版本残留失败", "path", upgrade.OldPath(exePath), "err", err)
+	// exePath 为空（定位失败）时不能调：那会变成删当前工作目录下的 ".old"。
+	if exePath != "" {
+		if err := upgrade.CleanOld(exePath); err != nil {
+			log.Warn("清理旧版本残留失败", "path", upgrade.OldPath(exePath), "err", err)
+		}
 	}
 
 	// 渲染器在启动期同步解析字体（约 300 ms，全部花在 20 MB 字体的字节码扫描上）。
