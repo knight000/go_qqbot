@@ -7,7 +7,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"time"
@@ -30,18 +32,115 @@ func (d *Duration) UnmarshalText(text []byte) error {
 func (d Duration) MarshalText() ([]byte, error) { return []byte(d.Duration.String()), nil }
 
 type Config struct {
-	App        App                       `toml:"app"`
-	Bot        Bot                       `toml:"bot"`
-	Store      Store                     `toml:"store"`
-	Retention  Retention                 `toml:"retention"`
-	Media      Media                     `toml:"media"`
-	HTTP       HTTP                      `toml:"http"`
-	Active     Active                    `toml:"active"`
-	Permission Permission                `toml:"permission"`
-	Group      Group                     `toml:"group"`
-	Log        Log                       `toml:"log"`
-	Debug      Debug                     `toml:"debug"`
-	Plugins    map[string]map[string]any `toml:"plugins"`
+	App        App        `toml:"app"`
+	Bot        Bot        `toml:"bot"`
+	Store      Store      `toml:"store"`
+	Retention  Retention  `toml:"retention"`
+	Media      Media      `toml:"media"`
+	HTTP       HTTP       `toml:"http"`
+	Active     Active     `toml:"active"`
+	Permission Permission `toml:"permission"`
+	Group      Group      `toml:"group"`
+	Log        Log        `toml:"log"`
+	Debug      Debug      `toml:"debug"`
+	Plugins    Plugins    `toml:"plugins"`
+	Upgrade    Upgrade    `toml:"upgrade"`
+}
+
+// Upgrade 是自更新配置（ADR-0006 决策 2/3）。
+//
+// 两个地址分开不是可选项：「校验和与二进制不同通道」是结构约束，不是约定。
+// index.json 与 checksums.txt 永远从 api_base 取；二进制默认从 asset_base 取
+// （可指向镜像），设了 token 之后三份产物全走 api_base——私有仓的资产无法在
+// 镜像上匿名取，而 token 绝不能发给用户可配置的镜像主机。
+type Upgrade struct {
+	// Enabled 是总开关，默认 true。关掉之后连检查都不发请求，
+	// 不是"检查了但不下载"。
+	Enabled *bool `toml:"enabled"`
+	// APIBase 是元数据通道（GitHub API 端点），默认 https://api.github.com。
+	APIBase string `toml:"api_base"`
+	// AssetBase 是二进制通道，默认 https://github.com；可指向镜像。
+	// 只在没有 token 时生效。
+	AssetBase string `toml:"asset_base"`
+	// Token 是私有仓凭据（细粒度 token，只需 contents:read）。
+	// 它在文件里就是明文——与 [app].secret 是同一类东西，配置本身要 600。
+	Token string `toml:"token"`
+}
+
+// UpgradeEnabled 返回自更新开关的最终值（默认 true）。
+func (c *Config) UpgradeEnabled() bool {
+	if c.Upgrade.Enabled == nil {
+		return true
+	}
+	return *c.Upgrade.Enabled
+}
+
+// Plugins 是 `[plugins]` 表：既有核心侧的停用名单，也有各插件的配置段。
+//
+// 为什么是一个带 UnmarshalTOML 的类型，而不是 `map[string]map[string]any`
+// 再加一个顶层字段（ADR-0005 决策 13）：TOML 里 `disabled` 与 `[plugins.echo]`
+// 处在**同一个表**中，一个表不能同时解进两个字段。而 `disabled = ["echo"]`
+// 是数组、配置段是表——按同一类型解会直接报「期望表、实际数组」，整个启动
+// 读不到配置。所以这里按 TOML 的类型分流：键名 disabled 走数组，其余一律
+// 当配置段，且必须是表（写错成 `[plugins] echo = 1` 要立刻报错，而不是被
+// 静默丢掉）。
+//
+// 两者的语义刻意不同（决策 13）：disabled 是"装而不跑"，由核心决定是否
+// spawn；`[plugins.<name>].enabled` 仍是插件自己的功能开关。
+type Plugins struct {
+	// Disabled 是核心侧停用名单，里面的名字一律不 spawn。
+	Disabled []string
+	// Sections 是 `[plugins.<name>]` 的原始配置，键是插件名。
+	Sections map[string]map[string]any
+}
+
+// UnmarshalTOML 把 `[plugins]` 的一张表拆成 Disabled 与 Sections。
+func (p *Plugins) UnmarshalTOML(v any) error {
+	tbl, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf("[plugins] 必须是表，实际 %T", v)
+	}
+	for key, raw := range tbl {
+		if key == "disabled" {
+			names, err := toStrings("[plugins].disabled", raw)
+			if err != nil {
+				return err
+			}
+			p.Disabled = names
+			continue
+		}
+		section, ok := raw.(map[string]any)
+		if !ok {
+			// 最可能的现场是把 `disabled` 拼错（`dissabled = [...]`）：把它当
+			// 插件配置段丢掉，症状会是"停用没生效"而不是"配置写错了"。
+			return fmt.Errorf("[plugins].%s 必须是表（插件配置段）；[plugins] 下只有 disabled 是数组，实际 %T", key, raw)
+		}
+		if p.Sections == nil {
+			p.Sections = make(map[string]map[string]any, len(tbl))
+		}
+		p.Sections[key] = section
+	}
+	return nil
+}
+
+// toStrings 把 TOML 数组收敛成 []string，顺带给出能指到键名的错误。
+func toStrings(label string, raw any) ([]string, error) {
+	switch arr := raw.(type) {
+	case []string:
+		return arr, nil
+	case []any:
+		out := make([]string, 0, len(arr))
+		for i, item := range arr {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s[%d] 必须是字符串，实际 %T", label, i, item)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("%s 必须是字符串数组，实际 %T", label, raw)
+	}
 }
 
 type App struct {
@@ -222,17 +321,30 @@ type Debug struct {
 
 // Plugin 返回某个插件的配置段（不存在时返回空 map，插件自行取默认值）。
 func (c *Config) Plugin(name string) map[string]any {
-	if c.Plugins == nil {
+	if c.Plugins.Sections == nil {
 		return map[string]any{}
 	}
-	return c.Plugins[name]
+	return c.Plugins.Sections[name]
+}
+
+// PluginDisabled 报告某个插件是否在 `[plugins].disabled` 里（核心侧停用）。
+//
+// 判定按名字精确匹配：插件名来自 manifest、大小写敏感，配置里写错大小写
+// 应当是"没停用"而不是"猜着停用"。
+func (c *Config) PluginDisabled(name string) bool {
+	for _, n := range c.Plugins.Disabled {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Load 读取配置、套默认值、做环境变量覆盖，最后校验。
 func Load(path string) (*Config, error) {
 	c := new(Config)
-	if _, err := toml.DecodeFile(path, c); err != nil {
-		return nil, fmt.Errorf("读取配置 %s: %w", path, err)
+	if err := decodeFile(path, c); err != nil {
+		return nil, err
 	}
 	c.applyEnv()
 	c.applyDefaults()
@@ -240,6 +352,38 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// LoadForInit 读取配置、套默认值，但**不校验**。
+//
+// `qqbot init --plugins` 只需要 [store].path 来定位数据目录。init 生成的
+// 配置里 app.id/secret 本来就是留空的，用 Load 会因为"还没填 AppID"而
+// 拒绝释放插件——而那正是这个命令要救的现场（ADR-0005 决策 12）。
+func LoadForInit(path string) (*Config, error) {
+	c := new(Config)
+	if err := decodeFile(path, c); err != nil {
+		return nil, err
+	}
+	c.applyDefaults()
+	return c, nil
+}
+
+// decodeFile 读取并解析配置文件。
+//
+// 缺文件单独给一句话：那是新用户看到的第一条错误，必须直接指向
+// `qqbot init`，而不是 "open xxx: The system cannot find the file specified"。
+func decodeFile(path string, c *Config) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("配置文件 %s 不存在：运行 `qqbot init -c %s` 生成一份", path, path)
+	}
+	if err != nil {
+		return fmt.Errorf("读取配置 %s: %w", path, err)
+	}
+	if _, err := toml.Decode(string(data), c); err != nil {
+		return fmt.Errorf("解析配置 %s: %w", path, err)
+	}
+	return nil
 }
 
 func (c *Config) applyEnv() {
@@ -311,14 +455,26 @@ func (c *Config) applyDefaults() {
 	if c.Log.Format == "" {
 		c.Log.Format = "text"
 	}
+	// 自更新两个地址的默认值必须在这里（而不是空串让 upgrade 包兜）：
+	// /ping 与启动日志里要能看到实际生效的地址，空白的配置项看不出用的是哪一个。
+	if c.Upgrade.APIBase == "" {
+		c.Upgrade.APIBase = "https://api.github.com"
+	}
+	if c.Upgrade.AssetBase == "" {
+		c.Upgrade.AssetBase = "https://github.com"
+	}
 }
 
 func (c *Config) Validate() error {
 	var problems []string
 	if strings.TrimSpace(c.App.ID) == "" {
-		problems = append(problems, "app.id 为空（QQ 开放平台机器人 AppID）")
+		// 这条错误是新用户的第一面（init 生成的配置里 id 就是留空的），
+		// 所以必须给出两条出路：跑 init 生成配置，或直接填 [app].id。
+		problems = append(problems, "app.id 为空：运行 `qqbot init` 生成配置并填 [app].id（QQ 开放平台机器人 AppID）")
 	}
 	if strings.TrimSpace(c.App.Secret) == "" {
+		// 与 id 不同，这里不提示 init：配置已经在手上了，再跑一次 init 也
+		// 只会写出同一个空 secret，真正缺的是密钥本身。
 		problems = append(problems, "app.secret 为空（写入本地 config，勿提交 git）")
 	}
 	if c.Bot.ShardID < 0 || c.Bot.ShardID >= c.Bot.ShardTotal {

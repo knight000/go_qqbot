@@ -1,11 +1,11 @@
 // Package echo 是最小插件示例，同时充当插件契约的回归用例。
 //
 // 它演示了三件事：
-//  1. 通过 init() 编译期注册（P1）；
+//  1. 一个插件 = 这个包 + cmd/echo 入口（独立可执行文件，ADR-0005）；
 //  2. Manifest 声明订阅事件与命令前缀；
 //  3. 从 [plugins.echo] 读配置、通过 Host 回复。
 //
-// 复制这个包即可开始写新插件；业务插件不得 import internal/gateway。
+// 复制这个包（含 cmd/ 入口）即可开始写新插件；业务插件不得 import internal/gateway。
 package echo
 
 import (
@@ -14,8 +14,6 @@ import (
 
 	"github.com/knight000/go_qqbot/pkg/host"
 )
-
-func init() { host.Register(&Plugin{}) }
 
 type Plugin struct {
 	prefix string

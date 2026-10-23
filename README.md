@@ -13,29 +13,107 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、发图（上传 + `msg_type=7`）、调度器、7 天 GC、`/reload` 自重启、`/reset` 分级重置 |
 | `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
-| `pkg/host` | 插件契约与能力实现（KV / 只读 Query / HTTP 转发（域名白名单由核心注入的客户端保证）/ 管理员判定 / 收件人目录 / 日志）；只依赖标准库与叶子依赖，不 import `internal/*` |
+| `pkg/host` | 插件契约与 Host 能力实现（KV / 只读 Query / HTTP 转发（域名白名单由核心注入的客户端保证）/ 管理员判定 / 收件人目录 / 日志）；只依赖标准库与叶子依赖，不 import `internal/*` |
+| `pkg/rpc` / `pkg/rpcsdk` | 插件线协议：长度前缀帧、方法表、错误码表；插件侧入口是 `rpcsdk.Serve(host.Plugin)`（ARCHITECTURE §3.9） |
+| `internal/pluginproc` | 把 `plugins/bin/` 下的可执行文件变成 `host.Plugin`：`--manifest` 探测、spawn、1/2/4/8/16 分钟退避重启与熔断、RPC→SIGTERM→Kill 三级关闭 |
+| `internal/pluginbundle` | 内嵌的出厂插件副本（`dist/<os>_<arch>/`），只作 `qqbot init --plugins` 的释放源；启动期不释放 |
+| `internal/upgrade` | 自更新：检查发布、下载、SHA-256、同卷落位、pending 标记、`VACUUM INTO` 快照与回滚 |
 | `internal/logx` | slog 文本/JSON handler；终端里 `WARN` 黄、`ERROR` 红，JSON 永不上色 |
 | `internal/termcolor` | 是否该上色的唯一判定：真终端才上色，落盘与 journald 保持纯文本 |
 | `internal/sysinfo` | 跨平台资源采集：CPU、内存、进程 RSS、分区容量、目录占用（无 cgo） |
-| `plugins/echo` | 最小插件，演示 Manifest、配置读取、`!ping` / `!echo` |
+| `tools/build` | 固定构建顺序：先编插件产物，再编核心（核心的 `//go:embed` 依赖上一步） |
+| `plugins/echo` | 示例插件（独立可执行文件）：Manifest、配置读取、`!ping` / `!echo` |
 | `plugins/adminping` | 仅管理员可用的 `/ping`：运行时长 + CPU / 内存 / 磁盘 / 目录占用 |
-| `plugins/bootnotice` | 启动/重启后主动私聊管理员：上线时间、距上次启动间隔、启用插件清单 |
-| `deploy/qqbot.service` | systemd 单元，含 `StartLimitBurst` 与 `MemoryMax` |
+| `plugins/bootnotice` | 启动/重启后主动私聊管理员：上线时间、距上次启动间隔、平台与版本 |
+| `deploy/qqbot.service` | systemd 单元：`StartLimitBurst`、`MemoryMax`、可写的 `/var/lib/qqbot`（自更新要换盘） |
 
-认证信息按约定写在**本地 config**（`config/config.local.toml`，已 gitignore），不再依赖 `EnvironmentFile`；仍支持 `QQ_APP_ID` / `QQ_APP_SECRET` 覆盖。
+插件是**独立进程**（ADR-0005）：核心启动时扫描 `<datadir>/plugins/bin/`，对每个文件跑 `--manifest` 探测，再 spawn 成子进程走 stdio RPC。加插件不用重编译核心，删文件就是卸载。
 
-## 快速开始
+认证信息按约定写在**本地 config**（默认 `config/config.local.toml`，已 gitignore），不再依赖 `EnvironmentFile`；仍支持 `QQ_APP_ID` / `QQ_APP_SECRET` 覆盖。
+
+## 首次安装
+
+本地（Windows / Linux 直接用源码跑）：
 
 ```bash
-cp config/config.example.toml config/config.local.toml
-# 填入 [app] id / secret，保持 sandbox = true
+# 1. 编产物。顺序是硬约束：核心的 go:embed 要在编译期看到插件产物
+go run ./tools/build all
+# Windows 产出 ./bot.exe；Linux 产出 ./bot
+# 插件产物落在 internal/pluginbundle/dist/<os>_<arch>/
 
-go run ./cmd/bot          # 不填 -c 时默认读相对路径 config/config.local.toml
+# 2. 生成配置 + 释放四个出厂插件（默认写 config/config.local.toml，已被 gitignore）
+./bot.exe init
+
+# 3. 填 [app].id / [app].secret（QQ 开放平台 → 机器人 → 开发设置）
+$EDITOR config/config.local.toml
+
+# 4. 启动（不带 -c 时读同一个默认路径）
+./bot.exe
 ```
 
-默认路径是**相对当前工作目录**的 `config/config.local.toml`；换目录启动或改用 `/etc/qqbot/config.toml` 时用 `-c <路径>` 指定。
+`init` 的输出就是它做的三件事（写配置 0600、建数据目录、释放插件）：
 
-私有插件放进 `plugins/<repo>/` 后，跑一次 `go generate ./cmd/bot` 把它编进二进制。生成物 `cmd/bot/plugins_gen.go` 不入库，所以核心仓克隆下来只带示例插件（见 ARCHITECTURE §3.5）。启动日志的 `plugins` 数量后面跟着 `plugin_names`，可以直接看出新插件是否真的链接进来了。
+```text
+已生成配置：config/config.local.toml
+数据目录：.temp\data
+出厂插件：adminping.exe, bootnotice.exe, echo.exe, md.exe → .temp\data\plugins\bin
+```
+
+> 数据目录按 `[store].path`（默认 `./.temp/data/qqbot.db`）的目录相对**当前工作目录**解析，不是相对配置文件。换目录安装时要么 `cd` 过去再 init，要么在配置里写绝对路径（见下面的 Debian 步骤）。上面是仓库内开发的形态，数据落在 `./.temp/data/`（已 gitignore）。
+
+启动日志里能确认插件真的装上了（这几行都在连网关之前，网关连不上照样打）：
+
+```text
+[INFO] 发现插件 component=pluginproc plugin=echo version=0.1.0 api_version=12 commands=2 optional=0
+[INFO] 核心已启动 plugins=4 sandbox=true
+[INFO] qqbot 启动完成 config=config/config.local.toml ... version="dev 4a19ec1e" platform=windows/amd64 plugins=4 plugin_names=adminping,bootnotice,echo,md
+```
+
+`plugin_names` 是"哪些插件真的装上了"的唯一权威来源：`bootnotice` 不再报插件清单（插件进程看不到别的插件，契约里也没有这个访问器），启动日志这一行才是事实。
+
+`init` 的两个开关：
+
+| 参数 | 用途 |
+|---|---|
+| `--plugins` | 只释放**缺失**的出厂插件，不碰配置。删掉一个插件后补回来就靠它（已存在的文件不覆盖） |
+| `--force` | 覆盖已存在的配置。会丢掉你填过的 `[app].id` / `[app].secret`，只在重来一遍时用 |
+
+不带 `--force` 时 `init` 拒绝覆盖：`init: 配置文件 ... 已存在，不覆盖（要覆盖请加 --force；只补插件请用 --plugins）`。
+
+Debian 上的安装（systemd）：
+
+```bash
+# 1. 目录与二进制（ExecStart 指向 /var/lib/qqbot/bin/qqbot，与数据目录同卷可写）
+sudo install -d -o qqbot -g qqbot -m 0750 /etc/qqbot /var/lib/qqbot /var/lib/qqbot/bin
+sudo install -m 0755 bot /var/lib/qqbot/bin/qqbot
+
+# 2. 以 qqbot 身份初始化（cd 到数据目录，让默认的相对 [store].path 落在正确的位置）
+sudo -u qqbot bash -c 'cd /var/lib/qqbot && ./bin/qqbot init -c /etc/qqbot/config.toml'
+
+# 3. 把 [store].path 改成绝对路径，再让插件落到新的数据目录
+sudo -u qqbot vi /etc/qqbot/config.toml              # path = "/var/lib/qqbot/qqbot.db"
+sudo -u qqbot /var/lib/qqbot/bin/qqbot init --plugins -c /etc/qqbot/config.toml
+sudo rm -rf /var/lib/qqbot/.temp                    # 第 2 步按相对路径释放的那一份
+
+# 4. 装 unit 并启动
+sudo install -m 0644 deploy/qqbot.service /etc/systemd/system/qqbot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now qqbot
+```
+
+第 3 步的两条命令不是仪式：`<datadir>/plugins/bin` 与 `<datadir>/upgrade` 都由 `[store].path` 的目录决定，改完路径必须让 `init --plugins` 在新位置再释放一次，否则启动日志里 `plugins=0`。
+
+权限与目录的完整清单（缺一个 unit 就起不来）：
+
+| 路径 | 谁创建 | 权限 |
+|---|---|---|
+| `/etc/qqbot/config.toml` | `init` | 0600，属主 qqbot（含 AppSecret） |
+| `/var/lib/qqbot` | 第 1 步 `install -d` | 0750，属主 qqbot |
+| `/var/lib/qqbot/bin/qqbot` | 第 1 步 `install` | 0755（`/upgrade` 会在同目录换盘） |
+| `/var/lib/qqbot/qqbot.db` | 首次启动 `store.Open` | 属主 qqbot |
+| `/var/lib/qqbot/plugins/bin/*` | `init` | 0755（要能 exec） |
+| `/var/lib/qqbot/upgrade/` | 首次 `/upgrade apply` 或启动时回滚判定 | 属主 qqbot |
+| `/run/qqbot` | systemd `RuntimeDirectory` | 0700 |
 
 启动日志里会出现：
 
@@ -45,6 +123,140 @@ WARN 未检测到管理员，已生成一次性认领令牌 ttl=10m0s token=<64�
 
 在目标群或单聊发送 `/claim <token>` 即成为 owner（一次性、10 分钟过期）。
 之后可用 `/admin add <openid> [备注]` 添加辅助管理员，用 `/ping` 查看运行状态，用 `!ping`、`!echo <文本>` 验证收发链路。
+
+## 升级
+
+`/upgrade` 是**唯一**的更新入口：只在人敲命令时发请求，启动期不检查、不自愈、也不会未经允许换二进制（ADR-0006）。权限是 **owner-only**——升级通道就是远程代码执行通道，管理员不该有这个能力。
+
+| 命令 | 行为 |
+|---|---|
+| `/upgrade` | 预览：当前版本、最新版本、核心产物大小、插件升/跳过清单。**不改动任何文件** |
+| `/upgrade apply` | 核心升级：快照数据库 → 下载 → 校验 SHA-256 → 同卷落位 → 回消息 → 重启换盘 |
+| `/upgrade plugin <名称\|all>` | 插件升级：只重启那个插件的子进程，不重启核心，也不需要二次确认 |
+| `/upgrade status` | 当前版本、有没有未确认的升级、上次失败原因 |
+
+配置（四键，`[upgrade]`）：
+
+```toml
+[upgrade]
+enabled    = true                       # false 时连检查都不发请求
+api_base   = "https://api.github.com"   # 元数据：index.json 与 checksums.txt
+asset_base = "https://github.com"       # 二进制；可指向镜像，只在没有 token 时生效
+token      = ""                         # 私有仓：细粒度 token，只需 Contents: read
+```
+
+- **校验和与二进制分两个通道**是结构约束：`checksums.txt` / `index.json` 永远从 `api_base` 取，镜像被投毒时二进制变了、校验和对不上。
+- **填了 `token` 之后三份产物全部走 `api_base`**（私有仓的发布资产在镜像上匿名取不到），`asset_base` 随之失效；`Authorization` 头只发给 `api_base` 的主机，绝不发给用户可配置的镜像。
+- 校验只比 SHA-256：覆盖传输损坏、截断、镜像投毒；**不覆盖**上游仓库或账号被 takeover。
+- `version` 是 `dev` 时拒绝升级——本地 `go build` 的产物没有可比对的版本号（`/ping` 首行能看到当前版本）。
+- 同一时刻只允许一次升级；`/upgrade apply` 进行中再敲会得到「已有一个升级在进行中」。
+
+一次核心升级的现场（`/upgrade` 然后 `/upgrade apply`）：
+
+```text
+自更新预览（未改动任何文件）
+当前 0.3.1｜linux/amd64
+最新 0.4.0（v0.4.0）
+核心产物 qqbot-0.4.0-linux-amd64（31.0 MiB）
+插件（只列已加载的插件）
+  echo 0.1.0 → 0.1.1  升
+  md 0.3.0 → 0.3.0  跳过（已是最新）
+用 /upgrade apply 应用核心升级：会先快照数据库，再重启进程。
+```
+
+```text
+升级已就位：0.3.1 → 0.4.0
+数据库快照 /var/lib/qqbot/upgrade/snapshots/qqbot-20261023-151230.000.db
+产物已校验并落位到 /var/lib/qqbot/bin/qqbot.new
+插件（只列已加载的插件）echo 0.1.0 → 0.1.1
+接下来重启进程换盘；重启后走 Resume，不额外消耗 Identify 配额。用 /ping 对比版本与启动时间即可确认生效。
+```
+
+预览里的插件清单只包含**已加载**的插件：被 `[plugins].disabled` 停用或加载失败的插件，核心不知道它们的版本号。
+
+插件升级是独立的一条路：
+
+```text
+/upgrade plugin all
+插件升级（发布 v0.4.0｜linux/amd64）
+  echo 0.1.0 → 0.1.1  升（2.9 MiB）
+  md 0.3.0 → 0.3.0  跳过（已是最新）
+耗时 412ms
+```
+
+前置条件（不满足时 `/upgrade apply` 会在下载之前就失败）：
+
+1. `deploy/qqbot.service` 的 `ExecStart` 指向 `/var/lib/qqbot/bin/qqbot`——升级要在**同卷**把 `<exe>.new` rename 成 `<exe>`，而 `ProtectSystem=strict` 让 `/opt` 只读；
+2. `[store].path` 的目录（`datadir`）对服务账号可写：`<datadir>/upgrade` 要写标记与快照；
+3. 版本不是 `dev`。
+
+## 回滚
+
+两条路，自动的只管"新版本起不来"，其余靠手工。
+
+**自动（核心）**：`/upgrade apply` 在换盘前写 `<datadir>/upgrade/state.json`（目标版本、旧文件、尝试次数）并对数据库做 `VACUUM INTO` 快照（保留最近 2 份）。新进程起来后观察 30 秒（`core.Start` 完成 + 网关协程存活），稳定就删掉标记。若下一次启动还看到标记，说明上一版没活过观察窗：`attempts` 加一，`> 1` 时自动把 `qqbot.old` 换回来并重启旧版本，日志是一条 Error。
+
+```text
+[ERROR] 新版本启动后未能稳定运行，已回滚到旧版本并重新启动 reason="上次升级到 0.4.0 后进程未能稳定运行（这是第 2 次尝试启动），回滚到 0.3.1"
+```
+
+判定用"存活 30 秒"而不是"网关连上"：网络抖动不该触发回滚。已知边角——30 秒内敲 `/reload` 会让 `attempts` 多加一次，可能误判回滚；代价是退回上一版，再敲一次 `/upgrade` 即可。
+
+**自动（插件）**：插件替换先停旧进程、换文件、起新进程，**5 秒内没完成 `init` 握手**就自动把旧产物换回来并重启它，成功则记一条 Warn「插件热升级失败，已回滚到旧版本」。插件没有 pending 标记，也没有数据库快照——它无状态，回滚就是换回文件。
+
+**手工（核心）**：自动回滚没救回来、或想立刻回到上一版：
+
+```bash
+sudo systemctl stop qqbot
+sudo rm -f /var/lib/qqbot/upgrade/state.json          # 不清标记，下次启动还会再判一次回滚
+sudo install -m 0755 /var/lib/qqbot/bin/qqbot.old /var/lib/qqbot/bin/qqbot
+sudo systemctl start qqbot
+```
+
+`qqbot.old` 是上一次换盘留下的旧映像（Unix 是硬链接，Windows 是改名），启动稳定后会被清掉，所以它只在"刚升级过"的这一段时间里存在。
+
+**数据库也要回滚**时：回滚二进制不等于回滚 schema。安全回滚窗口只有一个版本，且要求迁移只增不减；跨破坏性迁移必须配快照还原：
+
+```bash
+sudo systemctl stop qqbot
+sudo cp /var/lib/qqbot/upgrade/snapshots/qqbot-20261023-151230.000.db /var/lib/qqbot/qqbot.db
+sudo rm -f /var/lib/qqbot/qqbot.db-wal /var/lib/qqbot/qqbot.db-shm
+sudo systemctl start qqbot
+```
+
+快照是 `VACUUM INTO` 出来的完整库文件，不是日志；拷回去就等于回到那一刻。
+
+## 离线恢复
+
+机器上不了网、或者升级把二进制换坏了，就手工换文件——这条路不需要 `/upgrade`，也不需要 Go 工具链。
+
+```bash
+# 1. 停服务
+sudo systemctl stop qqbot
+
+# 2. 从 U 盘 / 内网拷贝换上去（权限必须是 0755）
+sudo install -m 0755 /media/usb/qqbot /var/lib/qqbot/bin/qqbot
+
+# 3. 清掉可能残留的升级状态，否则下次启动会按"未确认的升级"再回滚一次
+sudo rm -f /var/lib/qqbot/upgrade/state.json /var/lib/qqbot/bin/qqbot.new
+
+# 4. 补回被删掉的出厂插件（不碰配置、不覆盖已存在的文件）
+sudo -u qqbot /var/lib/qqbot/bin/qqbot init --plugins -c /etc/qqbot/config.toml
+
+# 5. 起来，用启动日志确认插件数量
+sudo systemctl start qqbot
+journalctl -u qqbot -n 30 --no-pager | grep '启动完成'
+```
+
+第 4 步的语义是「只补缺失」：`plugins/bin/` 里已有的文件一律不动，所以你单独升过的插件不会被降级；反过来说，**删掉一个插件就是卸载它**，启动期不会自愈。
+
+干净克隆自编的二进制没有出厂插件可释放：`internal/pluginbundle/dist/<os>_<arch>/` 里只有 `.gitkeep`（`go:embed` 不能出包目录），此时 `init --plugins` 会明确报错：
+
+```text
+init: 释放出厂插件: 本产物没有出厂插件副本（dist 目录里只有 .gitkeep）：请使用发布版，或先运行 `go run ./tools/build plugins` 再编译核心
+```
+
+先跑 `go run ./tools/build plugins`（或 `all`）再编核心，就有了。
 
 ## 调试模式
 
@@ -234,13 +446,12 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 
 ```
 机器人已上线
+版本 dev 4a19ec1e
 启动 10-17 14:56:19｜windows/amd64
 上次启动 10-17 12:51（2小时5分前）
-启用插件 3 个
-· adminping v0.2.0（/ping）
-· bootnotice v0.1.0
-· echo v0.1.0（!ping、!echo）
 ```
+
+正文里**不再有"启用插件 N 个"那份清单**：插件已经是独立进程（ADR-0005），本插件拿不到"核心装了哪些插件"——契约里没有这个访问器，为一行日志加一个访问器要动 `api_version`。要确认装了哪些插件，看核心启动日志的 `plugin_names`（那才是权威来源），或者看 `/ping` 的版本行与插件报错。
 
 主动消息在本项目里是**受控通道**，而不是默认放开的能力：
 
@@ -268,9 +479,13 @@ retry_delay = "30s"
 
 ## `/reload`：重启进程验证更新
 
-Go 插件是编译期静态链接的，改动无法热替换；`/reload` 的做法是**重新执行磁盘上的二进制**，用来回答"新构建到底部署上没有"。
+`/reload` 的做法是**重新执行磁盘上的核心二进制**，用来回答"新构建到底部署上没有"。
 
-这里有一个容易误解的点：`/reload` **不重新编译，也不扫 `plugins/`**。插件靠 `host.Register` 在 `init()` 注册，哪些插件包被链接进来由 `cmd/bot/plugins_gen.go` 的 blank import 决定。所以新克隆一个插件仓库后直接 `/reload`，不会有任何变化——磁盘上的二进制必须先被换掉。
+插件已经是独立进程（ADR-0005），所以这里的边界和 P1 时代完全不同：
+
+- **插件代码改动不需要 `/reload`，也不需要重编译核心**：把新产物放进 `<datadir>/plugins/bin/` 就是装上（同名文件覆盖后敲一次 `/reload`，或对单个插件用 `/upgrade plugin`）；
+- `/reload` **不重新编译任何东西**。它重启的是核心进程，新进程在装配期会重新扫 `plugins/bin/`，所以新放进去的插件会随之加载、被删掉的插件就此消失；
+- 只想换一个插件时用 `/upgrade plugin <名称>`，它只重启那个插件的子进程，核心与其它插件不重启。
 
 ```
 /reload              重启
@@ -283,12 +498,15 @@ Go 插件是编译期静态链接的，改动无法热替换；`/reload` 的做�
 
 1. **先回一条消息**——被动回复窗口只在收到消息时存在，重启后这条就发不出去了；
 2. 网关断开并把 `session_id` / `seq` 落盘，下次启动直接 Resume；
-3. 关闭 SQLite，避免新进程与旧进程抢写锁；
-4. 重新执行自身：
+3. 关停核心：调度收尾 → 派发排空 → 插件子进程按 RPC close → SIGTERM → Kill 三级关闭；
+4. 关闭 SQLite，避免新进程与旧进程抢写锁；
+5. 重新执行自身：
    - Linux / macOS：`execve` 原地替换进程映像，**PID 不变**，systemd 的 cgroup、日志句柄与控制台都沿用原来的；
    - Windows：没有 `execve`，拉起新进程后旧进程退出；此时网关与数据库都已关闭，不会出现两个实例抢同一个 session。
 
-重启后 `bootnotice` 会私聊「机器人已上线（/reload 重启）」，`/ping` 首行显示版本，两边对比就能确认：
+`/upgrade apply` 走的是同一条序列，只在第 5 步之前多一次换盘（`qqbot.new` → `qqbot`）。
+
+重启后 `bootnotice` 会私聊「机器人已上线」，`/ping` 首行显示版本，两边对比就能确认：
 
 ```
 版本 dev 3f2a1c9d｜go1.26.1
@@ -297,43 +515,38 @@ Go 插件是编译期静态链接的，改动无法热替换；`/reload` 的做�
 
 版本串带 `+dirty` 表示构建时工作区有未提交改动——部署的不是干净构建时一眼能看出来。
 
-### 开发期：让新插件随 `/reload` 生效
+### 开发期：让改动用 `/reload` 生效
 
-用 `tools/devrun` 托管进程，它在前台持有终端，循环执行「`go generate` → `go build` → 换二进制 → 拉起」：
+用 `tools/devrun` 托管进程，它在前台持有终端，每次重启前跑一遍 `go run ./tools/build all`（先插件、后核心）再换二进制拉起：
 
 ```bash
 go run ./tools/devrun -c config/config.local.toml
 ```
 
-此后每次 `/reload` 都会重新扫描 `plugins/`，新放入的插件随之加载。编译失败时它会打印错误并用**旧二进制**继续运行，机器人不会掉线。Windows 上换二进制要先把旧的改名成 `.old`，若两次改名之间被中断（`bot.exe` 缺了、`.old` 还在），下次启动会先把它从 `.old` 恢复回来，不会变成"二进制凭空消失"。
+编译失败时它会打印错误并用**旧二进制**继续运行，机器人不会掉线。Windows 上换二进制要先把旧的改名成 `.old`，若两次改名之间被中断（`bot.exe` 缺了、`.old` 还在），下次启动会先把它从 `.old` 恢复回来，不会变成"二进制凭空消失"。
 
 原理：bot 在 `QQBOT_SUPERVISOR=1` 下把 `/reload` 从「自己换映像」改为**以退出码 75 退出**，由父进程接手重编译。Windows 没有 `execve`，这一步还顺带解决了「每次重载都把终端丢回提示符」的问题——终端始终由 devrun 占着，日志连续。
 
-生产环境不设置该变量，行为与下一节完全一致。
+生产环境不设置该变量，`/reload` 仍是「换文件 + execve」，与上一节一致。
 
-### 部署更新的完整步骤
+### 发布一个新版本
 
 ```bash
-# 1. 生成插件装配并构建（少了 go generate，新放进 plugins/ 的插件不会进二进制）
-go generate ./cmd/bot && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o qqbot ./cmd/bot
-# 2. 覆盖服务器上的二进制（Linux 允许替换正在运行的文件，不需要先停服务）
-scp qqbot server:/opt/qqbot/bin/qqbot.new
-ssh server 'mv /opt/qqbot/bin/qqbot.new /opt/qqbot/bin/qqbot'
-# 3. 在 QQ 里发
-/reload 上线 v0.2
+# 本机交叉编 linux/amd64（发布流水线用同一套工具，见 .github/workflows/release.yml）
+go run ./tools/build all -target linux/amd64 -o dist/qqbot-linux-amd64
 ```
 
-约 1 分钟内应收到上线私聊。**没收到就查 journalctl** —— 重启失败时进程已经退出，只能从日志里找原因。
+正式发布走 tag：push `v*` 之后 CI 依次跑「三个平台的插件产物 → GoReleaser 编核心与 checksums.txt → `tools/index` 生成 index.json → 下载回来冒烟」。版本号只经 `-ldflags -X .../buildinfo.Version` 注入，本地 `tools/build` 不注入（所以本地产物是 `dev`，`/upgrade` 会拒绝自更新——这正是防止本地构建混进生产的闸门）。
 
-`go generate` 不带 `GOOS` 前缀（写成 `GOOS=linux go generate ...` 会让生成器按目标平台编译、在本机根本跑不起来）：它只做一层目录扫描 + 读 Go 源码找 `host.Register(`、生成 blank import，不编译也不加载，与目标平台无关；交叉编译只加在后面的 `go build` 上。
+服务器上不需要 `scp` + `systemctl restart` 了：tag 发出去之后在 QQ 里敲 `/upgrade` 看一眼、`/upgrade apply` 应用即可。要手工换文件（离线 / 救火）见上面的「离线恢复」。
 
 ### 几个边界
 
-- `go run ./cmd/bot` 下 `/reload` 只会重启同一份临时构建，**不会重新编译**；回复里会明确提示这一点。开发时请改用 `tools/devrun`（见上一节）。
-- `tools/devrun` 只在开发工作区有意义：它需要源码与 Go 工具链。服务器上部署的是二进制，`/reload` 仍是「换文件 + execve」。
+- `go run ./cmd/bot` 下 `/reload` 只会重启同一份临时构建，**不会重新编译**；开发时请改用 `tools/devrun`（见上一节）。
+- `tools/devrun` 只在开发工作区有意义：它需要源码与 Go 工具链。服务器上部署的是二进制。
 - 同一进程只接受一条重启请求，重复发只回「已有重启请求」。
 - `/reload` 与 `/reset` 无关：前者重启进程并重读配置，后者按级别清数据（见下一节）。
-- 插件不能声明 `/reload` / `/restart` 前缀，否则启动即拒绝加载。
+- 插件不能声明 `/claim` `/admin` `/group` `/reset` `/reload` `/restart` `/upgrade` 这些核心前缀，否则启动即拒绝加载。
 
 ## `/reset`：分级重置
 
@@ -473,7 +686,7 @@ CPU  12.3%（8 核）
 内存 5.1 GB / 15.6 GB（32.7%）
 本进程 48.2 MB（峰值 96.7 MB）
 磁盘 可用 120.3 GB / 共 466 GB（已用 74.2%）
-目录 /opt/qqbot 36.1 MB，312 个文件（不含 .git）
+目录 /var/lib/qqbot 36.1 MB，312 个文件（不含 .git）
 ```
 
 整机内存与本进程内存是两行、两个数据源：整机取不到不影响本进程那一行；本进程取不到时该行写成 `本进程 采集失败（原因）`，而不是整行消失。
@@ -491,13 +704,15 @@ CPU  12.3%（8 核）
 目录统计有 1.5 秒预算，超出即返回下限并标注"未走完"；`.git` 不计入（非运行时数据且可能极大），命中时回复里会注明。
 
 
-生产构建：
+生产构建（交叉编 linux/amd64）：
 
 ```bash
-go generate ./cmd/bot && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/qqbot ./cmd/bot
+go run ./tools/build all -target linux/amd64 -o bin/qqbot
 ```
 
-> 需要 Go 1.26+：`modernc.org/sqlite v1.60` 的 `go` 指令要求。实测 `GOOS=linux` 交叉编译产物约 16 MB（`-s -w` 后更小），无需 cgo。
+顺序不能反：`plugins` 先产出 `internal/pluginbundle/dist/linux_amd64/`，核心的 `//go:embed` 才编得过。`all` 的 `-o` 只作用于核心——插件必须写进 embed 目录，否则下一步编译直接失败。
+
+> 需要 Go 1.26+：`modernc.org/sqlite v1.60` 的 `go` 指令要求，无需 cgo。实测（Go 1.27.3 + `-s -w`）linux/amd64 核心产物 **32.5 MB**，其中四个内嵌出厂插件共 11.7 MB（各自 2.88–2.99 MB）；windows/amd64 是 33.4 MB。ADR-0005 当初估的是"核心 19 MB → 40 MB"，实际只涨到 32–33 MB：每个插件 4–6 MB 的估计偏高（示例插件实际 ~3 MB），而核心甩掉四个插件的业务代码后本体仍在 20 MB 上下（内嵌字体 6.2 MB 是大头）。
 
 ## 频控边界（为什么不把限流全交给平台返回值）
 
@@ -535,19 +750,35 @@ go generate ./cmd/bot && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s
 ## 目录
 
 ```
-cmd/bot/          入口与唯一装配点
+cmd/bot/          入口（启动 / init / 重启）、装配点
 internal/gateway/ WSS 状态机、心跳、resume、事件解码
-internal/core/    路由、幂等、频控、调度、GC、认领、/admin 权限
+internal/core/    路由、幂等、频控、调度、GC、认领、/admin 权限、/upgrade 命令面
 pkg/host/         插件契约与 Host 能力实现（插件唯一可见的 API）
+pkg/rpc/          线协议：长度前缀帧、方法表、错误码表
+pkg/rpcsdk/       插件侧入口（rpcsdk.Serve），插件可执行文件的 main 只调它
+internal/pluginproc/ 把 plugins/bin/ 下的可执行文件变成 host.Plugin（探测 / spawn / 退避重启 / 三级关闭）
+internal/pluginbundle/ 内嵌的出厂插件副本（dist/<os>_<arch>/），只作 init 的释放源
+internal/upgrade/ 自更新：检查、下载、校验、落位、pending 标记与快照
 internal/sysinfo/ 跨平台资源采集（build tag 分 windows / linux）
 internal/store/   schema、迁移、分批 GC、管理员与身份映射
 internal/instance/ 单实例文件锁（flock / CreateFile 独占共享）
 internal/httpx/   统一出站客户端
 internal/api/     QQ 开放平台 REST 封装
-plugins/echo/     示例插件
+internal/config/  配置结构、默认值、校验；示例配置 config.example.toml（init 写出的是它的内嵌副本）
+plugins/echo/     示例插件（cmd/echo/main.go 是产物入口）
 plugins/adminping/ 管理员 /ping
 plugins/bootnotice/ 启动/重启主动私聊通知
-plugins/<repo>/   私有插件：独立仓的嵌套克隆，未跟踪（见 ARCHITECTURE §3.5）
-config/           配置样例与本地配置（后者不入 git）
+plugins/<repo>/   第三方插件：独立 module，放好产物即可，不进核心构建
+tools/build/      构建入口（插件 → 核心的固定顺序）
 deploy/           systemd 单元
+```
+
+运行期数据（`<datadir>` = `[store].path` 的目录）：
+
+```
+<datadir>/qqbot.db                  SQLite（含 -wal / -shm）
+<datadir>/qqbot.db.lock             数据目录维度的单实例锁
+<datadir>/plugins/bin/<name>        已安装的插件产物（在就是装着，删掉就是卸载）
+<datadir>/upgrade/state.json        pending 升级标记
+<datadir>/upgrade/snapshots/        VACUUM INTO 快照（保留 2 份）
 ```

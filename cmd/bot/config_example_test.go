@@ -1,13 +1,16 @@
 package main
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/pkg/host"
+	"github.com/knight000/go_qqbot/plugins/adminping"
+	"github.com/knight000/go_qqbot/plugins/bootnotice"
+	"github.com/knight000/go_qqbot/plugins/echo"
+	"github.com/knight000/go_qqbot/plugins/md"
 )
 
 // 私有插件（开发工作区里 go generate 进来的那些）一旦声明 ConfigSchema，
@@ -44,19 +47,20 @@ func TestExamplePluginWithoutSectionFails(t *testing.T) {
 	}
 }
 
-// config.example.toml 是使用者复制一份就能启动的那份文件。插件声明了
-// config_schema 之后，「声明即必填」意味着任何一个键缺失都会让新克隆的仓库
-// 第一次启动就失败，所以这里对着磁盘上的真实文件跑一遍校验，而不是手写 map。
+// 示例配置是 `qqbot init` 真的会写出去的那份字节（config.ExampleTOML 内嵌
+// 自 internal/config/config.example.toml）。插件声明了 config_schema 之后，
+// 「声明即必填」意味着任何一个键缺失都会让新用户第一次启动就失败，所以这里
+// 直接对着内嵌字节跑一遍校验——校验的就是用户拿到的那份东西。
 func TestExampleConfigSatisfiesEveryPluginSchema(t *testing.T) {
 	var cfg config.Config
-	if _, err := toml.DecodeFile(filepath.Join("..", "..", "config", "config.example.toml"), &cfg); err != nil {
-		t.Fatalf("读取示例配置: %v", err)
+	if _, err := toml.Decode(string(config.ExampleTOML()), &cfg); err != nil {
+		t.Fatalf("解析内嵌示例配置: %v", err)
 	}
 
-	plugins := host.Registered()
-	if len(plugins) == 0 {
-		t.Fatal("没有注册任何插件（先在 cmd/bot 下跑 go generate）")
-	}
+	// 示例插件已经迁成独立产物（ADR-0005 决策 10），编译期注册表不存在了。
+	// 这条测试要守的是「入库的示例配置满足入库的示例插件的 schema」，所以
+	// 这里显式列出四个包——列表本身就是"随仓库发布的示例插件"的定义。
+	plugins := []host.Plugin{&echo.Plugin{}, &adminping.Plugin{}, &bootnotice.Plugin{}, &md.Plugin{}}
 	manifests := make([]host.Manifest, 0, len(plugins))
 	for _, p := range plugins {
 		manifests = append(manifests, p.Manifest())

@@ -1,12 +1,11 @@
 // Command bot 是唯一装配点：加载配置 → 打开存储 → 构造核心 → 连接网关。
 //
-// 内置插件在本文件 blank import（P1 编译期注册，见 ARCHITECTURE.md §3.1）；
-// plugins/ 下的其余插件由 tools/genplugins 生成到 plugins_gen.go，见 §3.5。
-// 生成物不入库（.gitignore），所以构建前必须先跑 go generate ./cmd/bot：
-// 少了这一步，新放进 plugins/ 的插件不会被链接进二进制，启动日志里的插件
-// 名单也不会多出它。
+// 插件不在这个二进制里（ADR-0005 决策 10）：它们是 <datadir>/plugins/bin/
+// 下的独立可执行文件，由 internal/pluginproc 在装配期扫描、探测、spawn。
+// 所以加插件不需要重编译核心，`go build ./cmd/bot` 也不再需要任何 go:generate。
 //
-//go:generate go run ../../tools/genplugins
+// 出厂副本（四个示例插件）由 internal/pluginbundle 内嵌，只作释放源；
+// 释放只发生在显式命令 `qqbot init --plugins` 里（#42），启动期不释放、不自愈。
 package main
 
 import (
@@ -17,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -33,14 +33,12 @@ import (
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/instance"
 	"github.com/knight000/go_qqbot/internal/logx"
+	"github.com/knight000/go_qqbot/internal/pluginproc"
 	"github.com/knight000/go_qqbot/internal/render"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/upgrade"
 	"github.com/knight000/go_qqbot/pkg/host"
-
-	_ "github.com/knight000/go_qqbot/plugins/adminping"
-	_ "github.com/knight000/go_qqbot/plugins/bootnotice"
-	_ "github.com/knight000/go_qqbot/plugins/echo"
-	_ "github.com/knight000/go_qqbot/plugins/md"
+	"github.com/knight000/go_qqbot/pkg/rpc"
 )
 
 // errShutdown 表示进程本身没有故障，只是关停没能在期限内完成。
@@ -59,6 +57,12 @@ const (
 )
 
 func main() {
+	// 子命令在 flag.Parse 之前分派：`qqbot init -c x` 的 -c 属于 init，
+	// 不能落到启动用的 flag 集合里。不带子命令时完全是原来的启动行为。
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		os.Exit(runInit(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	req, err := run()
 	if err != nil {
 		var fatal *gateway.FatalError
@@ -79,9 +83,8 @@ func main() {
 	// 走到这里时 run 已经返回：网关断开、session 落盘、数据库关闭。
 	// 此时再做进程替换，新进程不会和旧进程抢同一个 gateway session 与 SQLite 连接。
 	//
-	// 受 devrun 托管时不换映像：退出码就是协议，父进程负责重新生成装配、编译、
-	// 替换二进制再拉起。这是新放入 plugins/ 的插件能生效的唯一路径——重新执行
-	// 同一份二进制不会改变链接进来的插件集合。
+	// 受 devrun 托管时不换映像：退出码就是协议，父进程负责重新产出插件产物、
+	// 编译核心、替换二进制再拉起。生产环境没有源码与工具链，不会走到这里。
 	if buildinfo.Supervised() {
 		os.Exit(buildinfo.ExitRestartRequired)
 	}
@@ -91,6 +94,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "重启失败：定位可执行文件:", err)
 		os.Exit(1)
 	}
+
+	// /upgrade apply 的换盘就发生在这里：网关已断、session 已落盘、库已关。
+	// 失败时 Commit 会把旧二进制换回来（进程内回滚），我们照样重启——
+	// 重启旧版本总好过让机器人停在这里等人工介入。
+	if req.Plan != nil {
+		if err := upgrade.Commit(req.Plan, slog.Default()); err != nil {
+			fmt.Fprintln(os.Stderr, "换盘失败，继续重启旧版本:", err)
+		}
+	}
 	if err := restartSelf(exe); err != nil {
 		fmt.Fprintln(os.Stderr, "重启失败:", err)
 		os.Exit(1)
@@ -99,7 +111,7 @@ func main() {
 
 // run 正常退出时返回 nil；返回非 nil 表示需要由 main 重新执行自身（/reload）。
 func run() (*core.RestartRequest, error) {
-	cfgPath := flag.String("c", "config/config.local.toml", "配置文件路径")
+	cfgPath := flag.String("c", defaultConfigPath, "配置文件路径")
 	debugMode := flag.Bool("debug", false, "调试模式：打印收到的事件、命中的插件与回复内容（等同 [debug].enabled=true）")
 	flag.Parse()
 
@@ -126,6 +138,39 @@ func run() (*core.RestartRequest, error) {
 	// 而不是一次正常退出（P3-21）。
 	ctx, stop := notifyShutdown(context.Background())
 	defer stop()
+
+	// datadir 是全仓唯一口径：数据目录就是数据库文件所在的那一层。
+	// 升级标记与快照都在它下面（<datadir>/upgrade/），因此这里要早于开库。
+	datadir := filepath.Dir(cfg.Store.Path)
+
+	// 自更新的回滚判定必须在这里——拿锁之前、开库之前：
+	//   - 回滚的最后一步是重新执行自身，必须先放手（旧进程一个锁都不该握着）；
+	//   - 判定要读 <datadir>/upgrade/state.json，只需要配置。
+	// 顺序错了会得到一个"回滚后永远等锁"的启动循环。
+	exePath, exeErr := os.Executable()
+	if exeErr != nil {
+		exePath = ""
+	}
+	if rolledBack, err := handlePendingUpgrade(upgrade.StateDir(datadir), exePath, log); err != nil {
+		// 回滚失败不阻止启动：用当前二进制继续跑，比让机器人直接下线好。
+		log.Error("升级回滚未能完成，继续用当前二进制启动", "err", err)
+	} else if rolledBack {
+		// Unix 上 exec 成功不返回；Windows 上这是"拉起子进程"，
+		// 本进程随后退出（见 restartSelf 的注释）。
+		if err := restartSelf(exePath); err != nil {
+			return nil, fmt.Errorf("回滚后重启失败: %w", err)
+		}
+		return nil, nil
+	}
+	// 上一次升级留下的 .old 到这里就没用了（已经稳定运行过，
+	// 或刚被上面回滚用掉）。删不掉只 warn：Windows 上杀软/旧进程
+	// 可能短暂持有它，一份 40 MB 的残留不值得让机器人下线。
+	// exePath 为空（定位失败）时不能调：那会变成删当前工作目录下的 ".old"。
+	if exePath != "" {
+		if err := upgrade.CleanOld(exePath); err != nil {
+			log.Warn("清理旧版本残留失败", "path", upgrade.OldPath(exePath), "err", err)
+		}
+	}
 
 	// 渲染器在启动期同步解析字体（约 300 ms，全部花在 20 MB 字体的字节码扫描上）。
 	// 字体是 go:embed 进来的，解析失败只可能是二进制本身有问题——带病运行会在
@@ -198,15 +243,52 @@ func run() (*core.RestartRequest, error) {
 		Log:      log.With("component", "api"),
 	})
 
+	// 插件是 plugins/bin/ 下的独立可执行文件，核心只看见 []host.Plugin
+	// （ADR-0005 决策 3）。装配期全部工作收在 pluginproc.Load：扫目录 →
+	// 并行跑 `bin --manifest`（2 秒）→ 校验 → 跳过 [plugins].disabled。
+	//
+	// 探测或校验失败的插件只记 Error、**不让启动失败**：一个过期产物不该让
+	// 机器人整体下线，那还会进 systemd 重启循环白烧 Identify 配额（决策 6）。
+	registry := rpc.NewRegistry()
+	// core.ErrPassiveExhausted 必须过通道：插件调 Host.SendActive 时要能认出
+	// "被动窗口用尽"并发自己的降级消息，而不是当成普通错误重试。它故意留在
+	// core（没有第二个真实消费方），所以号码只能由实现方注册（决策 9）。
+	if err := registry.Register(rpc.CodeImplBase, core.ErrPassiveExhausted); err != nil {
+		return nil, err
+	}
+	procPlugins, err := pluginproc.Load(ctx, pluginproc.Options{
+		Dir:       filepath.Join(datadir, "plugins", "bin"),
+		ConfigFor: cfg.Plugin,
+		Disabled:  cfg.Plugins.Disabled,
+		Registry:  registry,
+		Log:       log.With("component", "pluginproc"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	plugins := procPlugins
+
 	coreImpl, err := core.New(core.Options{
 		Store:   db,
 		API:     apiClient,
 		HTTP:    hc,
 		Log:     log,
 		Config:  cfg,
-		Plugins: host.Registered(),
+		Plugins: plugins,
 		// 核心只认 host.Renderer 接口，不 import 渲染实现包。
 		Renderer: renderer,
+		Upgrade: upgrade.New(upgrade.Options{
+			Enabled:   cfg.UpgradeEnabled(),
+			APIBase:   cfg.Upgrade.APIBase,
+			AssetBase: cfg.Upgrade.AssetBase,
+			Token:     cfg.Upgrade.Token,
+			Exe:       exePath,
+			DataDir:   datadir,
+			Current:   buildinfo.Get().Version,
+			Plugins:   loadedPlugins(plugins),
+			Snapshots: db,
+			Log:       log.With("component", "upgrade"),
+		}),
 	})
 	if err != nil {
 		return nil, err
@@ -240,6 +322,10 @@ func run() (*core.RestartRequest, error) {
 		gwRes <- gw.Run(ctx)
 	}()
 
+	// 升级后的观察窗：core.Start 已经完成、网关协程已经起来，从这里开始
+	// 计时 30 秒。能活过去就删掉 pending 标记（ADR-0006 决策 6）。
+	go clearPendingAfter(ctx, upgrade.StateDir(datadir), upgradeHealthyWindow, log)
+
 	bi := buildinfo.Get()
 	logStartup(log, startupInfo{
 		ConfigPath:  *cfgPath,
@@ -252,7 +338,7 @@ func run() (*core.RestartRequest, error) {
 		Platform:    bi.Platform,
 		GoVersion:   bi.GoVer,
 		Restarted:   buildinfo.RestartedByReload(),
-		Plugins:     host.Registered(),
+		Plugins:     plugins,
 	})
 	if buildinfo.RestartedByReload() {
 		log.Info("本次启动由 /reload 触发", "version", bi.String())
@@ -437,8 +523,8 @@ func logStartup(log *slog.Logger, in startupInfo) {
 		"plugin_names", pluginNames(in.Plugins))
 }
 
-// pluginNames 把已注册插件按名字排序后用逗号连起来。
-// 排序只为两次启动能逐字比对——host.Registered() 的顺序取决于 import 顺序。
+// pluginNames 把已装配的插件按名字排序后用逗号连起来。
+// 排序只为两次启动能逐字比对——pluginproc.Load 的顺序来自文件名扫描。
 func pluginNames(plugins []host.Plugin) string {
 	names := make([]string, 0, len(plugins))
 	for _, p := range plugins {

@@ -32,6 +32,9 @@ type Options struct {
 	// Trace 为 nil 且配置里打开了 debug 时，自动输出到 stdout。
 	// 显式传入只给测试用（可写进 buffer）。
 	Trace *Trace
+	// Upgrade 是 /upgrade 依赖的升级能力。nil 表示本进程没有装配自更新
+	// （单测、或未来某个只要网关的精简构建）。
+	Upgrade UpgradeService
 }
 
 type Core struct {
@@ -75,6 +78,10 @@ type Core struct {
 	// reconnect 是网关的主动重连入口（R0）。由 main 在起网关协程之前注入，
 	// 因此 Handle 读取它与 main 赋值之间天然有 happens-before。
 	reconnect Reconnector
+
+	// upgrade 是 /upgrade 的升级能力（见 UpgradeService）。nil 时命令仍然
+	// 被核心消费（否则会落到插件路由），回复"未装配"。
+	upgrade UpgradeService
 }
 
 func New(o Options) (*Core, error) {
@@ -154,6 +161,7 @@ func New(o Options) (*Core, error) {
 		startedAt: time.Now(),
 		restart:   make(chan RestartRequest, 1),
 		gcDone:    make(chan struct{}),
+		upgrade:   o.Upgrade,
 	}, nil
 }
 

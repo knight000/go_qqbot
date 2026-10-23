@@ -6,11 +6,17 @@
 /.temp/
 /media/
 /bin/
+# GoReleaser 的中间产物与发布资产（含 tools/index 整理出的 dist/plugins/），
+# 都在本地生成，不入库。
+/dist/
 qqbot
 qqbot.exe
 # `go build ./cmd/bot` 的默认产物名
 /bot
 /bot.exe
+# 测试夹具同理（pkg/rpcsdk 的端到端用例把产物放进 .temp/，但手跑会落到仓库根）
+/testplugin
+/testplugin.exe
 # devrun 的中间产物与 Windows 上被改名腾位的旧二进制
 /bot.new
 /bot.new.exe
@@ -32,15 +38,18 @@ qqbot.exe
 !/plugins/bootnotice
 !/plugins/md
 
-# 由 tools/genplugins 生成：把 plugins/ 下的插件编进二进制的唯一开关。
-# 不入库——核心仓克隆下来只带 main.go 里的示例插件，插件工作区跑一次
-# `go generate ./cmd/bot` 即可把新插件纳入构建。
-/cmd/bot/plugins_gen.go
+# 出厂插件产物：`go run ./tools/build plugins` 按平台写进各目录，再由核心
+# go:embed 内嵌（ADR-0005 决策 11）。产物不入库，只保留 .gitkeep 占位——
+# 目录里没有匹配文件时 //go:embed 直接编译失败。
+/internal/pluginbundle/dist/*/*
+!/internal/pluginbundle/dist/*/.gitkeep
 
 # 编辑器 / 本地工具状态
 .idea/
 .vscode/
 .workbuddy/
+# WorkBuddy 的工作区数据（本地记忆与日志），与 .workbuddy/ 同理不入库
+.workbuddy-ai/
 *.swp
 
 # Python 工具的字节码缓存（tools/ 下只有生成期脚本）

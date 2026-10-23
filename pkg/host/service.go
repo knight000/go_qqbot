@@ -4,43 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 )
-
-var registry struct {
-	mu      sync.Mutex
-	plugins []Plugin
-	names   map[string]struct{}
-}
-
-// Register 由插件包的 init() 调用（P1 编译期注册）。
-// 重名直接 panic：装配期错误必须立刻暴露，不能带到线上。
-func Register(p Plugin) {
-	m := p.Manifest()
-	if m.Name == "" {
-		panic("host: 插件 Manifest.Name 不能为空")
-	}
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	if registry.names == nil {
-		registry.names = map[string]struct{}{}
-	}
-	if _, dup := registry.names[m.Name]; dup {
-		panic("host: 插件重名: " + m.Name)
-	}
-	registry.names[m.Name] = struct{}{}
-	registry.plugins = append(registry.plugins, p)
-}
-
-// Registered 返回全部已注册插件，顺序为 import 顺序。
-func Registered() []Plugin {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	out := make([]Plugin, len(registry.plugins))
-	copy(out, registry.plugins)
-	return out
-}
 
 // KVBackend / QueryBackend 由 store.DB 实现。
 // 用窄接口而不是直接依赖 *store.DB，是为了让 host 可单测、也避免插件间接受影响。

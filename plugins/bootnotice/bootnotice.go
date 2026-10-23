@@ -1,5 +1,9 @@
 // Package bootnotice 在进程启动（含重启）后主动私聊管理员，
-// 报告上线时间、距上次启动的间隔，以及当前启用的插件清单。
+// 报告上线时间、距上次启动的间隔。
+//
+// 这里**不再列插件清单**：插件已经迁成独立进程（ADR-0005 决策 10），
+// 本插件拿不到"核心装了哪些插件"——契约里没有这个访问器，为一行日志加一个
+// 访问器要动 APIVersion。核心的启动日志已经有 plugin_names，那才是权威来源。
 //
 // 为什么用主动消息：启动时没有任何用户消息可回复，被动回复窗口不存在，
 // 只能走主动单聊。平台对主动消息有每日额度，因此这里做了三层收敛：
@@ -23,8 +27,6 @@ import (
 	"github.com/knight000/go_qqbot/internal/sysinfo"
 	"github.com/knight000/go_qqbot/pkg/host"
 )
-
-func init() { host.Register(&Plugin{}) }
 
 type Plugin struct {
 	host host.Host
@@ -177,31 +179,7 @@ func compose(start, prev time.Time, hasPrev bool) string {
 		fmt.Fprintf(&b, "上次启动 %s（%s前）\n",
 			prev.Format("01-02 15:04"), sysinfo.HumanDuration(start.Sub(prev)))
 	}
-
-	plugins := host.Registered()
-	fmt.Fprintf(&b, "启用插件 %d 个\n", len(plugins))
-	for _, pl := range plugins {
-		m := pl.Manifest()
-		fmt.Fprintf(&b, "· %s v%s", m.Name, m.Version)
-		if cmds := commandHints(m.Commands); cmds != "" {
-			fmt.Fprintf(&b, "（%s）", cmds)
-		}
-		b.WriteString("\n")
-	}
 	return strings.TrimRight(b.String(), "\n")
-}
-
-func commandHints(cmds []host.Command) string {
-	out := make([]string, 0, len(cmds))
-	for _, c := range cmds {
-		switch {
-		case c.Prefix != "":
-			out = append(out, c.Prefix)
-		case c.Pattern != "":
-			out = append(out, "/"+c.Pattern+"/")
-		}
-	}
-	return strings.Join(out, "、")
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

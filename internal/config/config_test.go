@@ -16,6 +16,64 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+// 新用户的第一面：配置文件还不存在。错误必须直接给出 `qqbot init`，
+// 而不是一条 "open xxx: The system cannot find the file specified"——
+// 那既没说缺的是什么，也没说下一步干什么。
+func TestMissingConfigPointsToInit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.local.toml")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("配置不存在时应当报错")
+	}
+	if !strings.Contains(err.Error(), "qqbot init") {
+		t.Fatalf("缺配置的错误要指向 qqbot init，实际 %q", err)
+	}
+}
+
+// app.id 为空是 `qqbot init` 生成的配置必然撞上的第一条错误（示例里 id
+// 就是留空的）。它必须同时给出两条出路：跑 init 生成配置，或直接填 [app].id，
+// 而不是淹没在一串通用校验清单里。
+func TestEmptyAppIDPointsToInitAndField(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[app]
+id = ""
+secret = "s"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("app.id 为空时应当报错")
+	}
+	for _, want := range []string{"qqbot init", "[app].id"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误串 %q 缺少 %q：要能看出填哪个字段或跑哪条命令", err, want)
+		}
+	}
+}
+
+// secret 为空不给 init 提示：配置文件已经在手上，缺的是密钥本身，
+// 再跑一次 init 只会得到同一个空 secret。两种"为空"的处置不能混成一条。
+func TestEmptySecretDoesNotPointToInit(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[app]
+id = "123"
+secret = ""
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("app.secret 为空时应当报错")
+	}
+	if !strings.Contains(err.Error(), "app.secret") {
+		t.Fatalf("错误串应指到 app.secret，实际 %q", err)
+	}
+	if strings.Contains(err.Error(), "qqbot init") {
+		t.Errorf("secret 为空不该把用户推去跑 init，实际 %q", err)
+	}
+}
+
 // 未配置 [active] 时按开启处理：启动通知依赖它，显式 false 才关闭。
 func TestActiveDefaultsToEnabled(t *testing.T) {
 	path := writeConfig(t, `
@@ -222,6 +280,50 @@ rate_per_min = 100
 	}
 	if got := cfg.HTTP.Domains["Example.COM"]; got != 50 {
 		t.Fatalf("域名键应原样保留（大小写在出站层归一化），实际 %d", got)
+	}
+}
+
+// [plugins] 同时装两样东西：核心侧的停用名单（数组）与各插件的配置段（表）。
+// 这两者在 TOML 里是同一个表的不同键，所以解码必须区分类型而不是一律当配置段
+// ——否则 `disabled = [...]` 会以「期望表、实际数组」把整个配置读死（ADR-0005 决策 13）。
+func TestPluginsDisabledCoexistsWithSections(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+id = "123"
+secret = "s"
+
+[plugins]
+disabled = ["echo", "torn"]
+
+[plugins.demo]
+delay = "10s"
+size = 3
+
+[plugins.md]
+font = "serif"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("disabled 与本段共存时不该失败: %v", err)
+	}
+	if !cfg.PluginDisabled("echo") || !cfg.PluginDisabled("torn") {
+		t.Fatalf("停用名单未生效: %v", cfg.Plugins.Disabled)
+	}
+	if cfg.PluginDisabled("demo") {
+		t.Fatal("demo 不在 disabled 里，不该被判为停用")
+	}
+	demo := cfg.Plugin("demo")
+	if demo["delay"] != "10s" || demo["size"] != int64(3) {
+		t.Fatalf("demo 配置段 = %#v", demo)
+	}
+	// 段名必须按原样保留：插件名取自 manifest，大小写敏感。
+	if got := cfg.Plugin("md")["font"]; got != "serif" {
+		t.Fatalf("md 配置段 = %#v", cfg.Plugin("md"))
+	}
+	// 不存在的段是空（长度 0，与 nil map 等价）：插件一律「取默认值」，
+	// 不该写判空分支。
+	if got := cfg.Plugin("missing"); len(got) != 0 {
+		t.Fatalf("不存在的段应返回空 map，实际 %#v", got)
 	}
 }
 
