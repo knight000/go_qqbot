@@ -58,9 +58,13 @@
     qqbot-<version>-windows-amd64.exe
     qqbot-<version>-linux-amd64
     qqbot-<version>-linux-arm64
-    checksums.txt          # sha256，覆盖以上全部
+    checksums.txt          # sha256，覆盖以上三个核心产物
     plugins/index.json     # 插件版本与资产清单（含各平台的 sha256）
     ```
+
+    `plugins/index.json` 是**仓库内的逻辑路径**；GitHub Release 的资产名不允许含 `/`，所以发布出去的资产名是顶层的 `index.json`，`/upgrade` 按资产名去取。两者不必同名，也不必同步改名。
+
+    `checksums.txt` 与 `index.json` 各自覆盖什么：前者只有三个核心产物（决策 3 的"元数据/二进制分通道"靠它），插件产物与 `index.json` 自身的完整性由 `index.json` 里逐平台的 `sha256` 提供——否则校验和文件会与它要校验的清单互相引用。
 
     构建顺序固定：先编插件到 `dist/<os>_<arch>/`，再编核心（`go:embed` 依赖它们），最后跑 `sha256sum`。版本号只经 `-ldflags -X .../buildinfo.Version` 注入，`commit` 仍由 Go 自动嵌入的 VCS 信息提供。
 
