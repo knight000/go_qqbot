@@ -225,6 +225,50 @@ rate_per_min = 100
 	}
 }
 
+// [plugins] 同时装两样东西：核心侧的停用名单（数组）与各插件的配置段（表）。
+// 这两者在 TOML 里是同一个表的不同键，所以解码必须区分类型而不是一律当配置段
+// ——否则 `disabled = [...]` 会以「期望表、实际数组」把整个配置读死（ADR-0005 决策 13）。
+func TestPluginsDisabledCoexistsWithSections(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+id = "123"
+secret = "s"
+
+[plugins]
+disabled = ["echo", "torn"]
+
+[plugins.demo]
+delay = "10s"
+size = 3
+
+[plugins.md]
+font = "serif"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("disabled 与本段共存时不该失败: %v", err)
+	}
+	if !cfg.PluginDisabled("echo") || !cfg.PluginDisabled("torn") {
+		t.Fatalf("停用名单未生效: %v", cfg.Plugins.Disabled)
+	}
+	if cfg.PluginDisabled("demo") {
+		t.Fatal("demo 不在 disabled 里，不该被判为停用")
+	}
+	demo := cfg.Plugin("demo")
+	if demo["delay"] != "10s" || demo["size"] != int64(3) {
+		t.Fatalf("demo 配置段 = %#v", demo)
+	}
+	// 段名必须按原样保留：插件名取自 manifest，大小写敏感。
+	if got := cfg.Plugin("md")["font"]; got != "serif" {
+		t.Fatalf("md 配置段 = %#v", cfg.Plugin("md"))
+	}
+	// 不存在的段是空（长度 0，与 nil map 等价）：插件一律「取默认值」，
+	// 不该写判空分支。
+	if got := cfg.Plugin("missing"); len(got) != 0 {
+		t.Fatalf("不存在的段应返回空 map，实际 %#v", got)
+	}
+}
+
 // 入群/退群通知默认只发所有者。写错的值回退 owner 而不是 off：
 // 通知发多了只是吵，发少了会让"机器人被谁拉进了哪个群"悄无声息地过去。
 func TestGroupNotifyMode(t *testing.T) {
