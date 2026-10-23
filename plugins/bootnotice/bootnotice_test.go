@@ -94,15 +94,20 @@ func newPlugin(t *testing.T, cfg host.Params, dir fakeDir) (*Plugin, *fakeHost) 
 	return p, h
 }
 
-func TestComposeContainsStartAndPlugins(t *testing.T) {
+func TestComposeContainsStartInfo(t *testing.T) {
 	start := time.Date(2026, 10, 17, 15, 4, 5, 0, time.Local)
 	prev := start.Add(-2*time.Hour - 13*time.Minute)
 	text := compose(start, prev, true)
 
-	for _, want := range []string{"机器人已上线", "10-17 15:04:05", "上次启动", "2小时13分", "启用插件", "bootnotice"} {
+	for _, want := range []string{"机器人已上线", "10-17 15:04:05", "上次启动", "2小时13分"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("通知缺少 %q:\n%s", want, text)
 		}
+	}
+	// 插件清单已随「插件迁成独立进程」删除（ADR-0005 决策 10）：
+	// 本进程拿不到核心的插件表，核心启动日志的 plugin_names 才是权威来源。
+	if strings.Contains(text, "启用插件") {
+		t.Errorf("通知不该再列插件清单（核心启动日志已有 plugin_names）:\n%s", text)
 	}
 	// 没有上次记录时不应出现"上次启动"
 	if got := compose(start, time.Time{}, false); strings.Contains(got, "上次启动") {
@@ -125,8 +130,8 @@ func TestNotifySendsToReachableAdminsOnly(t *testing.T) {
 	if h.sender.msgs[0].scene != host.SceneC2C || h.sender.msgs[0].peer != "c2c-owner" {
 		t.Fatalf("收件人不对: %+v", h.sender.msgs[0])
 	}
-	if !strings.Contains(h.sender.msgs[0].text, "启用插件") {
-		t.Errorf("正文缺少插件清单:\n%s", h.sender.msgs[0].text)
+	if !strings.Contains(h.sender.msgs[0].text, "机器人已上线") {
+		t.Errorf("正文缺少上线标记:\n%s", h.sender.msgs[0].text)
 	}
 	if _, ok := h.kv.m[keyLastStart]; !ok {
 		t.Error("应记录本次启动时间")

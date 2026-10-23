@@ -26,10 +26,11 @@ var Version = "dev"
 const RestartEnv = "QQBOT_RESTARTED"
 
 // SupervisorEnv 由 tools/devrun 注入。设置后 /reload 不再自行换进程映像，
-// 而是以 ExitRestartRequired 退出，把重编译与拉起交给父进程。
+// 而是以 ExitRestartRequired 退出，把「重新产出插件产物 + 编译核心 + 拉起」
+// 交给父进程。
 //
-// 为什么需要它：Go 的插件是编译期注册的，重新执行同一份二进制不会让新放入
-// plugins/ 的插件生效；只有重新编译才行。生产环境没有源码与工具链，不设该变量。
+// 为什么需要它：开发期改的是源码，重新执行同一份二进制不会让改动生效；
+// 生产环境没有源码与工具链，不设该变量。
 const SupervisorEnv = "QQBOT_SUPERVISOR"
 
 // ExitRestartRequired 是「请重启我」的约定退出码（sysexits.h 的 EX_TEMPFAIL）。
