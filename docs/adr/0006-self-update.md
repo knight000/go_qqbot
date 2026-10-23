@@ -50,7 +50,7 @@
 
 9. **`Version == "dev"` 时拒绝自更新。** `dev` 无法参与版本比较，`-ldflags` 注入是发布版本号的**唯一**来源。这条顺带挡住一类事故：本地 `go build` 出来的二进制混进生产，然后 `/upgrade` 试图把它"升"到某个正式版本。
 
-10. **`/upgrade` 进核心保留前缀清单。** 现为 `/claim /admin /group /reset /reload /restart`；清单与 `handleReserved` 的对应关系有测试锁住，加它要一起改。插件占用同名指令仍按现有规则拒绝加载。
+10. **`/upgrade` 进核心保留前缀清单。** 现为 `/claim /admin /group /reset /reload /restart /upgrade`；清单与 `handleReserved` 的对应关系有测试锁住，加它要一起改。插件占用同名指令仍按现有规则拒绝加载。
 
 11. **发布产物形状**（CI，非运行期）：
 
@@ -63,6 +63,27 @@
     ```
 
     构建顺序固定：先编插件到 `dist/<os>_<arch>/`，再编核心（`go:embed` 依赖它们），最后跑 `sha256sum`。版本号只经 `-ldflags -X .../buildinfo.Version` 注入，`commit` 仍由 Go 自动嵌入的 VCS 信息提供。
+
+12. **私有仓需要一个 `token`，它是升级路径上唯一的凭据。** 本仓库是私有仓，匿名读不到 release。加一段配置：
+
+    ```toml
+    [upgrade]
+    enabled    = true
+    api_base   = "https://api.github.com"
+    asset_base = "https://github.com"
+    token      = ""      # 细粒度 token，只需 Contents: read
+    ```
+
+    `token` 留空时行为与决策 3 完全一致（元数据走 `api_base`、二进制走 `asset_base`）；填了它之后走决策 13。它在配置文件里就是明文，与 `[app].secret` 同级：文件权限 600、不入 git。不复用 `[app]` 的凭据，也不从环境变量读第二个秘密——升级是 owner 手动触发的一次性动作，多一条凭据来源只会多一处"为什么它没生效"。
+
+    残余风险与决策 4 同源：token 泄露等于让持有者读到私有仓的产物，但**读不到**校验和的另一条通道保障仍然成立——`checksums.txt` 与二进制都由 `api_base` 提供，所以"上游被 takeover"这一类风险不变，而"镜像站投毒"这一类反而被彻底移除（没有镜像参与）。
+
+13. **有 `token` 时三份产物全部走 `api_base`，`asset_base` 只在没有 token 时生效；凭据绝不发给 `asset_base` 的主机。** 两条约束必须一起读：
+
+    - 私有仓的 release asset 无法在镜像上匿名取，`{asset_base}/{owner}/{repo}/releases/download/{tag}/{file}` 对匿名请求是 404。所以有 token 时二进制改走 `{api_base}/repos/{owner}/{repo}/releases/assets/{id}`（`Accept: application/octet-stream`），`index.json` 与 `checksums.txt` 本来就在这条通道上。
+    - `asset_base` 是**用户可配置的地址**，可能是别人搭的镜像。把 GitHub 凭据发给它等于把私有仓的读权限交给镜像运营者——而镜像恰恰是决策 3 里假设"可能被投毒"的那一方。实现上这两条是同一件事：有 token 时根本不去 `asset_base`；此外 `Authorization` 头只对 `api_base` 的主机附加，作为第二道闸。
+
+    代价要认：配了 token 之后镜像选项消失，二进制与元数据同源。这是私有仓的必然——决策 3 想买的"镜像站投毒必然败在 sha256 上"在匿名可读的仓里成立，私有仓里连"镜像"这个选项本身都不成立。
 
 ## 为什么下载不走 `httpx`
 

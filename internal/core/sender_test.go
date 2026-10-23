@@ -62,9 +62,15 @@ type fakeAPI struct {
 	// Retry-After 头（0 表示平台没给，核心应按缺省窗口冷却）。
 	rateLimitedAt int
 	retryAfter    time.Duration
+	// onSend 在每次发消息**之前**调用，供"回复与入队谁先发生"这类顺序断言。
+	// 它在锁外执行：钩子里读别的通道（例如 c.restart）不会与这里互锁。
+	onSend func()
 }
 
 func (f *fakeAPI) SendMessage(ctx context.Context, scene, peer string, body api.MessageBody) error {
+	if f.onSend != nil {
+		f.onSend()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
