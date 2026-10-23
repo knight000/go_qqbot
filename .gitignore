@@ -48,6 +48,8 @@ qqbot.exe
 .idea/
 .vscode/
 .workbuddy/
+# WorkBuddy 的工作区数据（本地记忆与日志），与 .workbuddy/ 同理不入库
+.workbuddy-ai/
 *.swp
 
 # Python 工具的字节码缓存（tools/ 下只有生成期脚本）
