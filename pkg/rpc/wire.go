@@ -3,6 +3,7 @@ package rpc
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"strconv"
 	"time"
@@ -512,10 +513,6 @@ type (
 	}
 
 	// —— plugin.* ——
-	manifestResult struct {
-		Manifest manifestDTO
-		Optional []string
-	}
 	initParams struct {
 		Name   string
 		Config map[string]any
@@ -530,3 +527,34 @@ type (
 		Spec jobSpecDTO
 	}
 )
+
+// manifestResult 是清单的**唯一**线格式：`bin --manifest` 打到 stdout 的、
+// 以及 plugin.manifest 应答里的，都是这一份（#39 的教训：两侧各写一份 DTO，
+// 字段名漂移不会编译失败，只会让对面读出零值）。
+//
+//	{ "Manifest": {...}, "Optional": ["plugin.start", ...] }
+//
+// 两条路都只经 EncodeManifest / DecodeManifest，本类型不导出。
+type manifestResult struct {
+	Manifest manifestDTO
+	Optional []string
+}
+
+// EncodeManifest 把清单编成线格式。探测侧（插件 `--manifest`）与
+// plugin.manifest 的应答都走这里，因此两处不可能出现字段名差异。
+func EncodeManifest(m host.Manifest, optional []string) ([]byte, error) {
+	return json.Marshal(manifestResult{Manifest: toManifestDTO(m), Optional: optional})
+}
+
+// DecodeManifest 解析线格式的清单。
+//
+// 用 json.Unmarshal 而不是 decodeJSON：它拒绝**尾随内容**。插件往 stdout
+// 打一行日志再接 JSON 是最常见的形态，而宽松解析会把前半截当清单、后半截
+// 静默丢掉——那会表现为"插件装上了但命令全不响应"，没有任何报错。
+func DecodeManifest(b []byte) (host.Manifest, []string, error) {
+	var out manifestResult
+	if err := json.Unmarshal(b, &out); err != nil {
+		return host.Manifest{}, nil, fmt.Errorf("rpc: 插件清单不是合法 JSON: %w", err)
+	}
+	return out.Manifest.toHost(), out.Optional, nil
+}

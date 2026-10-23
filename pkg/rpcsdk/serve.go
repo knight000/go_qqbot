@@ -9,23 +9,32 @@
 //		}
 //	}
 //
-// 它做三件事：把 stdin/stdout 接成 rpc.Conn、注册 plugin.* 的方法、
-// 把 Host 实现成 rpc 客户端交给 Init。协议本身（帧、方法表、错误码）在
-// pkg/rpc；本包只负责「标准输入输出上的那一条连接」这个约定。
+// 它做四件事：应答 `--manifest`、把 stdin/stdout 接成 rpc.Conn、注册
+// plugin.* 的方法、把 Host 实现成 rpc 客户端交给 Init。协议本身（帧、方法表、
+// 错误码、清单线格式）在 pkg/rpc；本包只负责「标准输入输出上的那一条连接」
+// 这个约定。
 //
 // 一条必须知道的约束：**stdout 是协议通道**。插件的任何调试输出都要走
 // stderr（`Host.Log()` 与默认的 slog 都是 stderr）；往 stdout 打一行字，
-// 核心侧的帧读取立刻失步，表现为插件启动即失败。
+// 核心侧的帧读取立刻失步，表现为插件启动即失败。`--manifest` 是这条通道的
+// 唯一例外——那一瞬间 stdout 只装一段 JSON，没有连接。
 package rpcsdk
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 
 	"github.com/knight000/go_qqbot/pkg/host"
 	"github.com/knight000/go_qqbot/pkg/rpc"
 )
+
+// ManifestFlag 是装配期探测用的命令行开关（ADR-0005 决策 5）。
+//
+// 探测是「核心起 `bin --manifest`、插件打一段 JSON、退出 0」，所以它必须由
+// 插件产物自己应答——核心不认识任何插件类型，替它猜清单不在选项里。
+const ManifestFlag = "--manifest"
 
 // Options 是 Serve 的可选项。零值即默认行为，绝大多数插件不需要碰它。
 type Options struct {
@@ -42,7 +51,15 @@ type Options struct {
 //
 // 返回 nil 表示核心正常收摊（读到帧边界上的 EOF）；返回错误表示协议或
 // 读写出问题，调用方应非零退出。
+//
+// 参数里带 `--manifest` 时不进入连接：往 stdout 打一份清单就返回（调用方
+// 的 main 随之正常退出）。这使得「同一个产物既是插件、也是自己的探测对象」，
+// 清单只有一个实现（plugin.Manifest），不存在"探测到的"与"实际注册的"
+// 两份不一致的可能。
 func Serve(p host.Plugin) error {
+	if wantsManifest(os.Args[1:]) {
+		return writeManifest(p, os.Stdout)
+	}
 	return ServeIO(p, Options{}, os.Stdin, os.Stdout)
 }
 
@@ -56,4 +73,37 @@ func ServeIO(p host.Plugin, o Options, r io.Reader, w io.Writer) error {
 		return err
 	}
 	return c.Run()
+}
+
+func wantsManifest(args []string) bool {
+	for _, a := range args {
+		if a == ManifestFlag {
+			return true
+		}
+	}
+	return false
+}
+
+// writeManifest 打出一行 JSON。编码用 rpc.EncodeManifest——与 plugin.manifest
+// 的应答是同一个函数，字段名不可能漂移（#39 踩过一次）。
+//
+// 名字为空的插件在这里就失败：一个没有名字的清单装进去只会得到一条
+// "谁都不认识"的路由项，早失败比晚失败便宜。
+func writeManifest(p host.Plugin, w io.Writer) error {
+	if p == nil {
+		return errors.New("rpcsdk: 插件不能为 nil")
+	}
+	m := p.Manifest()
+	if m.Name == "" {
+		return errors.New("rpcsdk: 插件 Manifest.Name 不能为空")
+	}
+	b, err := rpc.EncodeManifest(m, rpc.OptionalMethods(p))
+	if err != nil {
+		return fmt.Errorf("rpcsdk: 编码清单: %w", err)
+	}
+	b = append(b, '\n')
+	if _, err := w.Write(b); err != nil {
+		return fmt.Errorf("rpcsdk: 写清单: %w", err)
+	}
+	return nil
 }
