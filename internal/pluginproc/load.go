@@ -26,6 +26,14 @@ import (
 // 启动停在一个坏文件上。
 const defaultProbeTimeout = 2 * time.Second
 
+// defaultBackoff 是崩溃重启的等待表（ADR-0005 决策 8：1/2/4/8/16 分钟）。
+//
+// 前四档翻倍、第五档封顶：第 5 次失败之后就停用了，所以表只需要 5 项。
+// 与 job 熔断的退避同形，运维不必再记一套节奏。
+var defaultBackoff = []time.Duration{
+	time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute,
+}
+
 // Options 是装配期的输入。Dir 之外的零值都有可用默认。
 type Options struct {
 	// Dir 是插件目录，调用方给出 `<datadir>/plugins/bin`
@@ -57,6 +65,13 @@ func (o Options) probeTimeout() time.Duration {
 		return defaultProbeTimeout
 	}
 	return o.ProbeTimeout
+}
+
+func (o Options) backoff() []time.Duration {
+	if len(o.Backoff) == 0 {
+		return defaultBackoff
+	}
+	return o.Backoff
 }
 
 func (o Options) configFor(name string) map[string]any {

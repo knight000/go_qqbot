@@ -70,6 +70,7 @@ func loadOne(t *testing.T, mode string, mutate func(*pluginproc.Options)) (host.
 	if len(plugins) != 1 {
 		t.Fatalf("应发现 1 个插件，实际 %d（日志：\n%s）", len(plugins), logs.text())
 	}
+	t.Cleanup(func() { stopAll(t, plugins, pidDir) })
 	return plugins[0], logs, pidDir
 }
 
@@ -96,19 +97,51 @@ func readPid(t *testing.T, pidDir, mode string) int {
 }
 
 // killByPid 是还没实现 Close 那几个用例的兜底清理：无论如何都不留孤儿进程。
+//
+// Kill 之后必须 Wait：Windows 上 os.Process.Release 只是把 handle 字段丢掉、
+// 并不 CloseHandle（Go 的 exec_windows.go 里它是 NOOP），只要那个句柄还在，
+// 被杀进程的 exe 映像就一直被映射着——文件删不掉，t.TempDir 清理会报
+// Access is denied，看起来像"留了孤儿"，其实是清理自己没撒手。Wait 会在
+// 等进程退出之后关掉句柄。Unix 上 Wait 对非子进程返回 ECHILD，无害。
 func killByPid(t *testing.T, pidDir string) {
 	t.Helper()
 	entries, err := os.ReadDir(pidDir)
 	if err != nil {
 		return
 	}
+	var pids []int
 	for _, e := range entries {
 		if pid := readPid(t, pidDir, strings.TrimSuffix(e.Name(), ".pid")); pid > 0 {
+			pids = append(pids, pid)
 			if proc, err := os.FindProcess(pid); err == nil {
 				_ = proc.Kill()
+				_, _ = proc.Wait()
 			}
 		}
 	}
+	for _, pid := range pids {
+		if !waitGone(t, pid, 5*time.Second) {
+			t.Logf("清理时进程 %d 仍未退出", pid)
+		}
+	}
+}
+
+// stopAll 是每个用例结尾的兜底清理，顺序不能反过来：先走生产那条关停路径，
+// 再按 pid 补刀。
+//
+// 为什么不直接 killByPid：proxy 会把"进程被外部杀掉"当成一次崩溃，退避一
+// 到期就重启一个新进程——用默认退避是 1 分钟后（看不见），本套用例把退避
+// 压到了 10ms，清理就会和重启赛跑：杀掉的进程刚放掉 exe，新进程又把它映射
+// 回去，t.TempDir 的清理永远删不掉那个文件。Close 会置 closing，监工就不再
+// 重启，这才是"关停"的定义。
+func stopAll(t *testing.T, plugins []host.Plugin, pidDir string) {
+	t.Helper()
+	for _, p := range plugins {
+		if c, ok := p.(host.Closer); ok {
+			_ = c.Close(context.Background())
+		}
+	}
+	killByPid(t, pidDir)
 }
 
 // waitGone 轮询到进程消失（或超时后报错）。进程退出与句柄回收之间有一小段
@@ -132,9 +165,8 @@ func TestInitSpawnsAndHandleForwards(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "marker")
 	t.Setenv(markerEnv, marker)
 
-	p, logs, pidDir := loadOne(t, modeEcho, nil)
+	p, logs, _ := loadOne(t, modeEcho, nil)
 	initPlugin(t, p, map[string]any{"greeting": "你好"})
-	t.Cleanup(func() { killByPid(t, pidDir) })
 
 	ctx := context.Background()
 	// 1. 配置快照必须过通道（插件读的是 plugin.init 给的 map，不是它自己的环境）。
@@ -173,9 +205,8 @@ func TestInitSpawnsAndHandleForwards(t *testing.T) {
 // 用真子进程而不是接口替身：替身只能证明"proxy 会调 ctx"，证明不了"卡在另一
 // 个进程里的调用能被本进程的期限放弃"——后者才是跨进程新增的那条失败路径。
 func TestHandleTimesOutAndNextEventStillServes(t *testing.T) {
-	p, _, pidDir := loadOne(t, modeSlow, nil)
+	p, _, _ := loadOne(t, modeSlow, nil)
 	initPlugin(t, p, nil)
-	t.Cleanup(func() { killByPid(t, pidDir) })
 
 	start := time.Now()
 	_, err := p.Handle(context.Background(), message("/slow", "hang"))
@@ -205,9 +236,8 @@ func TestHandleTimesOutAndNextEventStillServes(t *testing.T) {
 // Job 侧同一条语义：期限来自调用方（核心给的是 spec.Timeout，默认 60 秒），
 // 到点即放弃并把这次调用记为失败——不能因为"跨了进程"就放宽。
 func TestRunJobHonoursDeadline(t *testing.T) {
-	p, _, pidDir := loadOne(t, modeSlow, nil)
+	p, _, _ := loadOne(t, modeSlow, nil)
 	initPlugin(t, p, nil)
-	t.Cleanup(func() { killByPid(t, pidDir) })
 
 	jobber, ok := p.(host.JobRunner)
 	if !ok {
@@ -230,7 +260,6 @@ func TestRunJobHonoursDeadline(t *testing.T) {
 func TestTimeoutBurstTripsBreaker(t *testing.T) {
 	p, logs, pidDir := loadOne(t, modeSlow, nil)
 	initPlugin(t, p, nil)
-	t.Cleanup(func() { killByPid(t, pidDir) })
 
 	for i := 0; i < 5; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
@@ -259,15 +288,201 @@ func TestTimeoutBurstTripsBreaker(t *testing.T) {
 	}
 }
 
+// 崩溃策略（决策 8）：非零退出按 1/2/4/8/16 分钟退避重启，连败 5 次停用并
+// 留一条可读的「已停用」，而核心继续跑——其它插件照常服务。
+//
+// 退避表在这里注入成 10ms：1 分钟是给人看的节奏，不是这条用例要验的东西；
+// 要验的是"每次崩溃都算一次失败、第 5 次停用、别的插件不受影响"。
+func TestCrashBacksOffThenDisables(t *testing.T) {
+	dir := t.TempDir()
+	install(t, dir, modeCrashy)
+	install(t, dir, modeEcho)
+
+	pidDir := t.TempDir()
+	t.Setenv(pidEnv, pidDir)
+
+	logs := newLogs()
+	plugins, err := pluginproc.Load(context.Background(), pluginproc.Options{
+		Dir:     dir,
+		Log:     logs.logger(),
+		Backoff: []time.Duration{10 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(plugins) != 2 {
+		t.Fatalf("应发现 2 个插件，实际 %d（日志：\n%s）", len(plugins), logs.text())
+	}
+	t.Cleanup(func() { stopAll(t, plugins, pidDir) })
+	var crashy, echo host.Plugin
+	for _, p := range plugins {
+		switch p.Manifest().Name {
+		case modeCrashy:
+			crashy = p
+		case modeEcho:
+			echo = p
+		}
+	}
+
+	// 启动即崩的插件不能让 Init 失败（否则整台机器人起不来，还会进
+	// systemd 重启循环白烧 Identify 配额，决策 6）。
+	if err := crashy.Init(context.Background(), testHost(modeCrashy, nil)); err != nil {
+		t.Fatalf("启动即崩不该让 Init 失败: %v", err)
+	}
+	if err := echo.Init(context.Background(), testHost(modeEcho, nil)); err != nil {
+		t.Fatalf("正常插件 Init: %v", err)
+	}
+
+	if !waitUntil(5*time.Second, func() bool { return logs.contains("已停用") }) {
+		t.Fatalf("连败 5 次没有停用：\n%s", logs.text())
+	}
+	if !logs.contains("plugin=" + modeCrashy + " ") {
+		t.Fatalf("停用日志没说是哪个插件：\n%s", logs.text())
+	}
+	// 停用之后立即失败，不再白起进程。
+	if _, err := crashy.Handle(context.Background(), message("/echo", "x")); !errors.Is(err, pluginproc.ErrUnavailable) {
+		t.Fatalf("停用后应返回 ErrUnavailable，实际 %v", err)
+	}
+	// 其它插件完全不受影响：崩溃的隔离收益就在这里。
+	reply, err := echo.Handle(context.Background(), message("/echo", "还在"))
+	if err != nil || reply == nil || reply.Content != "还在" {
+		t.Fatalf("另一个插件应该照常工作，实际 reply=%#v err=%v", reply, err)
+	}
+}
+
+// 插件自己拒绝初始化（比如配置里的密钥不对）属于配置写错，与"产物崩溃"是
+// 两件事：前者按既有口径 fail-fast，后者才走退避重启（决策 6 的对照）。
+func TestInitRejectedByPluginIsFatal(t *testing.T) {
+	p, _, _ := loadOne(t, modeBadInit, nil)
+
+	err := p.Init(context.Background(), testHost(modeBadInit, nil))
+	if err == nil {
+		t.Fatal("插件在 Init 里报错应当让启动失败，而不是被当成崩溃吞掉")
+	}
+	if !strings.Contains(err.Error(), "配置") {
+		t.Fatalf("错误应保留插件的原文，实际 %v", err)
+	}
+}
+
+// waitUntil 轮询到条件成立。
+func waitUntil(d time.Duration, ok func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return ok()
+}
+
+// 关停三级（决策 8 的代价一节）：先请插件自己收摊（plugin.close），再断连接
+// 让它读到 EOF 退出，最后才是信号。顺序不能反——先杀进程会让插件的 Close
+// 永远跑不到，而很多插件要靠它把内存里的状态写回 KV。
+//
+// 关完不能留孤儿进程：这是本票的硬验收（Windows 上任务管理器里也不许剩）。
+func TestCloseRunsPluginHookBeforeTerminating(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker")
+	t.Setenv(markerEnv, marker)
+
+	p, _, pidDir := loadOne(t, modeEcho, nil)
+	initPlugin(t, p, nil)
+
+	closer, ok := p.(host.Closer)
+	if !ok {
+		t.Fatal("proxy 必须实现 host.Closer：核心的关停只认这个接口")
+	}
+	pid := readPid(t, pidDir, modeEcho)
+	if pid == 0 {
+		t.Fatal("没拿到插件进程的 pid")
+	}
+	if err := closer.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// 1. 第一级真的发生了：插件的 Close 写了 marker。
+	if n := countLines(t, marker, "close="+modeEcho); n != 1 {
+		t.Fatalf("插件 Close 被调用 %d 次，期望 1（先杀进程就一次都不会有）", n)
+	}
+	// 2. 进程真的没了。
+	if !waitGone(t, pid, 3*time.Second) {
+		t.Fatalf("关停后进程 %d 还在：留了孤儿", pid)
+	}
+	// 3. 幂等：关停路径可能被调两次（/reload 与信号竞争），第二次不能报错。
+	if err := closer.Close(context.Background()); err != nil {
+		t.Fatalf("第二次 Close 应无操作地成功，实际 %v", err)
+	}
+	// 4. 关停之后不再有"可投递的进程"。
+	if _, err := p.Handle(context.Background(), message("/echo", "x")); !errors.Is(err, pluginproc.ErrUnavailable) {
+		t.Fatalf("关停后 Handle 应返回 ErrUnavailable，实际 %v", err)
+	}
+}
+
+// 插件不理会 close、也不理会 EOF（半死的现场）：三级关闭必须还能把它收掉，
+// 否则每次 /reload 都留一个进程，几次之后机器上全是它。
+func TestCloseEscalatesWhenPluginIgnoresCloseAndEOF(t *testing.T) {
+	p, logs, pidDir := loadOne(t, modeStubborn, nil)
+	initPlugin(t, p, nil)
+
+	pid := readPid(t, pidDir, modeStubborn)
+	if pid == 0 {
+		t.Fatal("没拿到插件进程的 pid")
+	}
+	start := time.Now()
+	if err := p.(host.Closer).Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !waitGone(t, pid, time.Second) {
+		t.Fatalf("插件无视 close 与 EOF 时，最后一级 Kill 也没收掉进程 %d", pid)
+	}
+	// 每一级都有期限，所以整条路径是有上界的（不是"一直等插件自己良心发现"）。
+	if cost := time.Since(start); cost > 8*time.Second {
+		t.Fatalf("三级关闭用了 %s，期限没起作用（日志：\n%s）", cost, logs.text())
+	}
+}
+
+// 没实现可选接口的插件：Start / Close 是空操作，不是"方法未注册"的错误。
+// 这条靠握手时报上来的 optional 判断——去猜（先调一次、失败就当没有）会把
+// 真正的故障（插件启动即崩）和"本来就没实现"混成同一个现象。
+func TestOptionalMethodsAreSkippedWhenNotImplemented(t *testing.T) {
+	p, _, _ := loadOne(t, modePlain, nil)
+	initPlugin(t, p, nil)
+
+	if err := p.(host.Starter).Start(context.Background()); err != nil {
+		t.Fatalf("插件没实现 Start 时应当是空操作，实际 %v", err)
+	}
+	err := p.(host.JobRunner).RunJob(context.Background(), host.JobSpec{Plugin: modePlain, Name: "n"})
+	if !errors.Is(err, rpc.ErrMethodNotFound) {
+		t.Fatalf("插件没实现 RunJob 时应当如实报方法未注册，实际 %v", err)
+	}
+	if err := p.(host.Closer).Close(context.Background()); err != nil {
+		t.Fatalf("插件没实现 Close 时关停仍要收掉进程，实际 %v", err)
+	}
+}
+
+// Start 在实现了 Starter 的插件上必须真的转发过去（核心在 Init 之后统一调它）。
+func TestStartForwardedToPlugin(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker")
+	t.Setenv(markerEnv, marker)
+
+	p, _, _ := loadOne(t, modeEcho, nil)
+	initPlugin(t, p, nil)
+
+	if err := p.(host.Starter).Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if n := countLines(t, marker, "start="+modeEcho); n != 1 {
+		t.Fatalf("插件 Start 被调用 %d 次，期望 1", n)
+	}
+}
+
 // 任务参数要原样过通道：per-peer 任务靠 spec.Peer 指定目标群，丢了就等于
 // 每条实例都跑在"全局"上。
 func TestRunJobForwardsSpec(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "marker")
 	t.Setenv(markerEnv, marker)
 
-	p, _, pidDir := loadOne(t, modeEcho, nil)
+	p, _, _ := loadOne(t, modeEcho, nil)
 	initPlugin(t, p, nil)
-	t.Cleanup(func() { killByPid(t, pidDir) })
 
 	jobber, ok := p.(host.JobRunner)
 	if !ok {

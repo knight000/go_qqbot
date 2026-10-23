@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/knight000/go_qqbot/pkg/host"
 	"github.com/knight000/go_qqbot/pkg/rpc"
@@ -39,6 +41,8 @@ type proxy struct {
 	configFor func(string) map[string]any
 	reg       *rpc.Registry
 	log       *slog.Logger
+	// backoff 是崩溃重启的等待表（默认 1/2/4/8/16 分钟，测试可缩短）。
+	backoff []time.Duration
 
 	mu   sync.Mutex
 	host host.Host
@@ -52,6 +56,9 @@ type proxy struct {
 	// 不再起进程，调用一律立刻失败。
 	failures int
 	disabled bool
+	// started 记录核心调过 Start：重启之后要把 Start 补上，否则新进程只是
+	// "能接 handle"，后台协程/定时器一个都没起（插件自己不知道被重启过）。
+	started bool
 }
 
 // newProxy 用探测结果造一个还没起进程的 proxy。
@@ -69,6 +76,7 @@ func newProxy(pr probeResult, o Options) host.Plugin {
 		configFor: o.configFor,
 		reg:       o.Registry,
 		log:       o.logger().With("plugin", name),
+		backoff:   o.backoff(),
 	}
 }
 
@@ -93,10 +101,16 @@ func (p *proxy) Init(ctx context.Context, h host.Host) error {
 	p.host, p.cfg = h, p.configFor(p.name)
 	p.mu.Unlock()
 
-	if err := p.spawn(ctx); err != nil {
-		return fmt.Errorf("初始化插件 %s: %w", p.name, err)
+	err := p.start(ctx)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if isTransport(err) {
+		// 进程起不来就是崩溃：走退避重启，启动不失败（决策 6 / 8）。
+		p.noteExit(err)
+		return nil
+	}
+	return fmt.Errorf("初始化插件 %s: %w", p.name, err)
 }
 
 // Handle 把一条事件投给插件。超时口径由 rpc.CallHandle 兜底（3 秒），
@@ -184,31 +198,249 @@ func (p *proxy) noteFailure(reason string) {
 	}
 }
 
+// Start 转发 plugin.start。插件没实现时是空操作：核心对每个 proxy 都会调它
+// （proxy 这个类型永远实现了 Starter），"实现没实现"由 manifest 的 optional
+// 说了算（pkg/rpc 的 capabilitiesOf 保证探测到的与注册的方法来自同一份断言）。
+//
+// 进程此刻不在（启动即崩，正在退避）时也返回 nil：这不是"启动失败"，退避
+// 重启之后的 Init 会再把 Start 补上。
+func (p *proxy) Start(ctx context.Context) error {
+	if !p.optional[rpc.OptionalStart] {
+		return nil
+	}
+	p.mu.Lock()
+	p.started = true
+	p.mu.Unlock()
+
+	r := p.running()
+	if r == nil {
+		return nil
+	}
+	return r.conn.CallStart(ctx)
+}
+
+// Close 走三级关闭：RPC close → （断连接等 EOF）→ 终止信号 → Kill。
+//
+// 每一级都有期限：关停不能卡在一个不听话的插件上（ADR-0005「代价」一节），
+// 而最后一定落到 Kill——宁可杀掉一个正在写库的插件，也不能留下孤儿进程：
+// 孤儿会占着单实例锁之外的一切（端口、KV 写入、平台的主动消息配额）。
+//
+// 幂等：/reload 与退出信号可能同时触发关停，第二次必须是无操作的成功。
+func (p *proxy) Close(ctx context.Context) error {
+	p.mu.Lock()
+	if p.closing {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closing = true
+	r := p.cur
+	p.cur = nil
+	p.mu.Unlock()
+
+	if r == nil {
+		return nil
+	}
+
+	// 第一级：请插件自己收摊。它要靠这一步把内存里的状态写回 KV。
+	if p.optional[rpc.OptionalClose] {
+		cctx, cancel := context.WithTimeout(ctx, closeRPCGrace)
+		err := r.conn.CallClose(cctx)
+		cancel()
+		if err != nil && !errors.Is(err, rpc.ErrMethodNotFound) {
+			p.log.Warn("插件 close 未成功，继续关闭进程", "err", err)
+		}
+	}
+
+	// 第二级：断连接。插件读到 stdin 的 EOF 会自己退出——这是绝大多数插件的
+	// 正常退出路径，与第一级合起来就是"优雅关闭"。
+	_ = r.conn.Close()
+	if r.waitExit(closeExitWait) {
+		return nil
+	}
+
+	// 第三级：信号（Windows 上没有 SIGTERM，只能 Kill，见 terminate_*.go）。
+	p.log.Warn("插件未在期限内退出，发送终止信号", "wait", closeExitWait.String())
+	if r.cmd.Process != nil {
+		if err := terminate(r.cmd.Process); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			p.log.Warn("发送终止信号失败", "err", err)
+		}
+	}
+	if r.waitExit(closeKillWait) {
+		return nil
+	}
+
+	// 兜底：Kill。走到这里说明插件既不理会 close 也不理会信号。
+	p.log.Error("插件未响应终止信号，强制 Kill")
+	if r.cmd.Process != nil {
+		_ = r.cmd.Process.Kill()
+	}
+	if !r.waitExit(closeKillWait) {
+		return fmt.Errorf("pluginproc: 插件 %s 的进程在 Kill 之后仍未退出", p.name)
+	}
+	return nil
+}
+
+// 关闭三级的期限。总预算（3 秒 + 1 秒 Kill）要小到能在核心的关停窗口里
+// 余下给"写回状态"的时间，又大到足够一个正常插件把 Close 跑完。
+const (
+	closeRPCGrace = time.Second
+	closeExitWait = 2 * time.Second
+	closeKillWait = time.Second
+)
+
 // spawn 起一个进程并完成握手。
-func (p *proxy) spawn(ctx context.Context) error {
+//
+// 失败分两类（见 startFailure 的注释）：进程侧起不来/中途死了属于崩溃，由
+// 调用方转成退避重启；其余（含插件在 init 里报的错）原样上抛。
+func (p *proxy) spawn(ctx context.Context) (*runtimeProc, error) {
 	p.mu.Lock()
 	h, cfg := p.host, p.cfg
 	p.mu.Unlock()
 
 	r, err := startProcess(p.bin, p.reg, p.log)
 	if err != nil {
-		return err
+		return nil, &startFailure{err: err, transport: true}
 	}
 	// host.* 必须在 Run 之前挂上：插件在 Init 里就会调 Host（Config() 不过
 	// 通道，但 SendActive / Scheduler 会），那时代码已经在读这条连接了。
 	if err := rpc.ServeHost(r.conn, h); err != nil {
 		r.shutdown()
-		return err
+		return nil, err
 	}
 	go func() { _ = r.conn.Run() }()
 
 	if err := r.conn.CallInit(ctx, p.name, cfg); err != nil {
 		r.shutdown()
+		// 连接已关＝插件在 init 之前/之中就没了（崩溃）；其余是插件**答了**
+		// "我初始化失败"——那是配置写错，按既有口径让启动失败（决策 6）。
+		return nil, &startFailure{err: err, transport: errors.Is(err, rpc.ErrConnClosed)}
+	}
+	return r, nil
+}
+
+// startFailure 区分两种"起不来"。
+//
+// transport=true 表示问题在进程侧（起不来、半路死了、连接断了）：这是崩溃，
+// 走退避重启，启动**不**失败（决策 6/8）。transport=false 表示插件活着并
+// 明确拒绝了初始化（典型是配置里的密钥不对）：那是人改一下文件的事，
+// fail-fast 才是对的——与后端启动失败时不当"没事"是同一条取舍。
+type startFailure struct {
+	err       error
+	transport bool
+}
+
+func (e *startFailure) Error() string { return e.err.Error() }
+func (e *startFailure) Unwrap() error { return e.err }
+
+func isTransport(err error) bool {
+	var f *startFailure
+	return errors.As(err, &f) && f.transport
+}
+
+// start 起一代进程：握手成功就接管为当前进程，并派一个监工盯着它的退出。
+func (p *proxy) start(ctx context.Context) error {
+	r, err := p.spawn(ctx)
+	if err != nil {
 		return err
 	}
-
 	p.mu.Lock()
 	p.cur = r
 	p.mu.Unlock()
+	go p.supervise(r)
 	return nil
+}
+
+// supervise 盯这一代进程的结局。
+//
+// 两个信号都要看：进程退出（正常崩溃）与连接断开（插件关了 stdout 人却还
+// 在，属半死）。无论哪个，都只处理自己那一代（r），绝不碰 p.cur 上后来居上
+// 的新进程——否则一次重启失败会把刚起来的进程杀掉，变成稳定的自我踩踏。
+func (p *proxy) supervise(r *runtimeProc) {
+	select {
+	case <-r.exited:
+	case <-r.conn.Done():
+	}
+
+	p.mu.Lock()
+	current := p.cur == r
+	closing := p.closing
+	if current {
+		p.cur = nil
+	}
+	p.mu.Unlock()
+
+	if closing {
+		// 关停路径自己在走三级关闭，监工不许插手：否则它的"连接一断就杀"
+		// 会跳过 SIGTERM 那一级，插件连收尾的机会都没有。
+		return
+	}
+	r.shutdown() // 幂等：连接已关就只差"进程若还活着就杀"
+	if !current {
+		// 这一代已经被别处作废（停用、或被新的一代替换），不再计数。
+		return
+	}
+	p.noteExit(r.exitErr)
+}
+
+// noteExit 记一次"进程没了"，并按退避表安排重启；到阈值就停用。
+func (p *proxy) noteExit(err error) {
+	p.mu.Lock()
+	p.failures++
+	n := p.failures
+	if n >= maxFailures {
+		p.disabled = true
+		p.mu.Unlock()
+		p.log.Error("插件连续失败，已停用", "failures", n, "reason", "进程异常退出")
+		return
+	}
+	delay := p.backoffAt(n)
+	p.mu.Unlock()
+
+	p.log.Error("插件进程异常退出，将按退避重启",
+		"failures", n, "backoff", delay.String(), "err", err)
+	time.AfterFunc(delay, p.restart)
+}
+
+// restart 是退避到期后的重试入口。
+func (p *proxy) restart() {
+	p.mu.Lock()
+	closing, disabled := p.closing, p.disabled
+	p.mu.Unlock()
+	if closing || disabled {
+		return
+	}
+	if err := p.start(context.Background()); err != nil {
+		p.log.Error("插件重启失败", "err", err)
+		p.noteExit(err)
+		return
+	}
+	p.log.Info("插件已重启", "failures", p.failureCount())
+
+	// 核心只会在启动时调一次 Start；重启出来的是新进程，后台协程要重新起。
+	p.mu.Lock()
+	needStart := p.started && p.optional[rpc.OptionalStart]
+	p.mu.Unlock()
+	if needStart {
+		if err := p.Start(context.Background()); err != nil {
+			p.log.Error("插件重启后 Start 失败", "err", err)
+		}
+	}
+}
+
+func (p *proxy) failureCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.failures
+}
+
+// backoffAt 返回第 n 次失败（从 1 起）之后等多久再试。
+func (p *proxy) backoffAt(n int) time.Duration {
+	idx := n - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(p.backoff) {
+		idx = len(p.backoff) - 1
+	}
+	return p.backoff[idx]
 }

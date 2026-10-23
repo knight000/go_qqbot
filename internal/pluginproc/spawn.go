@@ -140,3 +140,15 @@ func (l *lineLogger) emit(line []byte) {
 
 // 断言：exec 只要求 io.Writer，别不小心把它换成更窄的东西。
 var _ io.Writer = (*lineLogger)(nil)
+
+// waitExit 在 d 内等这一代进程退出。
+func (r *runtimeProc) waitExit(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-r.exited:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
