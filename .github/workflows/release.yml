@@ -4,7 +4,7 @@
 #
 #   1. 先编插件到 internal/pluginbundle/dist/<os>_<arch>/（核心的 //go:embed 依赖它们）
 #   2. GoReleaser 编核心、发 release、算 checksums.txt
-#   3. 生成 plugins/index.json 并连同插件资产一起上传
+#   3. 生成 index.json 并连同插件资产一起上传
 #   4. 把刚发出去的资产下载回来做冒烟（校验和 / 版本号 / 可启动）
 #
 # 第 1 步一定要三个平台都跑：每个平台的 bundle_<os>_<arch>.go 只 embed 自己
@@ -55,7 +55,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 3. 生成 plugins/index.json 并上传插件资产
+      - name: 3. 生成 index.json 并上传插件资产
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -83,13 +83,15 @@ jobs:
           ls -l
 
           # 三个核心产物 + checksums.txt + index.json：缺任何一个都意味着
-          # 至少一个平台的升级通道是断的。
+          # 至少一个平台的升级通道是断的。index.json 在 release 里是扁平的
+          # （GitHub 的资产名不能带 /），仓内的 dist/plugins/ 那层目录只是
+          # 本地布局，上传后只剩文件名。
           for f in \
             "qqbot-$ver-windows-amd64.exe" \
             "qqbot-$ver-linux-amd64" \
             "qqbot-$ver-linux-arm64" \
             "checksums.txt" \
-            "plugins/index.json"; do
+            "index.json"; do
             test -s "$f" || { echo "缺少资产: $f"; exit 1; }
           done
 
@@ -109,11 +111,11 @@ jobs:
             and .core.version == $v
             and (.plugins | length) == 4
             and ([.plugins[].assets | length] | all(. == 3))
-          ' plugins/index.json
+          ' index.json
 
           # index.json 登记的 sha256 必须与真实下载到的插件资产一致：
           # 它是 /upgrade plugin 校验完整性的唯一依据。
-          jq -r '.plugins[] | .assets[] | "\(.url | split("/") | last) \(.sha256)"' plugins/index.json |
+          jq -r '.plugins[] | .assets[] | "\(.url | split("/") | last) \(.sha256)"' index.json |
             while read -r asset sha; do
               echo "$sha  $asset" | sha256sum -c -
             done
