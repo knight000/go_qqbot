@@ -22,9 +22,15 @@ type fakeUpgrade struct {
 	status     upgrade.Status
 	statusErr  error
 
+	pluginReport upgrade.PluginReport
+	pluginErr    error
+	// pluginTargets 记下"收到了哪些插件目标"：命令面只负责挑选与转发。
+	pluginTargets []upgrade.PluginTarget
+
 	previewCalls int
 	applyCalls   int
 	statusCalls  int
+	pluginCalls  int
 }
 
 func (f *fakeUpgrade) Preview(context.Context) (upgrade.Report, error) {
@@ -40,6 +46,12 @@ func (f *fakeUpgrade) Apply(context.Context) (*upgrade.Plan, error) {
 func (f *fakeUpgrade) Status(context.Context) (upgrade.Status, error) {
 	f.statusCalls++
 	return f.status, f.statusErr
+}
+
+func (f *fakeUpgrade) UpgradePlugins(_ context.Context, targets []upgrade.PluginTarget) (upgrade.PluginReport, error) {
+	f.pluginCalls++
+	f.pluginTargets = append([]upgrade.PluginTarget{}, targets...)
+	return f.pluginReport, f.pluginErr
 }
 
 func newUpgradeCore(t *testing.T, svc UpgradeService) (*Core, *fakeAPI) {
@@ -233,23 +245,6 @@ func TestUpgradeStatusReportsPending(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("状态正文缺少 %q:\n%s", want, got)
 		}
-	}
-}
-
-// /upgrade plugin 是 #45 的地盘：本票必须拒绝得干净（未知子命令 + 用法），
-// 而不是假装成功。
-func TestUpgradePluginNotImplemented(t *testing.T) {
-	svc := &fakeUpgrade{}
-	c, f := newUpgradeCore(t, svc)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
-
-	c.handleReserved(context.Background(), adminEvent("/upgrade plugin all", "o1", "", host.SceneC2C, "o1"))
-	got := lastReply(t, f)
-	if !strings.Contains(got, "尚未实现") || !strings.Contains(got, "/upgrade apply") {
-		t.Fatalf("应说明未实现并给出用法:\n%s", got)
-	}
-	if svc.applyCalls != 0 || svc.previewCalls != 0 {
-		t.Error("/upgrade plugin 不该触发核心升级")
 	}
 }
 

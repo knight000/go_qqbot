@@ -14,19 +14,31 @@ import (
 // /upgrade 是自更新的唯一入口（ADR-0006 决策 1/2）：
 // 只在人主动敲的时候发请求，启动期不查。
 //
-// 四段命令里本票只实现三段（预览 / 应用核心 / 状态）；`/upgrade plugin`
-// 留给 #45，落到「未知子命令 + 用法」，而不是假装成功。
+// 四段命令：预览 / 应用核心 / 应用插件 / 状态。插件那条只重启那个插件的
+// 子进程（决策 6：回滚几乎免费），所以它不需要重启核心、也不需要二次确认。
 //
 // 权限是 owner-only 而**不是** admin：升级通道就是远程代码执行通道
 // （ADR-0006 的"代价"第一条），辅助管理员不该有这个能力。
 const upgradeUsage = `用法：
-/upgrade               预览：当前版本、最新版本、核心产物大小、插件升/跳过清单（不改动任何文件）
-/upgrade apply         应用核心升级：快照数据库 → 下载 → 校验 → 落位 → 重启进程
-/upgrade status        查看是否还有未确认的升级、上次失败原因
-/upgrade plugin [...]  插件升级（尚未实现）
+/upgrade                    预览：当前版本、最新版本、核心产物大小、插件升/跳过清单（不改动任何文件）
+/upgrade apply              应用核心升级：快照数据库 → 下载 → 校验 → 落位 → 重启进程
+/upgrade plugin <名称|all>  升级单个插件（或全部已加载插件）：只重启那个插件的子进程
+/upgrade status             查看是否还有未确认的升级、上次失败原因
 
 仅 Bot 所有者可用。版本号为 dev 时拒绝（dev 无法参与版本比较）。
 安全提示：/upgrade apply 会把本机的 qqbot 换成远端发布的版本，请确认源可信。`
+
+// PluginReplacer 是插件进程代理暴露的两个可选能力（pluginproc.proxy 实现）。
+//
+// 只在方法名上对齐，两个包不必互相 import：pluginproc 已经 import core
+// （装配期校验复用路由构建器），core 不能再反向依赖它。方法集与
+// upgrade.PluginReplacer 逐字相同，所以断言拿到的值可以直接交给升级包。
+type PluginReplacer interface {
+	// BinPath 是插件可执行文件的绝对路径（落位文件必须与它同目录）。
+	BinPath() string
+	// ReplaceBinary 换掉这个插件的产物并只重启它；失败时自己回滚。
+	ReplaceBinary(newPath string) error
+}
 
 // UpgradeService 是 /upgrade 依赖的全部能力。
 //
@@ -36,6 +48,9 @@ const upgradeUsage = `用法：
 type UpgradeService interface {
 	Preview(ctx context.Context) (upgrade.Report, error)
 	Apply(ctx context.Context) (*upgrade.Plan, error)
+	// UpgradePlugins 升级给定的插件，逐条给出结论。返回的 error 只表示
+	// "整条路走不通"（关掉自更新、dev 版本、取不到索引）。
+	UpgradePlugins(ctx context.Context, targets []upgrade.PluginTarget) (upgrade.PluginReport, error)
 	Status(ctx context.Context) (upgrade.Status, error)
 }
 
@@ -75,7 +90,14 @@ func (c *Core) handleUpgrade(ctx context.Context, ev *host.Event) {
 		// "有没有上次没确认的升级"。
 		c.upgradeStatus(ctx, ev)
 	case "plugin", "plugins":
-		c.replyText(ctx, ev, "插件升级尚未实现（见 #45），本版本只支持核心升级。\n\n"+upgradeUsage)
+		if !c.upgradeAllowed(ctx, ev) {
+			return
+		}
+		var rest []string
+		if len(fields) > 2 {
+			rest = fields[2:]
+		}
+		c.upgradePlugin(ctx, ev, rest)
 	case "help", "-h", "--help":
 		c.replyText(ctx, ev, upgradeUsage)
 	default:
@@ -165,6 +187,104 @@ func (c *Core) upgradeApply(ctx context.Context, ev *host.Event) {
 	c.log.Warn("收到 /upgrade apply，准备换盘并重启",
 		"by", ev.SenderID, "from", plan.From, "to", plan.To,
 		"exe", plan.Exe, "bytes", plan.Staged, "snapshot", plan.Snapshot)
+}
+
+// upgradePlugin 是 `/upgrade plugin <名称|all>`（决策 2）。
+//
+// 参数里的名字必须是**已加载**的插件：核心才知道它们的版本号，索引里多出来
+// 的插件在本机没有进程可换。这条限制也顺手挡住"敲错名字却以为升了"。
+//
+// 与核心升级不同，这条路不重启核心：换掉一个插件只需要重启它的子进程，
+// 所以回复就是最终结果——没有"接下来重启"这句话。
+func (c *Core) upgradePlugin(ctx context.Context, ev *host.Event, args []string) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		c.replyText(ctx, ev, "用法：/upgrade plugin <名称|all>\n\n"+upgradeUsage)
+		return
+	}
+
+	targets, missing, cold := c.pluginTargets(args[0])
+	if missing != "" {
+		c.replyText(ctx, ev, "没有这个插件 "+missing+"。\n"+c.pluginListText())
+		return
+	}
+	if len(targets) == 0 {
+		// 走到这里的两种情形：本机没有已加载插件；或者点了名但那个插件不是
+		// 独立进程（cold 非空）。后者必须说清"不能"，而不是"没有"。
+		if len(cold) > 0 {
+			c.replyText(ctx, ev, "插件 "+strings.Join(cold, "、")+
+				" 不是独立进程（不支持热替换），只能重启核心让它重新装配。")
+			return
+		}
+		c.replyText(ctx, ev, "当前没有已加载的插件，没有可升级的对象。")
+		return
+	}
+
+	rep, err := c.upgrade.UpgradePlugins(ctx, targets)
+	if err != nil {
+		// 一个请求都没发、或整条路走不通（关掉自更新、dev 版本、取不到索引）。
+		// 与核心升级同一口径：说清原因，服务继续跑。
+		c.log.Warn("插件升级失败", "err", err)
+		c.replyText(ctx, ev, "插件升级失败（未做任何改动）："+err.Error())
+		return
+	}
+
+	text := rep.Text()
+	if len(cold) > 0 {
+		// all 的附注：漏掉它们等于谎报"全都处理过了"。
+		text += "\n\n以下插件不是独立进程，不支持热替换（只能靠重启核心）：" +
+			strings.Join(cold, "、")
+	}
+	c.replyText(ctx, ev, text)
+	c.log.Warn("收到 /upgrade plugin",
+		"by", ev.SenderID, "arg", args[0], "targets", len(targets),
+		"changed", rep.Changed(), "elapsed", rep.Elapsed.String())
+}
+
+// pluginTargets 把命令参数翻成升级目标。
+//
+// 返回：
+//   - targets：可热替换的目标（all 时是全部，否则只有一个）
+//   - missing：这个名字既不在已加载插件里，也不是 all（调用方回"没有这个插件"）
+//   - cold   ：名字对上了、但这个插件不是独立进程（没有 ReplaceBinary）
+//
+// 顺序由升级包按 index.json 排（all 的报告要能逐行比对），这里只负责挑选。
+func (c *Core) pluginTargets(arg string) (targets []upgrade.PluginTarget, missing string, cold []string) {
+	arg = strings.TrimSpace(arg)
+	all := strings.EqualFold(arg, "all")
+	found := false
+	for _, p := range c.plugins {
+		m := p.Manifest()
+		if !all && m.Name != arg {
+			continue
+		}
+		found = true
+		r, ok := p.(PluginReplacer)
+		if !ok {
+			cold = append(cold, m.Name)
+			continue
+		}
+		targets = append(targets, upgrade.PluginTarget{
+			Name:    m.Name,
+			Version: m.Version,
+			Replace: r,
+		})
+	}
+	if !all && !found {
+		return nil, arg, nil
+	}
+	return targets, "", cold
+}
+
+// pluginListText 列出可用的插件名：敲错名字时唯一有用的信息就是这一行。
+func (c *Core) pluginListText() string {
+	names := make([]string, 0, len(c.plugins))
+	for _, p := range c.plugins {
+		names = append(names, p.Manifest().Name)
+	}
+	if len(names) == 0 {
+		return "当前没有已加载的插件。"
+	}
+	return "可用的插件：" + strings.Join(names, "、") + "（all 表示全部）。"
 }
 
 func (c *Core) upgradeStatus(ctx context.Context, ev *host.Event) {
