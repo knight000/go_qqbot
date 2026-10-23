@@ -6,6 +6,9 @@
 /.temp/
 /media/
 /bin/
+# GoReleaser 的中间产物与发布资产（含 tools/index 整理出的 dist/plugins/），
+# 都在本地生成，不入库。
+/dist/
 qqbot
 qqbot.exe
 # `go build ./cmd/bot` 的默认产物名
