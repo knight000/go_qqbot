@@ -32,31 +32,20 @@ func ServePlugin(c *Conn, p host.Plugin) error {
 		return errors.New("rpc: 插件 Manifest.Name 不能为空")
 	}
 
-	s := &pluginServer{c: c, p: p, gate: make(chan struct{})}
-	// 可选接口用类型断言决定要不要注册方法：跨进程没有类型可断言，
-	// 所以「实现了哪些」由 plugin.manifest 的 Optional 一并报给核心。
-	if v, ok := p.(host.Starter); ok {
-		s.starter = v
-	}
-	if v, ok := p.(host.Closer); ok {
-		s.closer = v
-	}
-	if v, ok := p.(host.JobRunner); ok {
-		s.jobber = v
-	}
+	s := &pluginServer{c: c, p: p, gate: make(chan struct{}), caps: capabilitiesOf(p)}
 
 	methods := map[string]Handler{
 		MethodPluginManifest: s.manifest,
 		MethodPluginInit:     s.init,
 		MethodPluginHandle:   s.handle,
 	}
-	if s.starter != nil {
+	if s.caps.starter != nil {
 		methods[MethodPluginStart] = s.start
 	}
-	if s.closer != nil {
+	if s.caps.closer != nil {
 		methods[MethodPluginClose] = s.close
 	}
-	if s.jobber != nil {
+	if s.caps.jobber != nil {
 		methods[MethodPluginRunJob] = s.runJob
 	}
 	for method, handler := range methods {
@@ -67,14 +56,47 @@ func ServePlugin(c *Conn, p host.Plugin) error {
 	return nil
 }
 
-type pluginServer struct {
-	c    *Conn
-	p    host.Plugin
-	gate chan struct{}
-
+// pluginCaps 是「本产物实现了哪几个可选接口」的唯一事实源。
+//
+// 注册哪几个方法、plugin.manifest 里报哪几个名字，都从这一份断言结果派生：
+// 两处各写一遍类型断言的话，加第四个可选接口时必然会出现「注册了但没报」
+// （核心不发那条调用，功能静默缺失）或「报了但没注册」（一调就是方法未注册）。
+type pluginCaps struct {
 	starter host.Starter
 	closer  host.Closer
 	jobber  host.JobRunner
+	// methods 随三个断言一起生成，顺序固定，便于日志与测试逐字比对。
+	methods []string
+}
+
+func capabilitiesOf(p host.Plugin) pluginCaps {
+	var caps pluginCaps
+	if v, ok := p.(host.Starter); ok {
+		caps.starter = v
+		caps.methods = append(caps.methods, OptionalStart)
+	}
+	if v, ok := p.(host.Closer); ok {
+		caps.closer = v
+		caps.methods = append(caps.methods, OptionalClose)
+	}
+	if v, ok := p.(host.JobRunner); ok {
+		caps.jobber = v
+		caps.methods = append(caps.methods, OptionalRunJob)
+	}
+	return caps
+}
+
+// OptionalMethods 报告 p 实现了哪几个可选接口，供 `--manifest` 的应答
+// （见 EncodeManifest）与 ServePlugin 共用，保证探测到的事实与线上一致。
+func OptionalMethods(p host.Plugin) []string {
+	return capabilitiesOf(p).methods
+}
+
+type pluginServer struct {
+	c    *Conn
+	p    host.Plugin
+	caps pluginCaps
+	gate chan struct{}
 
 	mu      sync.Mutex
 	inited  bool
@@ -82,17 +104,10 @@ type pluginServer struct {
 }
 
 // optional 是「本产物实现了哪几个可选接口」的清单，随 manifest 一起报给核心。
-//
-// 从**已注册的方法**反推，而不是再看一遍字段：注册那张表是唯一事实源，
-// 将来加第四个可选接口时不会出现「注册了但清单里没报」的静默缺口。
+// 与注册方法是同一份断言结果（caps），将来加第四个可选接口时不会出现
+// 「注册了但清单里没报」的静默缺口。
 func (s *pluginServer) optional() []string {
-	var out []string
-	for _, method := range []string{OptionalStart, OptionalClose, OptionalRunJob} {
-		if s.c.Handles(method) {
-			out = append(out, method)
-		}
-	}
-	return out
+	return s.caps.methods
 }
 
 func (s *pluginServer) manifest(_ context.Context, _ Request) (Response, error) {
@@ -185,7 +200,7 @@ func (s *pluginServer) start(ctx context.Context, _ Request) (Response, error) {
 	if err := s.wait(ctx); err != nil {
 		return Response{}, err
 	}
-	return Response{}, s.starter.Start(ctx)
+	return Response{}, s.caps.starter.Start(ctx)
 }
 
 func (s *pluginServer) close(ctx context.Context, _ Request) (Response, error) {
@@ -195,7 +210,7 @@ func (s *pluginServer) close(ctx context.Context, _ Request) (Response, error) {
 	case <-ctx.Done():
 		return Response{}, ctx.Err()
 	}
-	return Response{}, s.closer.Close(ctx)
+	return Response{}, s.caps.closer.Close(ctx)
 }
 
 func (s *pluginServer) runJob(ctx context.Context, req Request) (Response, error) {
@@ -206,7 +221,7 @@ func (s *pluginServer) runJob(ctx context.Context, req Request) (Response, error
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodPluginRunJob, err)
 	}
-	return Response{}, s.jobber.RunJob(ctx, p.Spec.toHost())
+	return Response{}, s.caps.jobber.RunJob(ctx, p.Spec.toHost())
 }
 
 // —— 调用侧：核心怎么驱动一个插件 ——
