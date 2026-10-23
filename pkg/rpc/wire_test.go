@@ -226,7 +226,7 @@ func TestConfigIntFidelity(t *testing.T) {
 // `row["n"].(int64)` 是常规写法，float64 会让它 panic 或静默取零。
 func TestRowsIntFidelity(t *testing.T) {
 	raw := json.RawMessage(`[{"n":42,"s":"x"}]`)
-	var rows []map[string]any
+	var rows []host.Row
 	if err := decodeJSON(raw, &rows); err != nil {
 		t.Fatalf("解码: %v", err)
 	}

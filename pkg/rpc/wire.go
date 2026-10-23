@@ -418,14 +418,115 @@ func normalizeNums(v any) any {
 	return v
 }
 
-// normalizeRows 就地规范化查询结果。
-func normalizeRows(rows []map[string]any) []host.Row {
+// normalizeRows 规范化查询结果里的数字。行类型走 host.Row 而不是
+// map[string]any，是为了让「线上给的就是 host.Query 的返回类型」这件事
+// 在类型系统里成立——少一次转换，也少一处可以对不齐的地方。
+func normalizeRows(rows []host.Row) []host.Row {
 	if rows == nil {
 		return nil
 	}
 	out := make([]host.Row, len(rows))
 	for i, r := range rows {
-		out[i] = host.Row(normalizeNums(r).(map[string]any))
+		out[i] = host.Row(normalizeNums(map[string]any(r)).(map[string]any))
 	}
 	return out
 }
+
+// —— 每个方法的参数与应答 ——
+//
+// 这些结构体由**两端共用**：服务侧解码、调用侧编码用的是同一个类型。
+// 曾经两侧各写一个匿名 struct、靠 Go 字段名隐式对齐——改一个字段名不会
+// 编译失败，只会让对面读出零值，而症状是「连接正常、调用成功、结果是空的」。
+// 线格式的知识只放在一个地方，这条才算真的成立。
+//
+// TTL / Timeout 一律是 int64 纳秒：`time.Duration` 的 JSON 形态本来就是
+// 整数纳秒，但把单位写进字段名才不会被当成秒。
+type (
+	replyParams struct {
+		Event eventDTO
+		Msg   replyDTO
+	}
+	sendActiveParams struct {
+		Scene string
+		Peer  string
+		Msg   replyDTO
+	}
+	// kvParams 被 get / delete 共用；peer 为空即插件级全局键空间。
+	kvParams struct {
+		Peer string
+		Key  string
+	}
+	kvSetParams struct {
+		Peer  string
+		Key   string
+		Value []byte
+		TTL   int64
+	}
+	kvGetResult struct {
+		Value []byte
+		Found bool
+	}
+	queryParams struct {
+		Query string
+		Args  []any
+	}
+	queryResult struct {
+		Rows []host.Row
+	}
+	// httpParams 是四个 HTTP 方法的公共入参：字段互有冗余，但一个结构体
+	// 比四个只在两三个字段上有差别的结构体好维护。
+	httpParams struct {
+		URL     string
+		In      json.RawMessage
+		Header  map[string]string
+		Timeout int64 // 纳秒；0 表示用默认超时
+	}
+	// httpResult 把上游 JSON **原样**带回去，不在核心侧解一遍再编一遍。
+	// 解一遍的代价是保真：解进 any 会把所有数字变成 float64（int64 里
+	// 超过 2^53 的会被改掉），再编回去就是另一份数据了。
+	httpResult struct {
+		Out json.RawMessage
+	}
+	scheduleParams struct {
+		Spec jobSpecDTO
+	}
+	isAdminParams struct {
+		ID identityDTO
+	}
+	isAdminResult struct {
+		Admin bool
+	}
+	adminTargetsResult struct {
+		Targets []adminTargetDTO
+	}
+	renderParams struct {
+		Src string
+	}
+	renderResult struct {
+		Image imageDTO
+	}
+	sessionAwaitParams struct {
+		Event eventDTO
+		State []byte
+		TTL   int64
+	}
+
+	// —— plugin.* ——
+	manifestResult struct {
+		Manifest manifestDTO
+		Optional []string
+	}
+	initParams struct {
+		Name   string
+		Config map[string]any
+	}
+	handleParams struct {
+		Event eventDTO
+	}
+	handleResult struct {
+		Reply *replyDTO
+	}
+	runJobParams struct {
+		Spec jobSpecDTO
+	}
+)

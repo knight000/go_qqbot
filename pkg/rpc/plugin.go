@@ -3,7 +3,9 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/knight000/go_qqbot/pkg/host"
 )
@@ -80,32 +82,28 @@ type pluginServer struct {
 }
 
 // optional 是「本产物实现了哪几个可选接口」的清单，随 manifest 一起报给核心。
+//
+// 从**已注册的方法**反推，而不是再看一遍字段：注册那张表是唯一事实源，
+// 将来加第四个可选接口时不会出现「注册了但清单里没报」的静默缺口。
 func (s *pluginServer) optional() []string {
 	var out []string
-	if s.starter != nil {
-		out = append(out, OptionalStart)
-	}
-	if s.closer != nil {
-		out = append(out, OptionalClose)
-	}
-	if s.jobber != nil {
-		out = append(out, OptionalRunJob)
+	for _, method := range []string{OptionalStart, OptionalClose, OptionalRunJob} {
+		if s.c.Handles(method) {
+			out = append(out, method)
+		}
 	}
 	return out
 }
 
 func (s *pluginServer) manifest(_ context.Context, _ Request) (Response, error) {
-	return Response{Result: struct {
-		Manifest manifestDTO
-		Optional []string
-	}{toManifestDTO(s.p.Manifest()), s.optional()}}, nil
+	return Response{Result: manifestResult{
+		Manifest: toManifestDTO(s.p.Manifest()),
+		Optional: s.optional(),
+	}}, nil
 }
 
 func (s *pluginServer) init(ctx context.Context, req Request) (Response, error) {
-	var p struct {
-		Name   string
-		Config map[string]any
-	}
+	var p initParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodPluginInit, err)
 	}
@@ -127,15 +125,26 @@ func (s *pluginServer) init(ctx context.Context, req Request) (Response, error) 
 		// 否则 Params.Int 拿得到值、Params.Decode 解进 int 字段会报错。
 		vals = normalizeNums(vals).(map[string]any)
 	}
-	err := s.p.Init(ctx, NewHostClient(s.c, name, vals))
 
-	s.mu.Lock()
-	s.initErr = err
-	s.mu.Unlock()
-	// 失败也要放行：Close 得能跑（清理半初始化的资源），而其他方法会拿到
-	// initErr 而不是挂在这里等一个永远不会来的成功。
-	close(s.gate)
-	return Response{}, err
+	var initErr error
+	completed := false
+	// gate 必须**一定**关上（失败也关）：否则 Init panic 之后每个
+	// handle / close 都挂在 wait 上，插件的表现是「装了但永不理人」。
+	defer func() {
+		if !completed {
+			// 只有 panic 会走到这里：Init 正常返回时 completed 已置位。
+			// 记成 Init 的错误，别让后来者以为初始化成功。
+			initErr = fmt.Errorf("%w: plugin.init", ErrHandlerPanic)
+		}
+		s.mu.Lock()
+		s.initErr = initErr
+		s.mu.Unlock()
+		close(s.gate)
+	}()
+
+	initErr = s.p.Init(ctx, NewHostClient(s.c, name, vals))
+	completed = true
+	return Response{}, initErr
 }
 
 // wait 等 Init 结束。ctx 到期时如实返回 ctx 的错误——插件卡在 Init 里时，
@@ -155,7 +164,7 @@ func (s *pluginServer) handle(ctx context.Context, req Request) (Response, error
 	if err := s.wait(ctx); err != nil {
 		return Response{}, err
 	}
-	var p struct{ Event eventDTO }
+	var p handleParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodPluginHandle, err)
 	}
@@ -166,10 +175,10 @@ func (s *pluginServer) handle(ctx context.Context, req Request) (Response, error
 	// nil 与空 Reply 必须区分：进程内 nil 表示「这条不回复」，而空 Reply
 	// 会让核心去发一条空消息。所以结果段用指针，nil 原样传过去。
 	if reply == nil {
-		return Response{Result: struct{ Reply *replyDTO }{}}, nil
+		return Response{Result: handleResult{}}, nil
 	}
 	dto, body := encodeReply(reply)
-	return Response{Result: struct{ Reply *replyDTO }{&dto}, Body: body}, nil
+	return Response{Result: handleResult{Reply: &dto}, Body: body}, nil
 }
 
 func (s *pluginServer) start(ctx context.Context, _ Request) (Response, error) {
@@ -193,7 +202,7 @@ func (s *pluginServer) runJob(ctx context.Context, req Request) (Response, error
 	if err := s.wait(ctx); err != nil {
 		return Response{}, err
 	}
-	var p struct{ Spec jobSpecDTO }
+	var p runJobParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodPluginRunJob, err)
 	}
@@ -206,6 +215,29 @@ func (s *pluginServer) runJob(ctx context.Context, req Request) (Response, error
 // 它们刻意留在这里而不是 core 里：线格式的知识只应存在于一个包，
 // 否则 #40 的 proxy 会再写一遍 DTO 映射，两处漂移就是两套协议。
 
+// 超时口径（ADR-0005 决策 7 / §3.6）：**由 RPC 层强制**，不靠调用方记得设。
+// 这两条是仅有的两个有既定口径的入口，`Handle` 3 s、`Job` 60 s；其余
+// （init / start / close）的时限属于关停序列，由核心在那边定（三级关闭）。
+//
+// #40 接上 dispatcher 与调度器时应当直接用这两个常量，别再声明第三份
+// ——两个数字各写一遍，迟早一边改了另一边没改。
+const (
+	HandleTimeout = 3 * time.Second
+	JobTimeout    = 60 * time.Second
+)
+
+// withDefaultTimeout 只在调用方没给截止时间时补一个默认值；给了就照用
+// （测试与运维用的长超时不该被压回 3 s）。
+func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 // CallManifest 拉取清单与可选方法表。这是握手第一步。
 //
 // 返回的第二个值是插件**真的**实现了哪几个可选接口（plugin.start /
@@ -217,10 +249,7 @@ func (c *Conn) CallManifest(ctx context.Context) (host.Manifest, []string, error
 	if err != nil {
 		return host.Manifest{}, nil, err
 	}
-	var out struct {
-		Manifest manifestDTO
-		Optional []string
-	}
+	var out manifestResult
 	if err := res.Decode(&out); err != nil {
 		return host.Manifest{}, nil, err
 	}
@@ -229,21 +258,23 @@ func (c *Conn) CallManifest(ctx context.Context) (host.Manifest, []string, error
 
 // CallInit 把配置快照交给插件并让它初始化。cfg 是 [plugins.<name>] 段的原始 map。
 func (c *Conn) CallInit(ctx context.Context, name string, cfg map[string]any) error {
-	_, err := c.Call(ctx, MethodPluginInit, struct {
-		Name   string
-		Config map[string]any
-	}{name, cfg})
+	_, err := c.Call(ctx, MethodPluginInit, initParams{Name: name, Config: cfg})
 	return err
 }
 
 // CallHandle 投递一个事件。返回 nil 表示插件选择不回复（进程内同样的语义）：
 // 它与「回复一条空消息」是两件事，所以这里保留 nil。
+//
+// ctx 没带截止时间时按 HandleTimeout（3 s）兜底——§3.6 的口径由 RPC 层
+// 强制，否则最慢的那个插件会把整个 per-peer 队列拖住。
 func (c *Conn) CallHandle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
-	res, err := c.Call(ctx, MethodPluginHandle, struct{ Event eventDTO }{toEventDTO(ev)})
+	ctx, cancel := withDefaultTimeout(ctx, HandleTimeout)
+	defer cancel()
+	res, err := c.Call(ctx, MethodPluginHandle, handleParams{Event: toEventDTO(ev)})
 	if err != nil {
 		return nil, err
 	}
-	var out struct{ Reply *replyDTO }
+	var out handleResult
 	if err := res.Decode(&out); err != nil {
 		return nil, err
 	}
@@ -265,8 +296,12 @@ func (c *Conn) CallClose(ctx context.Context) error {
 	return err
 }
 
-// CallRunJob 执行一个到点的任务。超时由调用方按 JobSpec.Timeout 设在 ctx 上。
+// CallRunJob 执行一个到点的任务。超时优先用调用方设在 ctx 上的
+// `JobSpec.Timeout`；调用方没设时按 JobTimeout 兜底，理由与 CallHandle
+// 相同——「记得设超时」不该是每个调用点的义务。
 func (c *Conn) CallRunJob(ctx context.Context, spec host.JobSpec) error {
-	_, err := c.Call(ctx, MethodPluginRunJob, struct{ Spec jobSpecDTO }{toJobSpecDTO(spec)})
+	ctx, cancel := withDefaultTimeout(ctx, JobTimeout)
+	defer cancel()
+	_, err := c.Call(ctx, MethodPluginRunJob, runJobParams{Spec: toJobSpecDTO(spec)})
 	return err
 }
