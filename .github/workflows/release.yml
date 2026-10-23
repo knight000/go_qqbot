@@ -64,7 +64,9 @@ jobs:
           # sha256 来自磁盘上的真实产物，URL 末段就是下一个命令上传的文件名。
           go run ./tools/index -tag "$GITHUB_REF_NAME" -staging dist/plugins
           ls -l dist/plugins
-          gh release upload "$GITHUB_REF_NAME" dist/plugins/* --clobber
+          # -R 不能省：gh 靠当前目录的 .git 推断仓库，而这里的资产目录在
+          # $RUNNER_TEMP 下，不在检出里。
+          gh release upload "$GITHUB_REF_NAME" dist/plugins/* --clobber -R "$GITHUB_REPOSITORY"
 
       - name: 4a. 冒烟：资产齐全，checksums.txt 与 index.json 都能对上
         env:
@@ -75,7 +77,9 @@ jobs:
           work="$RUNNER_TEMP/smoke"
           mkdir -p "$work"
           cd "$work"
-          gh release download "$GITHUB_REF_NAME" --dir "$work"
+          # -R 不能省：cd 到 $RUNNER_TEMP 之后 gh 已经找不到 .git，
+          # 少了它这条命令直接 "fatal: not a git repository"。
+          gh release download "$GITHUB_REF_NAME" --dir "$work" -R "$GITHUB_REPOSITORY"
           ls -l
 
           # 三个核心产物 + checksums.txt + index.json：缺任何一个都意味着
