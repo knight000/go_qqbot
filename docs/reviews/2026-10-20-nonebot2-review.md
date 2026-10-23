@@ -216,6 +216,8 @@ if top.Manifest.Broadcast {
 
 P1（编译期注册）是已定稿决策，理由在 `ARCHITECTURE.md:150-166`：无 IPC、无版本错配、故障面最小。nonebot 的动态加载换来的是"免重编译"，代价是 Python 基线内存与加载顺序、循环依赖、热重载状态丢失。本项目的 `/reload` + `tools/devrun` 已经把"改插件要重编译"这件事的成本压到可接受范围，没有必要为它引入 P2。
 
+> **2026-10-23 追记**：这条结论已被 ADR-0005 推翻——P1 的"重编译"成本在需要独立升级 / 第三方发版时不再可接受，插件已改成子进程 + JSON-RPC（P3，实现 #38–#42）。本文件保留当时的判断与理由，作为决策演化的记录；当前形态见 `docs/ARCHITECTURE.md` §3.1。
+
 ### 3.2 依赖注入框架
 
 nonebot 的 `Depends`/`Dependent` 是为了让 handler 签名与框架解耦（`ArgPlainText`、`RegexGroup`、`T_State` 等按需注入）。Go 没有运行期类型反射的等价物，实现一套只能靠代码生成或 `any` 断言，收益不抵复杂度。**显式参数（`ev`、`h`）在 Go 里更可读、更好测**，保持现状。

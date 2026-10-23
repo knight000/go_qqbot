@@ -5,6 +5,8 @@
 - 基线：`go test ./...` 全绿（19 个包，本机 2026-10-21 实测）；`go vet` 无告警。
 - 结论：**2 个 P1、11 个 P2、26 个 P3**。P1 都是"进程还活着、但机器人永久不工作"这一类；P2 集中在平台契约（关闭码、err_code）、关停时序与配额口径。没有发现数据被静默清空的持久化缺陷。
 
+> **2026-10-23 追记**：本文件是当天的现场记录，条目保留当时结论。P1 → P3 的插件迁移（#38–#42）之后，生成式装配整套被删除：P3-17 / P3-19 / P3-26 随之消解，涉及它的两处说法已改成"已删除"的口径；其余条目的结论未变。
+
 ---
 
 ## 0. 契约地图（先看差集）
@@ -257,7 +259,7 @@ _ = s.db.RecordJobRun(wctx, ...)
 | --- | --- | --- | --- | --- |
 | P3-17 | `README.md:318`、`:474`；`cmd/bot/main.go:6`；`.gitignore:38` | 生产构建命令没有 `go generate`，生成物不入库 | 新放的私有插件不进二进制：构建成功、启动成功、`plugins=4` 不变，只能靠"指令没反应"发现 | README 改成 `go generate ./cmd/bot && go build …`；启动日志打印插件名而不只是数量 |
 | P3-18 | `tools/devrun/main.go:137-150` | Windows 先 `bin→old` 再 `tmp→bin`；第二步失败无回滚 | 一次无人值守的 `/reload` 可能让二进制消失、进程下线，而 `bot.old` 就在旁边却不被使用 | 第二步失败时把 `old` 改回 `bin`；`run()` 发现 `bin` 缺失但 `.old` 存在时先恢复 |
-| P3-19 | `tools/genplugins/main.go:78-107` | 只扫直接子目录；目录有 `package` 就 blank import，不校验是否真的 `host.Register` | 插件代码放在 `plugins/foo/plugin/*.go`，或目录是共享库 → 构建全绿、插件永不注册 | 追加"该目录（含一层子包）必须出现 `host.Register(`"校验，否则 exit 1 |
+| P3-19 | 生成式装配（已随 #41 删除） | 只扫直接子目录；目录有 `package` 就 blank import，不校验是否真的 `host.Register` | 插件代码放在 `plugins/foo/plugin/*.go`，或目录是共享库 → 构建全绿、插件永不注册 | 追加"该目录（含一层子包）必须出现 `host.Register(`"校验，否则 exit 1 |
 | P3-20 | `cmd/bot/main.go:113-120`；`internal/instance/instance.go:94-97` | 文档说"第二个实例该用 wait=0"，实现恒传 2s | 双开时白等 2s（仅体验） | `if RestartedByReload() { 15s } else { 0 }` |
 | P3-21 | `cmd/bot/main.go:177` | `signal.NotifyContext` 注册在字体解析（约 300ms）、开库、迁移之后 | 这段窗口收到 SIGTERM 走默认处理，会话不落盘、systemd 看到被信号杀死 | 把信号注册提到 `config.Load` 之后 |
 | P3-22 | `cmd/bot/main.go:231-237` | `ctx.Done()` 与 `/reload` 同时就绪时 Go 随机选；选中 req 就把 Ctrl-C 变成重启 | 极窄窗口内关停变重启 | select 后先判 `ctx.Err() != nil` |
@@ -287,7 +289,7 @@ _ = s.db.RecordJobRun(wctx, ...)
 13. **`WithTimeout` 共享连接池与限流桶**：只替换 `hc`，`buckets` 指针保留，`host/http_test.go:187-213` 有断言。
 14. **`Params.Decode` 走 TOML 往返**，类型无损；空配置段返回零值不报错。
 15. **`termcolor` / `logx` 的契约正确**：`NO_COLOR` 空串视为未设置；非 `*os.File`/重定向/`TERM=dumb` 不上色；派生 handler 共享 `*sync.Mutex`，一条记录一次 Write。
-16. **`genplugins` 对空 `plugins/` 的产出合法**（只有 `package main`），不影响构建。
+16. **生成式装配对空 `plugins/` 的产出合法**（只有 `package main`），不影响构建——该工具已随 #41 删除。
 17. **`buildinfo` 与 devrun 的字面量当前一致**（`QQBOT_SUPERVISOR`/`QQBOT_RESTARTED`/75），只是重复定义、有漂移风险。
 18. **compact list 的 `TextBlock` 走 `textBlock` 是对的**，只有 `Paragraph`（松散列表）丢失间距。
 
