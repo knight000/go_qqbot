@@ -61,8 +61,8 @@ func TestStartFailsBeforeInitWhenConfigKeyMissing(t *testing.T) {
 		APIVersion:   host.APIVersion,
 		ConfigSchema: map[string]string{"delay": "duration"},
 	}}
-	cfg := &config.Config{Plugins: map[string]map[string]any{"demo": {"delay": "10s"}}}
-	cfg.Plugins["demo"] = map[string]any{} // 段存在但缺键
+	cfg := &config.Config{Plugins: config.Plugins{Sections: map[string]map[string]any{"demo": {"delay": "10s"}}}}
+	cfg.Plugins.Sections["demo"] = map[string]any{} // 段存在但缺键
 
 	c := newSchemaCore(t, cfg, ok, bad)
 
