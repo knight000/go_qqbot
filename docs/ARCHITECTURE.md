@@ -9,13 +9,15 @@
 | 编号 | 决策 | 结论 | 影响 |
 |---|---|---|---|
 | D1 | 语言栈 | **Go** | 单二进制、内存 15–40 MB、交叉编译直投服务器 |
-| D2 | 插件形态 | **P1 编译期注册** | 无 IPC、无版本错配；加插件需重编译（5–10 s） |
+| D2 | 插件形态 | **P3 子进程 + JSON-RPC**（ADR-0005 取代 P1） | 插件是独立产物、可单独升级；核心只依赖 `[]host.Plugin`；每插件一份 5–15 MB 的独立内存 |
 | D3 | 平台场景 | **个人主体已可开发 QQ 群 + 消息列表单聊** | 群/单聊为主战场；频道作为可选扩展 |
 | D4 | 出站 API | Torn 为机器人主动调用（非对外供接口） | 无需入站端口、无需反代与备案域名 |
 | D5 | 管理员重置 | 对话指令触发，**自建鉴权**（平台只给群内身份，不给 Bot 运维身份） | 需 `admins` 表 + 认领机制 + 二次确认 |
 | D6 | 群准入 | **白名单 / 黑名单两套独立开关，默认都开**；Bot 角色为全局角色（无群内委托） | 新增 `qq_groups` 表 + `/group` 指令；未授权群在去重前丢弃 |
+| D7 | 更新方式 | **`/upgrade` 是唯一入口**（ADR-0006）：owner 主动触发，双通道取元数据与二进制 | 二进制要落在可写目录；核心回滚带 DB 快照，插件回滚只是换回文件 |
 
-D1/D2 是耦合决策：Go 缺少可靠的运行时动态插件机制（`.so` 插件要求工具链与依赖版本完全一致），因此选择 Go 即等于选择 P1。
+D1/D2 的关系变了：Go 仍然缺少可靠的运行时动态加载（`.so` 对工具链与依赖图要求过严、Windows 上根本没有实现），所以"同进程动态加载"（P2）依然不成立；但**编译期注册**（P1）已被 ADR-0005 取代——插件改成独立可执行文件，核心作为宿主通过 stdio 上的 JSON-RPC 调用它们。D1 的"单二进制"因此变成"单核心二进制 + 若干插件产物"，仍不需要目标机上装 Go 工具链。
+
 
 D5 的前提有两层，必须分清：
 - **平台确实给了群内身份**：群消息事件的 `author.member_role` 直接是 `member / admin / owner`，不需要额外接口（§8.1）；
@@ -69,13 +71,17 @@ D5 的前提有两层，必须分清：
 | 项 | 预算 |
 |---|---|
 | 内存（核心） | 15–40 MB |
-| 内存（每插件，同进程） | +2–8 MB |
+| 内存（每插件，独立进程） | +5–15 MB（进程基线 + 该插件自己用到的依赖） |
 | 内存（`Event.Raw` 副本） | 实测（`BenchmarkDecodeGroupMessage`，win/amd64 + Go 1.26.1）：真实群消息载荷 482 B → 单条 `Raw` 副本 482 B，整次解码 **约 1.7 KB/op、23 allocs/op**（测量条件见下）。dispatch 工作池 16 并发满载时在途 Raw 约 16×482 B ≈ 7.5 KiB，全部解码分配约 16×1.7 KB ≈ 27 KiB；最坏情况每条都撞上限 → 工作池 16 条 = 512 KiB，加上每 peer 队列（深 16）里排队事件持有的副本，10 个群同时刷屏约 10×17×32 KiB ≈ 5.3 MiB，占 `MemoryMax=256M` 的 2% |
-| 二进制磁盘 | 19 MB 量级（实测：windows 19.22 MB / linux 19.03 MB，其中内嵌字体 6.2 MB） |
+| 二进制磁盘（核心） | **32.5 MB（linux/amd64）/ 33.4 MB（windows/amd64）**，含四个内嵌出厂插件（各自 2.88–2.99 MB / 3.06–3.19 MB）与 6.2 MB 内嵌字体；剥离调试信息的发布构建（`-s -w`） |
+| 二进制磁盘（每插件） | 2.9–3.2 MB（四个示例插件，含各自那份标准库） |
 | SQLite（1000–10000 条/天，留 7 天） | 5–40 MB |
 | 媒体配额 | 0 —— 入站不下载；出站图片存在平台侧，不占本地盘 |
 | 日志（journald 限额） | 200 MB |
-| 结论 | 20 GB 盘余量充裕；1 GB 内存下与 TS3/WebDAV 共存可行，但需 `MemoryMax` 约束 |
+| 结论 | 20 GB 盘余量充裕；1 GB 内存下与 TS3/WebDAV 共存可行，但需 `MemoryMax` 约束（P3 之后 `MemoryMax` 只约束核心，插件进程各有一份基线） |
+
+上面"32.5 / 33.4 MB"是本机实测（Go 1.27.3，`go run ./tools/build all`，`-trimpath -ldflags "-s -w"`，按 1000 进制计的字节数）。不含出厂副本的核心本体约 20.8 MB（linux）/ 20.9 MB（windows），与 P1 时代的 19.03 / 19.22 MB 相比只多出进程边界与升级相关的代码——四个插件的业务代码移出去之后，核心并没有变小，因为共享的字体、SQLite 与 SQL 驱动本来就占大头。`/upgrade` 预览里的尺寸走 `humanSize`（1024 进制），同一份产物显示为 31.0 MiB。
+
 
 `Raw` 那一行的换算方式：`go test ./internal/gateway -run '^$' -bench BenchmarkDecode -benchmem`
 给出的 `B/op` 是**单次解码**的总分配字节数；每个 dispatch worker 同一时刻只处理
@@ -132,7 +138,7 @@ D5 的前提有两层，必须分清：
 │  核心层  core/           ① 幂等去重  ② 消息落库  ③ 事件路由  ④ 频控/发送  ⑤ 调度器      │
 │                          ⑥ 媒体策略  ⑦ 留存 GC   ⑧ 统一 HTTP 客户端（重试/退避/白名单）  │
 ├─────────────────────────────────────────────────────────────────────────────────────────┤
-│  插件层  plugins/*       每个插件只拿到 Host 暴露的能力，不直连 DB / 不直连 WS             │
+│  插件进程 plugins/bin/* 每个插件只拿到 Host 暴露的能力（每条走 RPC），不直连 DB / 不直连 WS  │
 ├─────────────────────────────────────────────────────────────────────────────────────────┤
 │  存储层  store/          SQLite（WAL）+ 媒体目录（可关闭）+ journald                       │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
@@ -142,11 +148,13 @@ D5 的前提有两层，必须分清：
 
 ### 2.1 进程与并发模型
 
-- **单进程**，三组长期协程：`ws-loop`、`dispatch-pool`、`scheduler-loop`；外加一个周期性 `gc-loop`。`scheduler-loop` 每轮按插件分出若干个**短命**的桶协程（上限 4 个同时跑，见 §5.1），桶跑完即退。
-- **按 peer 串行**：同一 `peer_openid` 的事件进入同一队列，串行处理。理由有两个——① `msg_seq` 必须原子递增，否则并发回复同一 `msg_id` 会撞车；② 避免插件对同一用户并发查询。会话接管的判定与投递也在这个队列里（`Dispatcher.handle` 内，ADR-0004 决策 6），所以"推进会话"与"静态路由"不会并发打到同一个 peer。
+- **一个核心进程 + 每个插件一个子进程**（ADR-0005）。核心里有三组长期协程：`ws-loop`、`dispatch-pool`、`scheduler-loop`；外加一个周期性 `gc-loop`。`scheduler-loop` 每轮按插件分出若干个**短命**的桶协程（上限 4 个同时跑，见 §5.1），桶跑完即退。插件进程里只有一条读循环（`pkg/rpcsdk`）与每个入站请求一个协程——它不认识网关、数据库与调度器。
+- **插件只在装配期出现一次**：扫 `<datadir>/plugins/bin/` → 对每个可执行文件并行跑 `bin --manifest`（2 秒超时）→ 复用全部启动期校验（§3.2）→ 跳过 `[plugins].disabled` 里的名字 → spawn → 发 `init`（带 `[plugins.<name>]` 原始 map）→ 进入可路由状态。探测或校验失败**只让该插件不加载**（记 Error），不让整个启动失败：一个过期产物不该让机器人下线并进 systemd 重启循环白烧 Identify 配额。
+- **插件进程的崩溃与关闭**：非零退出按 1/2/4/8/16 分钟退避重启，连败 5 次停用该插件并私聊 owner（超时与崩溃共用这套计数，`Handle` 3 s / `Job` 60 s 由 RPC 层强制）；关闭走 RPC close → SIGTERM → Kill 三级，每级带超时，不留孤儿进程。`/reload` 与进程退出都走完这一套。
+- **按 peer 串行**：同一 `peer_openid` 的事件进入同一队列，串行处理。理由有两个——① `msg_seq` 必须原子递增，否则并发回复同一 `msg_id` 会撞车；② 避免插件对同一用户并发查询。会话接管的判定与投递也在这个队列里（`Dispatcher.handle` 内，ADR-0004 决策 6），所以"推进会话"与"静态路由"不会并发打到同一个 peer。P3 之后每条消息多一次进程跳转与序列化（亚毫秒量级），串行语义不变。
 - **跨 peer 并行**：工作池上限默认 16，超限排队而非丢弃。
 - 全程无阻塞 IO 占用工作池：所有 HTTP 带 `context` 超时（默认 5 s）。
-- **单实例由两把文件锁保证**，不是靠部署纪律。按「先 appID、后数据目录」的顺序取：
+- **单实例由两把文件锁保证**，不是靠部署纪律；它约束的是**核心进程**（插件都是它的子进程，随它生灭）。按「先 appID、后数据目录」的顺序取：
   ① appID 维度 `%TMP%/qqbot-<sha256(appID)[:16]>.lock`（可由 `QQBOT_LOCK_DIR` 换目录）——约束"这台机器上的这个 bot"，
   放在系统临时目录是因为它跟数据目录在哪无关，放在库旁边就又会退化成"换个目录就能双开"。
   部署单元带 `PrivateTmp=true` 时 `/tmp` 是 unit 私有命名空间，第二个 unit 会看到另一个
@@ -161,21 +169,23 @@ D5 的前提有两层，必须分清：
   （旧进程已先放手，只是保险），因为它是交接而不是竞争。只有 `[bot].shard_id`
   不同的分片部署是合法的多进程形态：同 appID 的多个进程即使库不同也会互顶网关
   session（`4902 reset by resume`）。
-- **启动顺序**：`config.Load` → **注册 SIGTERM/SIGINT** → 解析字体（约 300 ms）→
-  拿单实例锁 → 开库与迁移 → 起协程。信号注册必须紧跟配置加载：晚一步，这段窗口里
-  的 Ctrl-C 就走 Go 的默认处理，进程被直接杀死，session 不落盘，systemd 记成
-  `killed by signal` 而不是一次正常退出。
+- **启动顺序**：`config.Load` → **注册 SIGTERM/SIGINT** → 升级回滚判定（读 `<datadir>/upgrade/state.json`，
+  必须在拿锁与开库之前）→ 解析字体（约 300 ms）→ 拿单实例锁 → 开库与迁移 →
+  装配插件（探测 + spawn）→ `core.Start` → 起网关协程 → 30 秒观察窗（清升级标记）。
+  信号注册必须紧跟配置加载：晚一步，这段窗口里的 Ctrl-C 就走 Go 的默认处理，进程被直接杀死，
+  session 不落盘，systemd 记成 `killed by signal` 而不是一次正常退出。回滚判定必须在拿锁之前：
+  回滚的最后一步是重新执行自身，旧进程一个锁都不该握着，否则新进程会等一个永远不会释放的锁。
 - **开发期可由 supervisor 托管**：`tools/devrun` 在前台持有终端，把 `/reload` 变成
-  「退出码 75 → 重新 `go generate` + `go build` → 换掉磁盘上的二进制 → 拉起」。
-  这是唯一能让**新放入 `plugins/` 的插件生效**的路径：`/reload` 本身只重新执行
-  磁盘上已有的二进制，不重编译、不扫目录（插件由 `host.Register` 在 `init()` 注册，
-  链接哪些包取决于 `plugins_gen.go` 的 blank import）。
+  「退出码 75 → `go run ./tools/build all`（先插件、后核心）→ 换掉磁盘上的二进制 → 拉起」。
+  这是开发工作区里让**插件代码改动**生效的最省事路径；`/reload` 本身不编译，但核心重启后
+  会重新扫 `plugins/bin/`，所以单改插件也可以只换产物、再 `/reload` 一次。
   协议只有两个约定：环境变量 `QQBOT_SUPERVISOR=1`（由 devrun 注入）与退出码 75
   （`EX_TEMPFAIL`）。反过来说，**关停未在期限内完成时退出码是 1 而不是 75**：那不是
   "请重新编译"，supervisor 不会重启，systemd 按失败处理，等人来看。生产不设置该
   变量——服务器上没有源码与工具链，`/reload` 仍是换二进制后 execve，与本节前述行为一致。
   Windows 没有 `execve`，supervisor 也无法让 PID 保持不变；它解决的是「终端不释放」
   与「重载前重新编译」，不是进程替换语义。
+
 
 ### 2.2 三条数据流
 
@@ -193,23 +203,23 @@ D5 的前提有两层，必须分清：
 > （`docs/reviews/2026-10-20-nonebot2-review.md`）里对应的小节，落地票号见该文 §5.1。
 > 这类标注是**事实说明**，不是待办承诺：在对应票关闭之前，实现就是没有这项保障。
 
-### 3.1 三种插件形态（已定稿：P1）
+### 3.1 插件形态（当前：P3 子进程 + JSON-RPC）
 
-| 形态 | 加载方式 | 隔离 | 加插件成本 | 每插件内存 | 适用 |
+| 形态 | 加载方式 | 隔离 | 加插件成本 | 每插件内存 | 结论 |
 |---|---|---|---|---|---|
-| **P1 编译期注册** | 每个插件是一个 package，`main` 里 blank import 注册 | 无（同进程） | 重编译，Go 约 5–10 s | +2–8 MB | ✅ 自用、插件可信、追求低配 |
-| **P2 同进程动态加载** | Python `entry_points` / Node 动态 `import` | 无 | 免重编译 | Python 基线 90–150 MB 起 | 需要热插拔、写插件的人多 |
-| **P3 子进程 + JSON-RPC** | 核心 spawn 子进程，stdin/stdout 行分隔 JSON | 强（崩溃互不影响） | 免重编译、可独立升级 | +5–15 MB/进程 | 第三方/不可信插件、多语言 |
+| P1 编译期注册 | 每个插件是一个 package，`main` 里 blank import 注册 | 无（同进程） | 重编译核心 | +2–8 MB | **已由 ADR-0005 取代**（实现 #38–#42） |
+| P2 同进程动态加载 | Python `entry_points` / Node 动态 `import` | 无 | 免重编译 | Python 基线 90–150 MB 起 | 不成立（Go 没有可靠的运行时动态加载） |
+| **P3 子进程 + JSON-RPC** | 核心 spawn `<datadir>/plugins/bin/<name>`，stdio 上是长度前缀 JSON（§3.9） | 强（崩溃、内存、死循环互不影响） | 免重编译、可单插件升级 | +5–15 MB/进程 | **当前形态**（ADR-0005 定稿） |
 
-**已定稿：P1（Go 编译期注册）**——见决策记录 D1/D2。取舍理由保留如下，供日后复盘：
+P1 被取代的理由是三条硬代价，全都指向同一个需求——插件要能独立升级：
 
-1. 无 IPC、无序列化开销、无版本错配，是所有形态里**故障面最小**的；本场景最怕的是“半夜挂了没人管”，不是“加插件慢 8 秒”。
-2. 复用性并不因此受损：插件是独立 package，其他机器人项目 `import` 同一模块即可，复用在源码层而非二进制层。
-3. P3 的隔离收益在“插件由他人编写”时才成立。若后续真出现第三方插件，P3 可**增量叠加**（核心的 Host 接口正好是进程边界上的契约），不需要推翻重来。
+1. **加一个插件必须重编译核心**。P1 的装配靠"扫描 `plugins/` 目录 + 生成一份 blank import 清单"这一步完成；生成物不入库，克隆后忘了跑它，就得到一份"编译通过、插件不存在"的二进制。`git worktree` 出来的工作区必现，实际踩过两次。
+2. **插件更新等于核心更新**。所有插件与核心共用一个 git tag、一个发布节奏，改一行插件代码就要重发整个二进制。
+3. **第三方无法独立发版**。契约包当时是 `internal/host`，跨 module 引用不到，插件只能以嵌套克隆的形式活在核心仓里，还不能有自己的 `go.mod`。
 
-> 唯一硬伤：同进程插件 panic/死循环/内存泄漏会波及核心。对策见 3.6，但只能兜底，不能根治——这是选择 P1 时明确接受的代价。
+P2 仍然不成立：Go 的 `.so`（`plugin` 包）在 Windows 上没有实现、要求工具链与依赖图完全一致、不能卸载、panic 直穿宿主；WASM 的收益真实但 Go 的 `wasmexport` 太新、TinyGo 对 `reflect`/`encoding/json` 有缺口，而契约是强类型 Go 接口。剩下唯一成立的是子进程。
 
-若最终选择 Python 栈，则答案是 **P2**：`entry_points` 是 Python 生态的标准做法，热加载几乎免费，代价是内存基线高一个数量级。**插件形态的选择本质上被语言栈决定**，这两件事要一起定。
+代价（已接受，见 ADR-0005「Consequences」）：约 30 个 RPC 方法的实现成本、每条消息一次可能失败的 IPC、新的故障类（僵死/孤儿进程）、每个插件一份独立内存与 2.9–3.2 MB 的磁盘、调试从"一个调用栈"变成"两个进程的日志"。换回来的是：插件崩溃不带崩核心、加插件不需要 Go 工具链、`api_version` 从编译期错误变成可观测的运行期状态（启动报告里直接看到哪个插件因版本不匹配没装）。
 
 ### 3.2 插件契约
 
@@ -268,6 +278,8 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 
 `api_version` 是**整体匹配**：`Manifest.APIVersion` 必须与本核心的 `host.APIVersion` 完全相等，没有“兼容上一版”的余地。所以同期落地的互不兼容改动共用一个版本号，下表每一行都是“插件要跟着改什么”的完整清单。
 
+从 12 起，这条匹配发生在**运行期**：插件产物由核心 spawn，`Manifest` 由 `bin --manifest` 在装配期探测回来（2 秒超时），版本不匹配的表现是启动日志一条 Error + 该插件不加载，而不是编译失败。核心照常运行——一个过期产物不该让机器人整体下线（ADR-0005 决策 6）。
+
 | 版本 | 契约变化 | 票号 |
 |---|---|---|
 | 4 | 任务支持会话维度（`JobSpec.PerPeer` / `JobSpec.Peer`），`JobRunner` 可能收到非空的 `Peer` | — |
@@ -278,7 +290,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16 |
 | 10 | ① `host.Params.Str` 区分「键缺失」与「键存在但为空串」：空串返回 `""` 而不是默认值；② `Host.Store.Query` 的只读改由 SQLite `query_only` 连接保证、SQL 原样执行（不再自动追加 `LIMIT`），行数在取行时截断到 1000 | #30 |
 | 11 | `host` 导出主动消息的三个失败哨兵 `ErrActiveQuota` / `ErrActiveDisabled` / `ErrRateLimited`：`SendActive` 的返回错误用 `errors.Is` 可判，插件不必 import `internal/core` 就能把「今日预算已满」「配置未开启」「平台 429」分成三条处置路径。**调用签名未变**，插件只需把 `api_version` 改成 11 | #34 |
-| 12 | 契约包 `internal/host` → `pkg/host`：独立 module 的插件现在能直接 import，插件不必再与核心共用一次构建。**`Host` 的方法签名一个字都没变**，变的是「不匹配」的含义——11 及以前是编译错误，12 起是运行期握手拒绝（插件照常编译通过，核心拒绝加载并写进启动报告）。实现侧 `Options.HTTP` 的类型从 `*httpx.Client` 换成 `pkg/host.HTTPBackend`（契约包不再依赖实现包），插件侧 `HTTP` 接口与错误口径不变。同一版本起 `Host` 的载体是**线协议**，帧格式、方法表与错误码见 §3.9 | #38 / #39 |
+| 12 | 契约包 `internal/host` → `pkg/host`：独立 module 的插件现在能直接 import，插件不必再与核心共用一次构建。**`Host` 的方法签名一个字都没变**，变的是「不匹配」的含义——11 及以前是编译错误，12 起是运行期握手拒绝（插件照常编译通过，核心拒绝加载并写进启动报告）。实现侧 `Options.HTTP` 的类型从 `*httpx.Client` 换成 `pkg/host.HTTPBackend`（契约包不再依赖实现包），插件侧 `HTTP` 接口与错误口径不变。同一版本起 `Host` 的载体是**线协议**，帧格式、方法表与错误码见 §3.9；插件产物是独立可执行文件（`rpcsdk.Serve(host.Plugin)`），由核心在 `<datadir>/plugins/bin/` 发现并 spawn，`Manifest` 经 `--manifest` 探测，其余能力每次调用过一次 RPC | #38 / #39 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
@@ -328,62 +340,76 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 - 命中结果随事件回传：核心在选定这个匹配者之后、调用它的 `Handle` 之前写入 `Event.Command` / `Event.Args`（语义见 §3.2），插件侧不再出现 `CutPrefix` / `HasPrefix` 分派。一次派发跑多个插件时（下面的让位链），每个插件拿到的是**它自己**命中那条命令的 `Command/Args`。
 - `yield` 是**每个匹配者自己的声明**，不是中标者的个人属性。同 priority 的候选按上面的顺序排队逐个执行：谁写 `yield=true`，谁处理完就让位给组内下一个；第一个 `yield=false` 的插件执行完，组内**剩下的一律不执行**（不是“跳过它继续”）。`aaa`（100，`yield=false`）与 `zzz`（100，`yield=true`）同时命中时只跑 `aaa`，`zzz` 因 `aaa` 阻断而未执行；反过来两者都跑。这个阻断关系在 full 级轨迹里每个被挡住的插件各占一行（`未执行 · 插件 … （… 未让位）`），不再有“静默不执行”。组内**无权限**的候选照旧跳过并记一行 `权限不足`，跳过本身不改变“是否继续”。
 - **跨 priority 不扇出**：`yield` 只在同 priority 组内生效。高优先级插件让位，去处是同组的下一个匹配者，不是低优先级插件——低优先级仍只在前者全部无权时才可能被考虑。
-- **核心保留前缀**：`/claim`、`/admin`、`/group`、`/reset`、`/reload`、`/restart` 由核心以最高优先级独占处理，插件在启动期若声明了相同前缀，**直接拒绝加载并报错**。否则一个第三方插件就能劫持重置指令，等于把第 8 章的鉴权整个绕过去。清单必须与 `handleReserved` 的 case 严格对应——多列一个会白占名字，少列一个会让核心静默遮蔽插件声明的同名命令。`/grant`、`/revoke` 的功能已由 `/admin add|rm` 取代，指令删除后名字一并释放。
+- **核心保留前缀**：`/claim`、`/admin`、`/group`、`/reset`、`/reload`、`/restart`、`/upgrade` 由核心以最高优先级独占处理，插件在启动期若声明了相同前缀，**直接拒绝加载并报错**。否则一个第三方插件就能劫持重置指令，等于把第 8 章的鉴权整个绕过去。清单必须与 `handleReserved` 的 case 严格对应——多列一个会白占名字，少列一个会让核心静默遮蔽插件声明的同名命令。`/grant`、`/revoke` 的功能已由 `/admin add|rm` 取代，指令删除后名字一并释放。
 
-### 3.5 插件目录与复用方式
+### 3.5 插件目录、产物与安装
+
+**仓内布局**
 
 ```
 qqbot/
-  cmd/bot/main.go              入口，集中注册插件（P1 的唯一“装配点”）
-  internal/gateway/            WSS 状态机、心跳、resume、分片
-  internal/core/               路由、幂等、频控、调度、媒体、GC
-  pkg/host/                    插件契约与 Host 实现（插件唯一可见的 API）
-  internal/store/              schema、迁移、GC
-  internal/httpx/              统一出站客户端
-  plugins/qqbot-plugin-torn/   插件：Torn 查询（独立仓的嵌套克隆，未跟踪）
-  plugins/echo/                插件：最小示例，兼作契约回归用例
-  config/config.toml           全局配置，插件配置在 [plugins.<name>]
-  deploy/qqbot.service
-  docs/ARCHITECTURE.md
+  cmd/bot/                        入口：启动、init、重启；唯一的装配点
+  pkg/host/                       插件契约与 Host 能力实现（插件唯一可见的 API）
+  pkg/rpc/ pkg/rpcsdk/            线协议 / 插件侧入口（rpcsdk.Serve）
+  internal/pluginproc/            发现、--manifest 探测、spawn、退避重启、三级关闭
+  internal/pluginbundle/
+    dist/<os>_<arch>/             出厂插件产物（go:embed 的源，不入库，只留 .gitkeep）
+  plugins/echo/cmd/echo/main.go   示例插件的产物入口（四个示例都是这个形状）
+  tools/build/                    构建入口（插件 → 核心的固定顺序）
+  internal/config/config.example.toml   示例配置源文件（init 写出它的内嵌副本）
 ```
 
-`pkg/host` 是**契约包**：只放接口、类型、哨兵与常量，**不得 import 任何 `internal/*`**（含 `internal/httpx`，见下），也**不依赖任何 `knight000` 的包**——`go list -deps ./pkg/host` 除自身外只有标准库与一项叶子依赖 `BurntSushi/toml`（`Params.Decode` 用，零传递依赖，核心与插件本来就都要它）。这条约束现在是编译期的，P3 之后是**线协议**的：契约一旦依赖实现包，等于把一个实现细节永久烧进跨进程格式（ADR-0005 决策 1）。
+**运行期布局**（`<datadir>` = `[store].path` 的目录，全仓唯一口径）
+
+```
+<datadir>/plugins/bin/<name>      # 装着就是装着，删掉就是卸载
+<datadir>/upgrade/state.json      # pending 升级标记
+<datadir>/upgrade/snapshots/      # VACUUM INTO 快照，保留 2 份
+```
+
+**构建顺序是硬约束**：核心的 `//go:embed` 在编译期就要看到插件产物。
+
+```bash
+go run ./tools/build plugins    # 四个示例插件 → internal/pluginbundle/dist/<os>_<arch>/
+go run ./tools/build core       # 核心（embed 上一步的产物）
+go run ./tools/build all        # 等价于依次跑这两步
+go run ./tools/build all -target linux/amd64 -o bin/qqbot   # 交叉编；-o 只作用于核心
+```
+
+产物目录固定在 `internal/pluginbundle/dist/<os>_<arch>/` 而不是仓库根：`//go:embed` 的模式不得引用包目录之外的文件，这是唯一可行的位置。`-o` 对 `plugins` 可以改目录（调试用），但 `all` 的 `-o` 只作用于核心——插件必须写进 embed 目录，否则下一步编译直接失败。
+
+**内嵌副本只作释放源**。运行期的事实源永远是 `<datadir>/plugins/bin/` 里的文件：在就是装着，不在就是没装。启动期不释放、不自愈（`删除 = 卸载` 是合法语义），释放只发生在显式命令 `qqbot init --plugins` 里。干净克隆里 `dist/<os>_<arch>/` 只有 `.gitkeep`，所以自编的核心**没有出厂插件**——`init --plugins` 会报 `本产物没有出厂插件副本`，发布版才有。
+
+**安装与停用**
+
+| 动作 | 做法 |
+|---|---|
+| 安装出厂插件 | `qqbot init`（首次，写配置 + 建数据目录 + 释放四个插件）或 `qqbot init --plugins`（只补缺失） |
+| 安装第三方插件 | 把可执行文件放进 `<datadir>/plugins/bin/`（名字只是给人看的，身份以 `Manifest.Name` 为准） |
+| 卸载 | 删掉那个文件；下次启动就不在了 |
+| 临时停用 | `[plugins].disabled = ["echo"]`（核心侧不 spawn，产物保留） |
+| 升级单个插件 | `/upgrade plugin <名称\|all>`（§9.2） |
+
+`disabled` 是 `[plugins]` 下的**保留键**：TOML 里它与 `[plugins.<name>]` 处在同一张表，键名被核心占用，插件不能叫 `disabled`。两者的语义刻意不同——`disabled` 是"装而不跑"，`[plugins.<name>].enabled` 仍是插件自己的功能开关。
+
+**示例插件与第三方插件的区别**：四个示例与核心**同一个 module**（`plugins/<name>` 是核心模块里的包），只是各自编成独立可执行文件——它们要跟核心一起测、一起随仓发布。第三方插件可以是独立 module，直接 `require github.com/knight000/go_qqbot`，用 `rpcsdk.Serve(&Plugin{})` 作为 `main`，产物放进 `plugins/bin/` 即可；它不参与核心构建，也不需要 Go 工具链在目标机上。
+
+`pkg/host` 是**契约包**：只放接口、类型、哨兵与常量，**不得 import 任何 `internal/*`**（含 `internal/httpx`，见下），也**不依赖任何 `knight000` 的包**——`go list -deps ./pkg/host` 除自身外只有标准库与一项叶子依赖 `BurntSushi/toml`（`Params.Decode` 用，零传递依赖，核心与插件本来就都要它）。P3 之后这条约束就是**线协议**的边界：契约一旦依赖实现包，等于把一个实现细节永久烧进跨进程格式（ADR-0005 决策 1）。
 
 出站 HTTP 就是这条边界的实例：契约包只定义 `HTTPBackend`（四个 JSON 方法 + `WithTimeout`），怎么发请求全在 `internal/httpx`，怎么把非 2xx 翻成 `*host.HTTPStatusError` 在 `hostHTTP` 适配器里，怎么按 `Manifest.AllowedDomains` 收窄客户端在 `Core.hostHTTPBackend`（装配点，`WithDomains` 只在那里调一次）。三件事都在核心，契约侧只留接口。`Host` 的实现（`Service`）也在同一个包里，但它只引用本包内定义的窄接口（`KVBackend` / `Sender` / `HTTPBackend`），实现一律由装配点注入。
 
-**Go 构建不拆分**：私有插件不是独立 module，也不是 submodule——它是放在 `plugins/<repo>/` 下的一个**嵌套克隆**，被 `.gitignore` 忽略，随核心模块一起编译。
-
-**双工作区**：
-
-```
-go_qqbot/                       核心工作区：只带示例插件，git pull 即更新
-qqbot-plugin-torn/              插件工作区：核心仓的克隆
-  plugins/qqbot-plugin-torn/    ← 插件仓（自己的 .git），commit/push 只影响它自己
-  cmd/bot/plugins_gen.go        ← 生成物，未跟踪：把 plugins/ 全部插件编进二进制
-```
-
-- **核心更新**：两个工作区各自 `git pull`。插件目录被忽略，外层 pull 不会与插件的本地提交冲突，也不需要 bump 指针。
-- **插件更新**：进入 `plugins/<repo>/` 提交推送，不产生任何核心仓提交。
-- **编进二进制**：放入 `plugins/<repo>/` 后跑一次 `go generate ./cmd/bot`，`tools/genplugins` 扫描目录、生成 `cmd/bot/plugins_gen.go`（一行一个 blank import）。生成物不入库，所以核心仓永远只带 `main.go` 里写死的示例插件，克隆即可构建。
-- **插件目录不能有 `go.mod`**：嵌套模块会让 `go build ./...` 静默跳过它。要单独跑测试就在工作区里 `go test ./plugins/<repo>/...`。
-- **生成器的判据是 `host.Register(`**：目录（含**一层**子包）里必须出现过这个调用，光有 `package` 不算。插件代码放在 `plugins/foo/plugin/`、根包只做 blank import 转发，是合法形态；而目录里有源码却找不到 `host.Register(` 会直接 exit 1，不会生成一个"编译全绿、指令没反应"的空 import。
-
-**为什么需要「生成」这一步**：Go 的 import 是静态的，编译器不会去发现目录里的包，`go build ./...` 只编译不链接，未 import 的包会被丢弃。所以"放入即生效"在 Go 里没有零步骤方案；生成器是成本最低的那个——它只做一层目录扫描 + 读 Go 源码找 `host.Register(`，**不编译、不加载**，不到 200 行，无第三方依赖。
-
-推论：同一个核心提交在不同工作区可能产出不同二进制（取决于 `plugins_gen.go` 生成时目录里有什么）。这是「核心不引用业务插件」的代价，换来核心仓克隆即可构建、插件仓有独立提交历史。
-
-> 为什么不拆成独立 module（现状）：契约**已经**移出 `internal/`（`pkg/host`，#38），所以「另一个模块路径 import 不到」这个理由不再成立——P3 的插件正是独立 module 并直接 `require` 核心（ADR-0005 决策 1）。但插件**当前仍随核心模块一起编译**：`plugins_gen.go` 与 `go generate` 那一套还没拆（那是 #41 的范围），所以上面「插件目录不能有 `go.mod`」暂依旧成立。
-
-⚠️ `git clean -xdf` 会连同插件目录里的 `.git` 一起删掉——插件仓有未推送提交时不要跑。
+**调试插件的两条基本约束**：stdout 是协议通道，任何调试输出都必须走 stderr（`Host.Log()` 与默认 slog 都是 stderr）；插件的日志由核心按行抓取、加 `plugin=<name>` 前缀后重放进核心日志（§3.9）。
 
 ### 3.6 隔离与超时
 
 | 措施 | 参数 |
 |---|---|
-| panic 捕获 | `Handle` 与 `Job` 都包 `recover`：`Handle` panic 记日志与堆栈、不回复；`Job` panic 只转成 error（无堆栈），计入该任务的失败次数 |
-| 超时 | `Handle` 固定 3 s（硬编码在 `core.NewDispatcher` 调用处，不可配置）；`Job` 由 `JobSpec.Timeout` 指定，`<=0` 时取 60 s |
-| 连续失败熔断 | 只有**任务级**：同一任务（一行 `jobs`）连续失败 5 次 → 该任务置 `enabled=0` 并告警，退避 1/2/4/8/16 分钟（§5.2）。`Handle` 失败**只记日志**，不累计、不禁用插件——**插件级熔断当前未实现**（评审 §4.7 第二行） |
-| 内存 | 进程级 `MemoryMax=256M`；插件级无法单独限制（P1 的固有短板） |
+| 进程隔离 | 每个插件是独立子进程：崩溃、死循环、内存泄漏都只影响它自己。核心继续跑，路由把该插件的调用判为 `ErrUnavailable`（"正在退避/已停用"），不是把整个机器人拖下水 |
+| panic | 插件侧 `pkg/rpc` 的 handler 包 `recover`，panic 转成码 13（`ErrHandlerPanic`）回给调用方——一次调用失败，进程不倒；核心侧 `Handle` / `Job` 仍各有一层 `recover` 兜底 |
+| 超时 | `Handle` 3 s、`Job` 60 s，由 **RPC 层强制**（`CallHandle` / `CallRunJob`），不是靠调用点记得设；调用方给了截止时间就照用，没给才按常量兜底。跨进程不放宽（ADR-0005 决策 7） |
+| 崩溃重启 | 子进程非零退出按 1/2/4/8/16 分钟退避重启 |
+| 连续失败熔断 | **两套**：① 插件级——同一插件的超时与崩溃共用计数，连败 5 次停用该插件（记一条 Error，进程被收掉；**当前不发主动私聊**，核心侧没有给运维告警的通道）；② 任务级——同一任务（一行 `jobs`）连续失败 5 次置 `enabled=0` 并告警（§5.2） |
+| 内存 | `MemoryMax=256M` 作用在 unit 的 cgroup 上，**核心与它的所有插件子进程共享这一份上限**；单个插件无法再单独限制 |
 
 ### 3.7 依赖清单（Go，D1/D2 定稿后）
 
@@ -520,9 +546,9 @@ P3 之后核心与插件是**两个进程**，之间只有一条 stdio 通道。
 
 **数值保真**。JSON 里的数字默认变成 `float64`，而 TOML 与 SQLite 给的都是 `int64`。收侧统一 `UseNumber` 再把整数收回 `int64`，否则两处会静默走样：配置里的 `n = 7` 变成 `7.0` 后被 `Params.Decode` 解进 `int` 字段会直接报错；查询结果里的整数列变成 `float64` 会让 `row["n"].(int64)` 这类常规断言失败——而且**只在跨进程时**失败。HTTP 出参是唯一的例外：核心侧把它当 `json.RawMessage` 原样转回，收侧按插件自己的类型解，与进程内那条路逐字一致（包括「数字就是 float64」这件事）。
 
-**已知取舍**：`host.Query` 的 BLOB 列以 base64 字符串到达（JSON 没有 bytes）；`Event.Raw` / `Payload`（≤32 KiB）走 JSON 而不是正文槽，代价约 30% 编码开销，换来「正文槽只有一个、语义唯一」；`ImageSourceFile` 的**路径原样过通道**——进程内它是「插件进程能读到的那个路径」，跨进程后由核心照着同一个字符串去读，两个进程的工作目录与挂载不一定相同。这条待复核：要么在 #40 的装配点把插件的工作目录固定成与核心一致，要么改成「插件自己读到内存再用 `ImageFromBytes`」，那是契约措辞的改动，不在本票。
+**已知取舍**：`host.Query` 的 BLOB 列以 base64 字符串到达（JSON 没有 bytes）；`Event.Raw` / `Payload`（≤32 KiB）走 JSON 而不是正文槽，代价约 30% 编码开销，换来「正文槽只有一个、语义唯一」；`ImageSourceFile` 的**路径原样过通道**——进程内它是「插件进程能读到的那个路径」，跨进程后由核心照着同一个字符串去读。这条已经按「子进程继承核心的工作目录」收口：`pluginproc.startProcess` 不设 `cmd.Dir` / `cmd.Env`，所以两边的 cwd 逐字相同，`deploy/qqbot.service` 的 `WorkingDirectory` 就是它们共同的工作目录；剩下的差异只有文件系统权限（同一 unit、同一账号，实际不存在）。
 
-**本票不做**：spawn、`--manifest` 探测、退避重启与熔断在 #40；`plugins/bin/` 的释放、`/upgrade` 与文档收口在 #41–#46。
+**配套的另外两节**：spawn、`--manifest` 探测、退避重启与熔断在 §3.5 / §3.6；`plugins/bin/` 的安装与释放、`/upgrade` 在 §3.5 与 §9.2（实现 #40–#45）。
 
 ---
 
@@ -1177,11 +1203,18 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=qqbot
-WorkingDirectory=/opt/qqbot
-ExecStart=/opt/qqbot/bin/qqbot -c /etc/qqbot/config.toml
+# 二进制与数据目录同一棵可写树：/upgrade apply 要在同卷把 <exe>.new 换成
+# <exe>（ADR-0006 决策 5），而 ProtectSystem=strict 让 /opt 只读
+WorkingDirectory=/var/lib/qqbot
+ExecStart=/var/lib/qqbot/bin/qqbot -c /etc/qqbot/config.toml
 # 双保险：cron 与主动消息日预算都由程序内的 Asia/Shanghai 决定（不读 TZ），
 # 但 Debian 12 默认 UTC，日志时间戳与任何依赖本地时区的库都会偏 8 小时
 Environment=TZ=Asia/Shanghai
+# 单实例锁的 appID 维度默认放系统临时目录，而 PrivateTmp=true 让 /tmp 成为
+# unit 私有命名空间：两个 unit 各看一个 /tmp，两把锁互不可见
+RuntimeDirectory=qqbot
+RuntimeDirectoryMode=0700
+Environment=QQBOT_LOCK_DIR=/run/qqbot
 # 认证已写入 /etc/qqbot/config.toml（600）。若改用环境变量覆盖，再启用下面一行
 # EnvironmentFile=-/etc/qqbot/env
 Restart=on-failure
@@ -1193,24 +1226,80 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# 一棵可写树覆盖全部运行期写入：库与 WAL、plugins/bin、upgrade/（标记与快照）、
+# 以及自更新要替换的 bin/qqbot（与它的 .new / .old 同目录）
 ReadWritePaths=/var/lib/qqbot
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+`ExecStart` 指向 `/var/lib/qqbot/bin/qqbot` 而不是 `/opt/qqbot/bin/qqbot`：自更新要求目标目录对服务账号可写，而 `ProtectSystem=strict` 把 `/opt` 与 `/usr` 一起钉成只读。另一条路是给 `/opt/qqbot/bin` 加 `ReadWritePaths`——能跑，但等于把「程序目录只读」这一条加固面放开：升级通道本身就是远程代码执行通道，再给它一块系统级的可写程序目录只是扩大攻击面，换来的仅仅是一个路径写法。`/var/lib/qqbot` 本来就要写，把 `bin` 放进去不需要新增任何一条 `ReadWritePaths`。
+
+`WorkingDirectory` 与数据目录重合：插件子进程不设 `cmd.Dir` / `cmd.Env`（`pluginproc.startProcess`），cwd 直接继承核心；`[store].path` 若写相对路径就是相对它解析的。
+
+unit 之外必须先建好的东西（缺一个就起不来，或者 `init` 写不进去）：
+
+| 路径 | 谁建 | 说明 |
+|---|---|---|
+| `/var/lib/qqbot`、`/var/lib/qqbot/bin` | 安装步骤（`install -d -o qqbot`） | `ReadWritePaths` 与 `ExecStart` 都指这里 |
+| `/var/lib/qqbot/bin/qqbot` | 安装步骤（`install -m 0755`） | 首次启动前必须存在 |
+| `/etc/qqbot/config.toml` | `qqbot init`（0600） | 含 AppSecret，属主 qqbot |
+| `<datadir>/plugins/bin/` | `qqbot init` / `init --plugins` | 四个出厂插件；没有它核心照常启动，只是 `plugins=0` |
+| `/var/lib/qqbot/upgrade/` | 首次 `/upgrade` 或启动期回滚判定 | 标记与快照，需可写 |
+| `/run/qqbot` | systemd `RuntimeDirectory` | 单实例锁目录，0700 |
+
 `StartLimitBurst=5 / 300 s` 是刻意配的：**防止 session 配额（1000/天）被重启循环吃掉**。配置错误时应停在 failed 状态等人看，而不是无声重试一整夜。网关的**永久性关闭码**（下架 4914、封禁 4915、intents 无权限 4014、分片参数错误 4010 等）走同一条路：进程以退出码 1 退出、不再自己重连，由 `StartLimit` 把"反复因封禁而重启"收敛成一次人工介入。
 
-### 9.2 升级流程
+### 9.2 升级与回滚
 
-1. 进程收到 `SIGTERM` → 停止收新事件 → 落 `session_id`/`seq` → 关闭 WSS（不主动 Identify 关闭）。
-2. 替换二进制 → `systemctl restart`。
-3. 启动后优先 **Resume**（带 `session_id` + `seq`），失败（4006/4009）才 Identify。这一步能避免每次发布都消耗一次 Identify 配额并丢失断线期间的事件。
+`/upgrade` 是唯一的更新入口（ADR-0006）：owner-only、只在人敲命令时发请求，启动期不检查、不自愈、也不未经允许换二进制。
 
-**契约 8 的额外一步**：`config_schema` 从这一版起真正在装配期生效（**声明即必填**，§3.2）。
-升级前先核对每个第三方插件声明的 `config_schema`：带代码默认值的键要么从 schema 里删掉
-（这些键本来就允许不写），要么在 `[plugins.<name>]` 里补齐值——否则本次升级会以「缺键」
-启动失败。本仓的 echo / bootnotice 已按此原则删掉了全部 schema 声明。
+| 命令 | 行为 |
+|---|---|
+| `/upgrade` | 预览：当前版本、最新版本、核心产物大小、插件升/跳过清单。**不改动任何文件** |
+| `/upgrade apply` | 核心升级：快照 → 下载 → 校验 → 落位 → 回消息 → 重启换盘 |
+| `/upgrade plugin <名称\|all>` | 插件升级：下载 → 校验 → 换文件 → 只重启那个子进程 |
+| `/upgrade status` | 当前版本、有没有未确认的升级、上次失败原因（只读本地状态，不发请求） |
+
+**配置**（`[upgrade]` 四键）：`enabled`（false 时连检查都不发请求）、`api_base`（元数据：`index.json` 与 `checksums.txt`）、`asset_base`（二进制，可指向镜像）、`token`（私有仓凭据，只需 Contents: read）。`checksums.txt` / `index.json` **永远**从 `api_base` 取：镜像被投毒时二进制变了、校验和没变，sha256 必然对不上。填了 `token` 之后三份产物全部改走 `api_base` 的 release asset 端点（私有资产在镜像上匿名取不到），`Authorization` 头也只发给 `api_base` 的主机——绝不把 GitHub 凭据送给用户可配置的镜像（ADR-0006 决策 13）。版本是 `dev` 时一律拒绝（`dev` 无法参与版本比较，`-ldflags -X` 注入是发布版本号的唯一来源）。
+
+**发布产物形状**（CI，`.github/workflows/release.yml`）：
+
+```text
+qqbot-<version>-windows-amd64.exe
+qqbot-<version>-linux-amd64
+qqbot-<version>-linux-arm64
+checksums.txt          # sha256，覆盖以上三个核心产物
+index.json             # 插件版本与各平台资产的 sha256（仓内路径 plugins/index.json）
+```
+
+构建顺序固定：先 `tools/build plugins` 产出三个平台的插件 → GoReleaser 编核心并算 `checksums.txt` → `tools/index` 现算插件 sha256 写 `index.json` → 把发出去的资产下载回来冒烟。
+
+**核心升级的时序**（每一步的位置都有原因）：
+
+1. `VACUUM INTO` 快照到 `<datadir>/upgrade/snapshots/`（保留最近 2 份）；
+2. 按 `api_base` 取 `checksums.txt` 与本平台产物的 sha256，从 `asset_base`（或有 token 时的 `api_base`）流式下载到 `<exe>.new`，边写边算 sha256，长度与哈希都对上才继续；
+3. 写 `<datadir>/upgrade/state.json`（目标版本、旧文件、尝试次数）——**必须在换盘之前**，它是"进程已经没法自救"时唯一的线索；
+4. 回一条消息（被动回复窗口重启后就不存在了）；
+5. 关网关、落 `session_id`/`seq`、关停核心与插件、关库；
+6. `rename(<exe>, <exe>.old)` → `rename(<exe>.new, <exe>)` → 重新执行自身。
+
+Unix 用硬链接做 `.old`（秒级，不复制 30 MB），Windows 依赖"运行中的 exe 可以改名"；`exec` 失败时进程还活着，可以 `rename` 回去再重启一次——同步错误在进程内就能收住。
+
+**回滚**：
+
+- **核心**带 pending 标记：新进程起来后观察 30 秒（`core.Start` 完成 + 网关协程存活），稳定就删标记；启动时若还看到标记，`attempts` 加一，`> 1` 判定回滚——把 `.old` 换回来并重新执行自身，日志是一条 Error。判定用"存活 30 秒"而不是"网关连上"：网络抖动不该触发回滚。已知边角：30 秒内敲 `/reload` 会让 `attempts` 多加一次，可能误判回滚（代价是退回上一版，再敲一次即可）。
+- **插件**不套 pending 标记：新进程 5 秒内没完成 `init` 握手就自动换回旧产物并重启，成功则只记一条 Warn。插件无状态、无迁移，回滚就是换文件——给它也背上快照与状态机只会让"换个插件"变成"换核心"。
+- **数据库**回滚只能靠快照：回滚二进制不等于回滚 schema，安全窗口只有一个版本且要求迁移只增不减；跨破坏性迁移时停服务、把快照拷回 `[store].path`（并删掉 `-wal` / `-shm`）。
+
+**插件升级与核心升级的差别**：`/upgrade plugin` 校验通过后直接换文件、重启那一个子进程，回复即最终结果；核心升级时会顺带落位"版本更高"的插件产物（只升不降，跳过更高或无法比较的，理由见 ADR-0006 决策 7），落位在关停之后按 rename 规则执行，`.<name>.new` / `.<name>.old` 用点开头——装配期扫目录只认非点开头的文件，残留的备份不该被当成插件探测。
+
+**离线 / 救火**：停服务 → 手工换 `/var/lib/qqbot/bin/qqbot`（0755）→ 删 `upgrade/state.json` 与 `qqbot.new` → `qqbot init --plugins` 补回缺失的出厂插件 → 启动。这条路不需要 `/upgrade`，也不需要 Go 工具链。
+
+**并发**：同一时刻只允许一次升级（`Apply` / `UpgradePlugins` 共用一把 CAS），第二个请求直接回「已有一个升级在进行中」。
+
+**契约 8 的历史约束**：`config_schema` 从契约 8 起在装配期生效（**声明即必填**，§3.2）。升级前核对每个第三方插件的 `config_schema`：带代码默认值的键要么从 schema 删掉，要么在 `[plugins.<name>]` 里补齐值——否则启动会以「缺键」失败。本仓的 echo / bootnotice 已按此原则删掉了全部 schema 声明。
 
 ### 9.3 日志与磁盘
 
@@ -1243,7 +1332,9 @@ WantedBy=multi-user.target
 | 中 | **管理员鉴权来源单一**：平台给群内身份，不给 Bot 运维身份，只能靠本地 allowlist | 认领令牌 + owner/admin 分离 + 全局角色；官方若开放 Bot 级身份则升级为双因子 |
 | 中 | **空白名单自锁**：白名单默认开启且初始为空 → 所有群消息被丢弃 | 启动时 warn；未入名单的群里放行 Bot 管理员的 `/group allow` 自助接入；也可私聊 `/group list` 按 id 添加 |
 | 中 | 认领令牌泄露 → 他人抢先成为 owner | 一次性 + 10 min 过期 + 仅打印到本机 journald；认领后不再可用 |
-| 中 | P1 同进程插件无隔离，插件 panic/内存泄漏波及核心 | `recover` + 超时 + **任务级**熔断（仅调度器，§5.2）+ `MemoryMax`；插件级熔断未实现——`Handle` 连续失败不会自动禁用插件（§3.6） |
+| 中 | **插件进程失控**：僵死、孤儿、反复崩溃，或一个插件吃掉整份内存 | 每个插件独立进程（崩溃不带崩核心）+ 1/2/4/8/16 分钟退避重启 + 连败 5 次停用 + RPC close→SIGTERM→Kill 三级关闭 + cgroup 级 `MemoryMax=256M`（核心与全部插件共享）；单插件无法再单独限内存（§3.6） |
+| 中 | **升级通道是远程代码执行通道**：服务账号能改自己的二进制 | owner-only + SHA-256 双通道校验 + 私有源 token + 核心回滚带 DB 快照；残余风险（上游仓库/账号被 takeover）明写在 ADR-0006 决策 4（§9.2） |
+| 中 | **升级后新版本起不来**：核心在无人值守时被换成坏版本 | pending 标记 + 30 秒观察窗 + `.old` 自动回滚；插件 5 秒握手失败自动换回旧产物（§9.2） |
 | 中 | SQLite 与 aria2 同机争 IO，出现 `database is locked` | `busy_timeout=5000` + 单写连接 + 分批 GC |
 | 中 | botgo 维护频率低于 botpy | 把 botgo 当协议参考而非黑盒；opcode 状态机保留独立可替换层 |
 | 中 | 沙箱“免频控”仅频道场景有明文，群场景未明确 | 群场景按受限设计，压缩批量回复 |
