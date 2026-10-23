@@ -1,9 +1,9 @@
 // Command devrun 在开发工作区托管 qqbot：把 /reload 从「换进程映像」升级为
-// 「重新生成装配 → 编译 → 替换二进制 → 拉起」。
+// 「重新产出插件产物 → 编译核心 → 替换二进制 → 拉起」。
 //
-// 为什么需要它：Go 的插件是编译期注册的，重新执行同一份二进制不会让新放入
-// plugins/ 的插件生效，只有重新编译才行。而 Windows 没有 execve，qqbot 自己
-// 重启只能 spawn 后退出，shell 立刻拿回提示符——终端体验是断的。让一个不死的
+// 为什么需要它：开发期改的是源码，/reload 必须先把插件产物与核心重新编出来
+// （构建顺序由 tools/build 收口）；而 Windows 没有 execve，qqbot 自己重启
+// 只能 spawn 后退出，shell 立刻拿回提示符——终端体验是断的。让一个不死的
 // 父进程持有终端，两个问题一起解决。
 //
 // 用法（在工作区根目录）：
@@ -52,8 +52,8 @@ func usage() {
 	fmt.Fprint(os.Stderr, `用法：go run ./tools/devrun [qqbot 的参数...]
 
 在工作区根目录托管 qqbot：
-  - 启动前执行 go generate ./cmd/bot 与 go build ./cmd/bot
-  - /reload 时重新生成、编译、替换二进制并拉起，终端不释放
+  - 启动前执行 go run ./tools/build all（先编插件、再编核心）
+  - /reload 时重新构建、替换二进制并拉起，终端不释放
   - 编译失败时打印错误并沿用上一次的二进制
 
 例：
@@ -106,25 +106,20 @@ func run(args []string) int {
 	}
 }
 
-// build 生成装配并编译到 bin。先写临时名再替换，任何一步失败都不会破坏
-// 正在使用的旧二进制。
+// build 产出插件产物并编译核心到 bin。先写临时名再替换，任何一步失败都不会
+// 破坏正在使用的旧二进制。
+//
+// 构建顺序交给 tools/build（插件 → 核心）：核心的 //go:embed 依赖 dist/ 里
+// 的插件产物，少了第一步，/reload 之后跑的还是上一次的插件版本。
 func build(root, bin string) error {
-	gen := exec.Command("go", "generate", "./cmd/bot")
-	gen.Dir = root
-	gen.Stdout = os.Stderr
-	gen.Stderr = os.Stderr
-	if err := gen.Run(); err != nil {
-		return fmt.Errorf("go generate: %w", err)
-	}
-
 	tmp := bin + ".new"
-	compile := exec.Command("go", "build", "-o", tmp, "./cmd/bot")
+	compile := exec.Command("go", "run", "./tools/build", "all", "-o", tmp)
 	compile.Dir = root
 	compile.Stdout = os.Stderr
 	compile.Stderr = os.Stderr
 	if err := compile.Run(); err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("go build: %w", err)
+		return fmt.Errorf("go run ./tools/build all: %w", err)
 	}
 
 	if err := replace(tmp, bin); err != nil {
