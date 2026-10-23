@@ -35,8 +35,6 @@ import (
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
-func init() { host.Register(&Plugin{}) }
-
 const usage = "用法：/md <markdown 源码>，可直接换行；例：/md # 标题"
 
 type Plugin struct {

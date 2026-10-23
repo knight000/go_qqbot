@@ -1,12 +1,11 @@
 // Command bot 是唯一装配点：加载配置 → 打开存储 → 构造核心 → 连接网关。
 //
-// 内置插件在本文件 blank import（P1 编译期注册，见 ARCHITECTURE.md §3.1）；
-// plugins/ 下的其余插件由 tools/genplugins 生成到 plugins_gen.go，见 §3.5。
-// 生成物不入库（.gitignore），所以构建前必须先跑 go generate ./cmd/bot：
-// 少了这一步，新放进 plugins/ 的插件不会被链接进二进制，启动日志里的插件
-// 名单也不会多出它。
+// 插件不在这个二进制里（ADR-0005 决策 10）：它们是 <datadir>/plugins/bin/
+// 下的独立可执行文件，由 internal/pluginproc 在装配期扫描、探测、spawn。
+// 所以加插件不需要重编译核心，`go build ./cmd/bot` 也不再需要任何 go:generate。
 //
-//go:generate go run ../../tools/genplugins
+// 出厂副本（四个示例插件）由 internal/pluginbundle 内嵌，只作释放源；
+// 释放只发生在显式命令 `qqbot init --plugins` 里（#42），启动期不释放、不自愈。
 package main
 
 import (
@@ -39,11 +38,6 @@ import (
 	"github.com/knight000/go_qqbot/internal/store"
 	"github.com/knight000/go_qqbot/pkg/host"
 	"github.com/knight000/go_qqbot/pkg/rpc"
-
-	_ "github.com/knight000/go_qqbot/plugins/adminping"
-	_ "github.com/knight000/go_qqbot/plugins/bootnotice"
-	_ "github.com/knight000/go_qqbot/plugins/echo"
-	_ "github.com/knight000/go_qqbot/plugins/md"
 )
 
 // errShutdown 表示进程本身没有故障，只是关停没能在期限内完成。
@@ -82,9 +76,8 @@ func main() {
 	// 走到这里时 run 已经返回：网关断开、session 落盘、数据库关闭。
 	// 此时再做进程替换，新进程不会和旧进程抢同一个 gateway session 与 SQLite 连接。
 	//
-	// 受 devrun 托管时不换映像：退出码就是协议，父进程负责重新生成装配、编译、
-	// 替换二进制再拉起。这是新放入 plugins/ 的插件能生效的唯一路径——重新执行
-	// 同一份二进制不会改变链接进来的插件集合。
+	// 受 devrun 托管时不换映像：退出码就是协议，父进程负责重新产出插件产物、
+	// 编译核心、替换二进制再拉起。生产环境没有源码与工具链，不会走到这里。
 	if buildinfo.Supervised() {
 		os.Exit(buildinfo.ExitRestartRequired)
 	}
@@ -226,7 +219,7 @@ func run() (*core.RestartRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	plugins := mergePlugins(host.Registered(), procPlugins, log)
+	plugins := procPlugins
 
 	coreImpl, err := core.New(core.Options{
 		Store:   db,
@@ -467,8 +460,8 @@ func logStartup(log *slog.Logger, in startupInfo) {
 		"plugin_names", pluginNames(in.Plugins))
 }
 
-// pluginNames 把已注册插件按名字排序后用逗号连起来。
-// 排序只为两次启动能逐字比对——host.Registered() 的顺序取决于 import 顺序。
+// pluginNames 把已装配的插件按名字排序后用逗号连起来。
+// 排序只为两次启动能逐字比对——pluginproc.Load 的顺序来自文件名扫描。
 func pluginNames(plugins []host.Plugin) string {
 	names := make([]string, 0, len(plugins))
 	for _, p := range plugins {
@@ -476,31 +469,4 @@ func pluginNames(plugins []host.Plugin) string {
 	}
 	sort.Strings(names)
 	return strings.Join(names, ",")
-}
-
-// mergePlugins 把「编进二进制的插件」与「装在 plugins/bin/ 里的插件」合成
-// 核心看到的那一张表。核心只认 []host.Plugin，不知道谁在哪个进程里。
-//
-// 重名只留 in-process 那个：两份同名插件会声明同一批命令，路由构建时直接
-// 失败——整台机器人起不来，与「一个坏插件不该拖垮启动」（ADR-0005 决策 6）
-// 正好相反。#41 把四个内置插件迁出去之后 inproc 就是空的，这一步自然失效，
-// 不留后遗症。
-func mergePlugins(inproc, sub []host.Plugin, log *slog.Logger) []host.Plugin {
-	out := make([]host.Plugin, 0, len(inproc)+len(sub))
-	seen := make(map[string]bool, len(inproc)+len(sub))
-	for _, p := range inproc {
-		name := p.Manifest().Name
-		seen[name] = true
-		out = append(out, p)
-	}
-	for _, p := range sub {
-		name := p.Manifest().Name
-		if seen[name] {
-			log.Error("插件重名，跳过子进程那份", "plugin", name)
-			continue
-		}
-		seen[name] = true
-		out = append(out, p)
-	}
-	return out
 }

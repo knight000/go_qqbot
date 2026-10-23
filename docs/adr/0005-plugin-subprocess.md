@@ -32,9 +32,11 @@ P1（编译期注册）用到现在暴露出三条硬代价，而它们都指向
 
     代价要认：核心二进制从此**不自带任何插件**，`/ping`（adminping）与启动私聊报告（bootnotice）都成了插件。它们装上之前，群里没有确认服务存活的手段（核心指令 `/reload` `/reset` `/group` 仍在，但都要管理员权限，且不能证明业务链路是通的）。
 
-11. **出厂态靠 `go:embed`，运行期事实源是文件。** 插件二进制按 `dist/<os>_<arch>/` 嵌进核心 exe，`qqbot init` 释放到 `<datadir>/plugins/bin/`。**内嵌副本不参与运行期判定**：启动时只扫 `plugins/bin/`，文件在就是装着，不在就是没装。这条边界必须写进文档，否则半年后会出现"插件是编死的"这种误解。
+11. **出厂态靠 `go:embed`，运行期事实源是文件。** 插件二进制按 `internal/pluginbundle/dist/<os>_<arch>/` 嵌进核心 exe，`qqbot init` 释放到 `<datadir>/plugins/bin/`。**内嵌副本不参与运行期判定**：启动时只扫 `plugins/bin/`，文件在就是装着，不在就是没装。这条边界必须写进文档，否则半年后会出现"插件是编死的"这种误解。
 
-    代价有两个，都要认：核心 19 MB → 40 MB 上下（每个插件 4–6 MB 估）；`go build` 前必须先把插件编到 `dist/<os>_<arch>/`，否则 `//go:embed` 直接编译失败——这跟刚删掉的 `genplugins` 是同一类构建顺序坑，只是从"忘了 generate"变成"忘了先编插件"。
+    路径落在 `internal/pluginbundle/dist/` 而不是仓库根的 `dist/`：`//go:embed` 的模式不得引用包目录之外的文件，把产物放包目录里是唯一可行的位置（`tools/build` 与 `//go:embed` 指令同住这个约定）。
+
+    代价有两个，都要认：核心 19 MB → 40 MB 上下（每个插件 4–6 MB 估）；`go build` 前必须先把插件编到 `internal/pluginbundle/dist/<os>_<arch>/`，否则 `//go:embed` 直接编译失败——这跟刚删掉的 `genplugins` 是同一类构建顺序坑，只是从"忘了 generate"变成"忘了先编插件"。
 
 12. **缺失不自动恢复，删除是合法的卸载手段。** 启动期不自愈：`plugins/bin/<name>` 被删掉就是这个插件不存在，不该在下次启动时又冒出来。恢复用显式命令 `qqbot init --plugins`（只释放缺失的插件，不碰配置）。误删的表现必须是**日志里少一个插件名**，而不是"某个指令没反应却查不到原因"。
 
