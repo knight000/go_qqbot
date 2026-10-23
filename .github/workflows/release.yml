@@ -1,0 +1,163 @@
+# 发布流水线：push 一个 v* tag 就产出一整套可升级的资产（ADR-0006 决策 11）。
+#
+# 步骤顺序是硬约束，不能调换：
+#
+#   1. 先编插件到 internal/pluginbundle/dist/<os>_<arch>/（核心的 //go:embed 依赖它们）
+#   2. GoReleaser 编核心、发 release、算 checksums.txt
+#   3. 生成 index.json 并连同插件资产一起上传
+#   4. 把刚发出去的资产下载回来做冒烟（校验和 / 版本号 / 可启动）
+#
+# 第 1 步一定要三个平台都跑：每个平台的 bundle_<os>_<arch>.go 只 embed 自己
+# 那一个目录，漏一个平台那一步 `go build` 就找不到文件。第 4 步下载的是
+# release 里的真实资产而不是 dist/ 里的中间产物——中间产物绿、上传件坏
+# （比如漏传一个平台）是这条流水线最可能的失败形态。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 发 release 与上传资产都要写权限；GITHUB_TOKEN 默认只读。
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出（commit 走 VCS 信息注入，需要完整 tag 与历史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Go（版本以 go.mod 为准）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 1. 产出三个平台的插件产物
+        run: |
+          set -euo pipefail
+          for target in windows/amd64 linux/amd64 linux/arm64; do
+            echo "::group::plugins $target"
+            go run ./tools/build plugins -target "$target"
+            echo "::endgroup::"
+          done
+
+      - name: 2. GoReleaser：编核心、发 release、算 checksums.txt
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 3. 生成 index.json 并上传插件资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # index.json 的版本与 sha256 都由这一步现算：插件版本来自 Manifest()，
+          # sha256 来自磁盘上的真实产物，URL 末段就是下一个命令上传的文件名。
+          go run ./tools/index -tag "$GITHUB_REF_NAME" -staging dist/plugins
+          ls -l dist/plugins
+          # -R 不能省：gh 靠当前目录的 .git 推断仓库，而这里的资产目录在
+          # $RUNNER_TEMP 下，不在检出里。
+          gh release upload "$GITHUB_REF_NAME" dist/plugins/* --clobber -R "$GITHUB_REPOSITORY"
+
+      - name: 4a. 冒烟：资产齐全，checksums.txt 与 index.json 都能对上
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          work="$RUNNER_TEMP/smoke"
+          mkdir -p "$work"
+          cd "$work"
+          # -R 不能省：cd 到 $RUNNER_TEMP 之后 gh 已经找不到 .git，
+          # 少了它这条命令直接 "fatal: not a git repository"。
+          gh release download "$GITHUB_REF_NAME" --dir "$work" -R "$GITHUB_REPOSITORY"
+          ls -l
+
+          # 三个核心产物 + checksums.txt + index.json：缺任何一个都意味着
+          # 至少一个平台的升级通道是断的。index.json 在 release 里是扁平的
+          # （GitHub 的资产名不能带 /），仓内的 dist/plugins/ 那层目录只是
+          # 本地布局，上传后只剩文件名。
+          for f in \
+            "qqbot-$ver-windows-amd64.exe" \
+            "qqbot-$ver-linux-amd64" \
+            "qqbot-$ver-linux-arm64" \
+            "checksums.txt" \
+            "index.json"; do
+            test -s "$f" || { echo "缺少资产: $f"; exit 1; }
+          done
+
+          # ADR-0006 决策 11 的对象形状：核心按平台，插件共 4 × 3 份资产。
+          test "$(ls qqbot-plugin-* | wc -l)" -eq 12
+
+          # windows 产物在这个 linux runner 上跑不了，至少确认它是个 PE
+          # 而不是被截断的空文件（-s -w 之后也仍然要以 MZ 开头）。
+          test "$(head -c2 "qqbot-$ver-windows-amd64.exe")" = "MZ"
+
+          # checksums.txt 覆盖三个核心产物（ADR：元数据与二进制分两个通道）。
+          sha256sum -c checksums.txt
+
+          # index.json 的结构、core.version 与插件/平台覆盖度。
+          jq -e --arg v "$ver" '
+            .schema == 1
+            and .core.version == $v
+            and (.plugins | length) == 4
+            and ([.plugins[].assets | length] | all(. == 3))
+          ' index.json
+
+          # index.json 登记的 sha256 必须与真实下载到的插件资产一致：
+          # 它是 /upgrade plugin 校验完整性的唯一依据。
+          jq -r '.plugins[] | .assets[] | "\(.url | split("/") | last) \(.sha256)"' index.json |
+            while read -r asset sha; do
+              echo "$sha  $asset" | sha256sum -c -
+            done
+
+      - name: 4b. 冒烟：产物报告的 version 是 tag 值、commit 是短哈希
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          work="$RUNNER_TEMP/smoke"
+          cd "$work"
+          mkdir -p cfg
+          # 假凭据：只要过得了配置校验、能走到「启动完成」那一行就够了。
+          # 网关连不上是预期结果——这一步验的是版本注入，不是连通性。
+          cat > cfg/config.toml <<'EOF'
+          [app]
+          id = "000000000"
+          secret = "smoke"
+          sandbox = true
+
+          [store]
+          path = "./data/qqbot.db"
+
+          [log]
+          level = "info"
+          format = "text"
+          EOF
+
+          chmod +x "qqbot-$ver-linux-amd64"
+          mkdir -p data
+          set +e
+          timeout 25 "./qqbot-$ver-linux-amd64" -c cfg/config.toml > startup.log 2>&1
+          set -e
+          cat startup.log
+
+          grep -F 'qqbot 启动完成' startup.log
+          # 期望 version="<tag 去 v> <8 位短哈希>"：Version 来自 -X，
+          # Commit 来自 Go 自动嵌入的 VCS 信息，两样都不该是 dev。
+          grep -Eq "version=\"${ver} [0-9a-f]{8}\"" startup.log || {
+            echo "启动日志的 version/commit 不符合预期：期望 version=\"${ver} <短哈希>\"" >&2
+            exit 1
+          }
+          if grep -Fq 'version=dev' startup.log; then
+            echo "产物报告的版本是 dev：-X 注入口径失效" >&2
+            exit 1
+          fi
