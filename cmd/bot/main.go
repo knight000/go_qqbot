@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -33,9 +34,11 @@ import (
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/instance"
 	"github.com/knight000/go_qqbot/internal/logx"
+	"github.com/knight000/go_qqbot/internal/pluginproc"
 	"github.com/knight000/go_qqbot/internal/render"
 	"github.com/knight000/go_qqbot/internal/store"
 	"github.com/knight000/go_qqbot/pkg/host"
+	"github.com/knight000/go_qqbot/pkg/rpc"
 
 	_ "github.com/knight000/go_qqbot/plugins/adminping"
 	_ "github.com/knight000/go_qqbot/plugins/bootnotice"
@@ -198,13 +201,40 @@ func run() (*core.RestartRequest, error) {
 		Log:      log.With("component", "api"),
 	})
 
+	// 插件是 plugins/bin/ 下的独立可执行文件，核心只看见 []host.Plugin
+	// （ADR-0005 决策 3）。装配期全部工作收在 pluginproc.Load：扫目录 →
+	// 并行跑 `bin --manifest`（2 秒）→ 校验 → 跳过 [plugins].disabled。
+	//
+	// 探测或校验失败的插件只记 Error、**不让启动失败**：一个过期产物不该让
+	// 机器人整体下线，那还会进 systemd 重启循环白烧 Identify 配额（决策 6）。
+	// datadir = filepath.Dir(cfg.Store.Path) 是全仓唯一口径。
+	datadir := filepath.Dir(cfg.Store.Path)
+	registry := rpc.NewRegistry()
+	// core.ErrPassiveExhausted 必须过通道：插件调 Host.SendActive 时要能认出
+	// "被动窗口用尽"并发自己的降级消息，而不是当成普通错误重试。它故意留在
+	// core（没有第二个真实消费方），所以号码只能由实现方注册（决策 9）。
+	if err := registry.Register(rpc.CodeImplBase, core.ErrPassiveExhausted); err != nil {
+		return nil, err
+	}
+	procPlugins, err := pluginproc.Load(ctx, pluginproc.Options{
+		Dir:       filepath.Join(datadir, "plugins", "bin"),
+		ConfigFor: cfg.Plugin,
+		Disabled:  cfg.Plugins.Disabled,
+		Registry:  registry,
+		Log:       log.With("component", "pluginproc"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	plugins := mergePlugins(host.Registered(), procPlugins, log)
+
 	coreImpl, err := core.New(core.Options{
 		Store:   db,
 		API:     apiClient,
 		HTTP:    hc,
 		Log:     log,
 		Config:  cfg,
-		Plugins: host.Registered(),
+		Plugins: plugins,
 		// 核心只认 host.Renderer 接口，不 import 渲染实现包。
 		Renderer: renderer,
 	})
@@ -252,7 +282,7 @@ func run() (*core.RestartRequest, error) {
 		Platform:    bi.Platform,
 		GoVersion:   bi.GoVer,
 		Restarted:   buildinfo.RestartedByReload(),
-		Plugins:     host.Registered(),
+		Plugins:     plugins,
 	})
 	if buildinfo.RestartedByReload() {
 		log.Info("本次启动由 /reload 触发", "version", bi.String())
@@ -446,4 +476,31 @@ func pluginNames(plugins []host.Plugin) string {
 	}
 	sort.Strings(names)
 	return strings.Join(names, ",")
+}
+
+// mergePlugins 把「编进二进制的插件」与「装在 plugins/bin/ 里的插件」合成
+// 核心看到的那一张表。核心只认 []host.Plugin，不知道谁在哪个进程里。
+//
+// 重名只留 in-process 那个：两份同名插件会声明同一批命令，路由构建时直接
+// 失败——整台机器人起不来，与「一个坏插件不该拖垮启动」（ADR-0005 决策 6）
+// 正好相反。#41 把四个内置插件迁出去之后 inproc 就是空的，这一步自然失效，
+// 不留后遗症。
+func mergePlugins(inproc, sub []host.Plugin, log *slog.Logger) []host.Plugin {
+	out := make([]host.Plugin, 0, len(inproc)+len(sub))
+	seen := make(map[string]bool, len(inproc)+len(sub))
+	for _, p := range inproc {
+		name := p.Manifest().Name
+		seen[name] = true
+		out = append(out, p)
+	}
+	for _, p := range sub {
+		name := p.Manifest().Name
+		if seen[name] {
+			log.Error("插件重名，跳过子进程那份", "plugin", name)
+			continue
+		}
+		seen[name] = true
+		out = append(out, p)
+	}
+	return out
 }
