@@ -36,6 +36,7 @@ import (
 	"github.com/knight000/go_qqbot/internal/pluginproc"
 	"github.com/knight000/go_qqbot/internal/render"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/internal/upgrade"
 	"github.com/knight000/go_qqbot/pkg/host"
 	"github.com/knight000/go_qqbot/pkg/rpc"
 )
@@ -93,6 +94,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "重启失败：定位可执行文件:", err)
 		os.Exit(1)
 	}
+
+	// /upgrade apply 的换盘就发生在这里：网关已断、session 已落盘、库已关。
+	// 失败时 Commit 会把旧二进制换回来（进程内回滚），我们照样重启——
+	// 重启旧版本总好过让机器人停在这里等人工介入。
+	if req.Plan != nil {
+		if err := upgrade.Commit(req.Plan, slog.Default()); err != nil {
+			fmt.Fprintln(os.Stderr, "换盘失败，继续重启旧版本:", err)
+		}
+	}
 	if err := restartSelf(exe); err != nil {
 		fmt.Fprintln(os.Stderr, "重启失败:", err)
 		os.Exit(1)
@@ -128,6 +138,39 @@ func run() (*core.RestartRequest, error) {
 	// 而不是一次正常退出（P3-21）。
 	ctx, stop := notifyShutdown(context.Background())
 	defer stop()
+
+	// datadir 是全仓唯一口径：数据目录就是数据库文件所在的那一层。
+	// 升级标记与快照都在它下面（<datadir>/upgrade/），因此这里要早于开库。
+	datadir := filepath.Dir(cfg.Store.Path)
+
+	// 自更新的回滚判定必须在这里——拿锁之前、开库之前：
+	//   - 回滚的最后一步是重新执行自身，必须先放手（旧进程一个锁都不该握着）；
+	//   - 判定要读 <datadir>/upgrade/state.json，只需要配置。
+	// 顺序错了会得到一个"回滚后永远等锁"的启动循环。
+	exePath, exeErr := os.Executable()
+	if exeErr != nil {
+		exePath = ""
+	}
+	if rolledBack, err := handlePendingUpgrade(upgrade.StateDir(datadir), exePath, log); err != nil {
+		// 回滚失败不阻止启动：用当前二进制继续跑，比让机器人直接下线好。
+		log.Error("升级回滚未能完成，继续用当前二进制启动", "err", err)
+	} else if rolledBack {
+		// Unix 上 exec 成功不返回；Windows 上这是"拉起子进程"，
+		// 本进程随后退出（见 restartSelf 的注释）。
+		if err := restartSelf(exePath); err != nil {
+			return nil, fmt.Errorf("回滚后重启失败: %w", err)
+		}
+		return nil, nil
+	}
+	// 上一次升级留下的 .old 到这里就没用了（已经稳定运行过，
+	// 或刚被上面回滚用掉）。删不掉只 warn：Windows 上杀软/旧进程
+	// 可能短暂持有它，一份 40 MB 的残留不值得让机器人下线。
+	// exePath 为空（定位失败）时不能调：那会变成删当前工作目录下的 ".old"。
+	if exePath != "" {
+		if err := upgrade.CleanOld(exePath); err != nil {
+			log.Warn("清理旧版本残留失败", "path", upgrade.OldPath(exePath), "err", err)
+		}
+	}
 
 	// 渲染器在启动期同步解析字体（约 300 ms，全部花在 20 MB 字体的字节码扫描上）。
 	// 字体是 go:embed 进来的，解析失败只可能是二进制本身有问题——带病运行会在
@@ -206,8 +249,6 @@ func run() (*core.RestartRequest, error) {
 	//
 	// 探测或校验失败的插件只记 Error、**不让启动失败**：一个过期产物不该让
 	// 机器人整体下线，那还会进 systemd 重启循环白烧 Identify 配额（决策 6）。
-	// datadir = filepath.Dir(cfg.Store.Path) 是全仓唯一口径。
-	datadir := filepath.Dir(cfg.Store.Path)
 	registry := rpc.NewRegistry()
 	// core.ErrPassiveExhausted 必须过通道：插件调 Host.SendActive 时要能认出
 	// "被动窗口用尽"并发自己的降级消息，而不是当成普通错误重试。它故意留在
@@ -236,6 +277,18 @@ func run() (*core.RestartRequest, error) {
 		Plugins: plugins,
 		// 核心只认 host.Renderer 接口，不 import 渲染实现包。
 		Renderer: renderer,
+		Upgrade: upgrade.New(upgrade.Options{
+			Enabled:   cfg.UpgradeEnabled(),
+			APIBase:   cfg.Upgrade.APIBase,
+			AssetBase: cfg.Upgrade.AssetBase,
+			Token:     cfg.Upgrade.Token,
+			Exe:       exePath,
+			DataDir:   datadir,
+			Current:   buildinfo.Get().Version,
+			Plugins:   loadedPlugins(plugins),
+			Snapshots: db,
+			Log:       log.With("component", "upgrade"),
+		}),
 	})
 	if err != nil {
 		return nil, err
@@ -268,6 +321,10 @@ func run() (*core.RestartRequest, error) {
 		defer close(gwDone)
 		gwRes <- gw.Run(ctx)
 	}()
+
+	// 升级后的观察窗：core.Start 已经完成、网关协程已经起来，从这里开始
+	// 计时 30 秒。能活过去就删掉 pending 标记（ADR-0006 决策 6）。
+	go clearPendingAfter(ctx, upgrade.StateDir(datadir), upgradeHealthyWindow, log)
 
 	bi := buildinfo.Get()
 	logStartup(log, startupInfo{

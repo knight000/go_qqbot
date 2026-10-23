@@ -77,6 +77,12 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		c.trace.CoreCommand(cmd)
 		c.handleReset(ctx, ev)
 		return true
+	case "/upgrade":
+		// 自更新的唯一入口（ADR-0006 决策 2/10）：换二进制等于远程代码执行，
+		// 只能由核心独占，插件声明同名指令一律拒绝加载。
+		c.trace.CoreCommand(cmd)
+		c.handleUpgrade(ctx, ev)
+		return true
 	}
 	return false
 }
