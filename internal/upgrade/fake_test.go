@@ -26,6 +26,9 @@ type fakeRelease struct {
 	index    string
 	sums     string
 	coreName string
+	// indexAssetName 是清单在 release 资产列表里的名字。默认 "index.json"
+	// （GitHub 不允许资产名含 "/"）；测试可以把它改成别的形状来验证匹配口径。
+	indexAssetName string
 
 	api   *httptest.Server
 	asset *httptest.Server
@@ -41,11 +44,12 @@ type fakeRelease struct {
 func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 	t.Helper()
 	f := &fakeRelease{
-		t:        t,
-		version:  version,
-		tag:      "v" + version,
-		binary:   binary,
-		coreName: CoreAssetName(version, runtime.GOOS, runtime.GOARCH),
+		t:              t,
+		version:        version,
+		tag:            "v" + version,
+		binary:         binary,
+		coreName:       CoreAssetName(version, runtime.GOOS, runtime.GOARCH),
+		indexAssetName: "index.json",
 	}
 	sum := sha256.Sum256(binary)
 	// index.json 与 tools/index 的输出同形：插件资产指向 asset_base 风格
@@ -70,7 +74,7 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"tag_name": f.tag,
 			"assets": []map[string]any{
-				{"id": 1, "name": "index.json", "size": len(f.index)},
+				{"id": 1, "name": f.indexAssetName, "size": len(f.index)},
 				{"id": 2, "name": "checksums.txt", "size": len(f.sums)},
 				{"id": 3, "name": f.coreName, "size": len(f.binary)},
 			},
