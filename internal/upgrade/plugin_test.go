@@ -3,6 +3,7 @@ package upgrade
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -209,8 +210,70 @@ func TestUpgradePluginsRejectsNameMismatch(t *testing.T) {
 	}
 }
 
-// 插件升级只读 index.json：核心产物的 checksums.txt 与它无关。
-// 用一个空的 checksums 断言这条路不碰核心清单。
+// 产物连 `--manifest` 都答不上来（不是插件、或起不来）→ 拒绝，旧文件不动。
+func TestUpgradePluginsRejectsUnprobableAsset(t *testing.T) {
+	f := newFakeRelease(t, "1.2.4", peHeader("core"))
+	// 一份能通过文件头检查、但不会应答清单的内容：测试二进制本身（没有
+	// 注入清单时它会当普通测试进程跑，收到 --manifest 直接报错退出）。
+	selfPath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("定位测试二进制: %v", err)
+	}
+	self, err := os.ReadFile(selfPath)
+	if err != nil {
+		t.Fatalf("读测试二进制: %v", err)
+	}
+	f.addPlugin("echo", "0.2.0", self)
+
+	r, tgt := pluginTarget(t, "echo")
+	before := readFile(t, r.bin)
+	u, _ := newTestUpgrader(t, f, "1.2.3", nil)
+
+	rep, err := u.UpgradePlugins(context.Background(), []PluginTarget{tgt})
+	if err != nil {
+		t.Fatalf("UpgradePlugins: %v", err)
+	}
+	got := rep.Results[0]
+	if !strings.HasPrefix(got.Action, "失败") || !strings.Contains(got.Action, "--manifest") {
+		t.Fatalf("应因探测失败而拒绝，实际 %q", got.Action)
+	}
+	if len(r.calls) != 0 {
+		t.Error("探测失败时不该换文件")
+	}
+	if readFile(t, r.bin) != before {
+		t.Error("旧文件被改动了")
+	}
+	if _, err := os.Stat(PluginStagedPath(r.bin)); !os.IsNotExist(err) {
+		t.Error("探测失败的产物不该留在落位路径上")
+	}
+}
+
+// 验收 2（升级侧）：换进程失败（新版本握手不过）→ 结论写"已回滚"，
+// 并把回滚后的版本一起说出来，别让 owner 以为插件现在是坏的。
+func TestUpgradePluginsReportsRollback(t *testing.T) {
+	f := newFakeRelease(t, "1.2.4", peHeader("core"))
+	f.addPlugin("echo", "0.2.0", fakePluginAsset(t, "echo", "0.2.0"))
+
+	r, tgt := pluginTarget(t, "echo")
+	r.err = errors.New("新版本 5s 内没有完成握手")
+	u, _ := newTestUpgrader(t, f, "1.2.3", nil)
+
+	rep, err := u.UpgradePlugins(context.Background(), []PluginTarget{tgt})
+	if err != nil {
+		t.Fatalf("UpgradePlugins: %v", err)
+	}
+	got := rep.Results[0]
+	for _, want := range []string{"失败", "已回滚到 0.1.0", "没有完成握手"} {
+		if !strings.Contains(got.Action, want) {
+			t.Errorf("结论缺少 %q：%q", want, got.Action)
+		}
+	}
+	if rep.Changed() != 0 {
+		t.Error("回滚不算升级成功")
+	}
+}
+
+// 插件升级只读 index.json：核心产物的 checksums.txt 与它无关。// 用一个空的 checksums 断言这条路不碰核心清单。
 func TestUpgradePluginsNeedsNoCoreChecksums(t *testing.T) {
 	f := newFakeRelease(t, "1.2.4", peHeader("core"))
 	f.sums = ""
