@@ -75,6 +75,28 @@ func TestTokenNeverSentToAssetBaseHost(t *testing.T) {
 	}
 }
 
+// #43 的发布实测口径：release 里的清单资产名是**顶层的** index.json。
+// 仓库内的逻辑路径是 plugins/index.json，但 GitHub 的资产名不允许含 "/"，
+// 所以客户端只能按文件名匹配，不能拼接路径、也不能依赖下载地址的末段形状。
+func TestCheckMatchesTopLevelIndexAsset(t *testing.T) {
+	f := newFakeRelease(t, "1.2.3", []byte("x"))
+	if err := func() error {
+		c := newClient(f.api.URL, f.asset.URL, "", "o/r")
+		_, err := c.check(context.Background())
+		return err
+	}(); err != nil {
+		t.Fatalf("顶层 index.json 应能取到: %v", err)
+	}
+
+	// 反证：资产名按路径形状命名时，客户端**不该**认出它。
+	f.indexAssetName = "plugins/index.json"
+	c := newClient(f.api.URL, f.asset.URL, "", "o/r")
+	_, err := c.check(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "没有资产 index.json") {
+		t.Fatalf("只认顶层的 index.json，实际: %v", err)
+	}
+}
+
 // checksums.txt 里没有本平台产物时必须拒绝：那是"该发布漏发了平台"，
 // 而不是"下载失败"——两种文案要能区分开。
 func TestCheckRejectsMissingPlatformInChecksums(t *testing.T) {
