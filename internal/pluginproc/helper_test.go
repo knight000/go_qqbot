@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,6 +33,18 @@ import (
 const (
 	markerEnv = "HELPER_MARKER"
 	pidEnv    = "HELPER_PID"
+)
+
+// 自身可执行文件末尾的"注入标记"（只给热升级用例用）。
+//
+// 为什么不把版本号编进文件名：热升级的最后一件事就是 rename——产物一旦改成
+// 插件的正式名字，按文件名编码的角色与版本就一起退化了；而内容会跟着文件
+// 一起搬过去。这两个键必须带冒号取值、并且贴在文件尾，否则会和二进制里
+// 常量本身的字节撞上（常量 "HELPERVER:" 就在 rodata 里）。
+const (
+	markRole    = "HELPERROLE"
+	markVersion = "HELPERVER"
+	markNoInit  = "HELPERINITFAIL"
 )
 
 // probeForTest 是不验超时的用例统一给的探测期限。
@@ -64,7 +77,13 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	if mode := helperMode(); mode != "" {
+	mode := helperMode()
+	if mode == "" {
+		// 落位路径上的产物叫 ".echo.exe.new"：热升级用例复制出来的那份
+		// 名字不再等于角色，所以角色也编进文件内容里（文件名优先）。
+		mode = selfMarkers()[markRole]
+	}
+	if mode != "" {
 		runAsPlugin(mode)
 		return
 	}
@@ -90,6 +109,51 @@ func hasManifestFlag() bool {
 		}
 	}
 	return false
+}
+
+// selfMarkers 读自身可执行文件末尾那几行注入标记。
+//
+// 从后往前按行认，遇到第一行不以 HELPER 开头就停：注入的内容一定贴在文件尾，
+// 而更早的位置是 rodata（里面本来就有这些常量），不能往前扫。
+func selfMarkers() map[string]string {
+	out := map[string]string{}
+	self, err := os.Executable()
+	if err != nil {
+		return out
+	}
+	f, err := os.Open(self)
+	if err != nil {
+		return out
+	}
+	defer f.Close()
+	const window = 4096
+	if st, err := f.Stat(); err == nil && st.Size() > window {
+		if _, err := f.Seek(-window, io.SeekEnd); err != nil {
+			return out
+		}
+	}
+	blob, err := io.ReadAll(f)
+	if err != nil {
+		return out
+	}
+	lines := strings.Split(strings.TrimRight(string(blob), "\r\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		key, val, ok := strings.Cut(strings.TrimSpace(lines[i]), ":")
+		if !ok || !strings.HasPrefix(key, "HELPER") {
+			return out
+		}
+		out[key] = val
+	}
+	return out
+}
+
+// helperVersion 是这份产物自称的版本：默认 0.0.0，热升级用例造出来的
+// "新版本"会在末尾追加一个更高的版本号。
+func helperVersion(m map[string]string) string {
+	if v := strings.TrimSpace(m[markVersion]); v != "" {
+		return v
+	}
+	return "0.0.0"
 }
 
 // runAsPlugin 以插件身份跑到底，不返回。
@@ -122,7 +186,7 @@ func runAsPlugin(mode string) {
 		os.Exit(3)
 	}
 
-	var p host.Plugin = newHelperPlugin(mode)
+	var p host.Plugin = newHelperPlugin(mode, selfMarkers())
 	if mode == modePlain {
 		p = plainPlugin{h: p.(*helperPlugin)}
 	}
@@ -156,13 +220,18 @@ func appendMarker(line string) {
 // 插件；每个角色的差别只在 manifest 与几处行为开关。
 type helperPlugin struct {
 	mode string
+	ver  string
+	// failInit 让 Init 返回错误：热升级用它造"新版本握手失败"的现场。
+	failInit bool
 
 	mu  sync.Mutex
 	h   host.Host
 	cfg string
 }
 
-func newHelperPlugin(mode string) *helperPlugin { return &helperPlugin{mode: mode} }
+func newHelperPlugin(mode string, marks map[string]string) *helperPlugin {
+	return &helperPlugin{mode: mode, ver: helperVersion(marks), failInit: marks[markNoInit] == "1"}
+}
 
 func (p *helperPlugin) Manifest() host.Manifest {
 	switch p.mode {
@@ -187,7 +256,7 @@ func (p *helperPlugin) Manifest() host.Manifest {
 	}
 	return host.Manifest{
 		Name:       name,
-		Version:    "0.0.0",
+		Version:    p.ver,
 		APIVersion: host.APIVersion,
 		Intents:    []string{"message"},
 		Commands: []host.Command{
@@ -199,7 +268,7 @@ func (p *helperPlugin) Manifest() host.Manifest {
 }
 
 func (p *helperPlugin) Init(_ context.Context, h host.Host) error {
-	if p.mode == modeBadInit {
+	if p.mode == modeBadInit || p.failInit {
 		return errors.New("配置里的 token 为空")
 	}
 	p.mu.Lock()
@@ -208,12 +277,12 @@ func (p *helperPlugin) Init(_ context.Context, h host.Host) error {
 	// 逐行转发要验的是"每行都在、都带 plugin 前缀"，所以这里刻意打两行。
 	fmt.Fprintln(os.Stderr, "init: 第一行")
 	fmt.Fprintln(os.Stderr, "init: 第二行")
-	appendMarker("init=" + p.mode + " greeting=" + p.cfg + " name=" + h.Plugin())
+	appendMarker("init=" + p.mode + " v" + p.ver + " greeting=" + p.cfg + " name=" + h.Plugin())
 	return nil
 }
 
 func (p *helperPlugin) Start(context.Context) error {
-	appendMarker("start=" + p.mode)
+	appendMarker("start=" + p.mode + " v" + p.ver)
 	return nil
 }
 
@@ -224,7 +293,7 @@ func (p *helperPlugin) Close(context.Context) error {
 		// 不理会 close：让核心的 1s 期限到期，走到第二、三级。
 		time.Sleep(30 * time.Second)
 	}
-	appendMarker("close=" + p.mode)
+	appendMarker("close=" + p.mode + " v" + p.ver)
 	return nil
 }
 
@@ -291,6 +360,32 @@ func install(t *testing.T, dir, mode string) string {
 	dst := filepath.Join(dir, name)
 	if err := os.WriteFile(dst, blob, 0o755); err != nil {
 		t.Fatalf("落地插件 %s: %v", mode, err)
+	}
+	return dst
+}
+
+// stageVersion 造一份"更高版本"的产物并落到热升级的落位路径上。
+//
+// 做法与 install 同源（复制测试二进制），只是在末尾追加两行标记：版本号，
+// 以及可选的"Init 必须失败"。落位路径与生产的规则一致——与插件同目录、
+// 点开头，这样无论怎么失败都不会被下一次启动的目录扫描当成插件。
+func stageVersion(t *testing.T, bin, role, version string, failInit bool) string {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("定位测试二进制: %v", err)
+	}
+	blob, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatalf("读取测试二进制: %v", err)
+	}
+	blob = append(blob, []byte("\n"+markRole+":"+role+"\n"+markVersion+":"+version+"\n")...)
+	if failInit {
+		blob = append(blob, []byte(markNoInit+":1\n")...)
+	}
+	dst := filepath.Join(filepath.Dir(bin), "."+filepath.Base(bin)+".new")
+	if err := os.WriteFile(dst, blob, 0o755); err != nil {
+		t.Fatalf("落位新产物 %s: %v", dst, err)
 	}
 	return dst
 }
