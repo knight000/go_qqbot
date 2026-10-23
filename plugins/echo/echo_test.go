@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // newPlugin 用真实的 host.Service 当宿主：Host 接口很大，为两条命令写替身

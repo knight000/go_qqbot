@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // fakeRunner 同时满足 host.Plugin 与 host.JobRunner：Bind 要求前者，

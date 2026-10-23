@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/knight000/go_qqbot/internal/config"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // newIntentCore 走真实的 Start：交叉校验挂在装配流程里，直接调内部函数

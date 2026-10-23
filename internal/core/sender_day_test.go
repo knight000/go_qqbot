@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // recordingUsage 只记下每次记账的 key，不落库：切日口径的断言要直接看到

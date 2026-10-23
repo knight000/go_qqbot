@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/buildinfo"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // /reload 是"把磁盘上的新二进制换上来"的唯一入口。

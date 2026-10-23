@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/knight000/go_qqbot/internal/config"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // capturePlugin 是装配测试用的最小插件：Init 时把宿主扣下来，

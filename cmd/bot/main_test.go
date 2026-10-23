@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/core"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // 第二个实例不该白等：只有 /reload 的交接场景才需要给旧进程留余量。

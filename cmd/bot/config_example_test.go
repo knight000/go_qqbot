@@ -7,7 +7,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/knight000/go_qqbot/internal/config"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // 私有插件（开发工作区里 go generate 进来的那些）一旦声明 ConfigSchema，

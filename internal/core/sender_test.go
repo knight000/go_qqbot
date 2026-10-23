@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // newUsageStore 开一个临时库，供主动消息日预算的测试使用（预算已落库）。

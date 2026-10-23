@@ -14,9 +14,9 @@ import (
 
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/config"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 type Options struct {
@@ -186,10 +186,9 @@ func (c *Core) Start(ctx context.Context) error {
 			KV:       c.store,
 			DB:       c.store,
 			Admin:    adminStore{c.store},
-			HTTP:     c.httpClient(),
+			HTTP:     c.hostHTTPBackend(m.AllowedDomains),
 			Sched:    c.sched,
 			Log:      c.log,
-			Domains:  m.AllowedDomains,
 			Renderer: c.render,
 			Session:  c.session,
 		})
@@ -221,9 +220,20 @@ func (c *Core) Start(ctx context.Context) error {
 	return nil
 }
 
-// httpClient 当前没有在 Core 里保存引用，单独抽一个方法是为了将来
-// 给不同插件分配不同限流桶时只改一处。
-func (c *Core) httpClient() *httpx.Client { return c.http }
+// hostHTTPBackend 返回按该插件 Manifest.AllowedDomains 收窄过的出站客户端。
+//
+// 白名单必须在这里定死：`pkg/host` 不再认识域名，插件拿到的客户端就是
+// 「只能打它声明过的域」的那一份。将来给不同插件分配不同限流桶也改这一处。
+//
+// 未配置客户端时必须返回**未包装的 nil 接口**——把 (*httpx.Client)(nil) 或
+// hostHTTP{nil} 塞进接口会得到一个非 nil 的接口值，host 侧的判空随之失效，
+// 调用即 panic（核心单测大量使用不接 HTTP 的 Core）。
+func (c *Core) hostHTTPBackend(domains []string) host.HTTPBackend {
+	if c.http == nil {
+		return nil
+	}
+	return hostHTTP{c.http.WithDomains(domains)}
+}
 
 // Shutdown 按固定顺序收尾：停调度 → 等调度收尾 → 等 Dispatcher 排空 →
 // 等 GC 退出 → 关插件。

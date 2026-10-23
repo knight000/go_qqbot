@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // 私聊没有群，但调用者仍是普通成员：权限基线是 member，而不是"未知"。

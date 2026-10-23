@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/buildinfo"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/sysinfo"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 func init() { host.Register(&Plugin{}) }

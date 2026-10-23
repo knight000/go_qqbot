@@ -21,7 +21,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // stateStore 是网关需要的全部持久化能力：session_id 与 seq 两个键。
