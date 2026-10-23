@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/core"
 	"github.com/knight000/go_qqbot/pkg/host"
 	"github.com/knight000/go_qqbot/pkg/rpc"
 	"github.com/knight000/go_qqbot/pkg/rpcsdk"
@@ -90,8 +91,23 @@ func Load(ctx context.Context, o Options) ([]host.Plugin, error) {
 	}
 
 	probes := probeAll(ctx, files, o.probeTimeout())
+	// disabled 按 manifest 里的名字判定（文件名只是标签）：探测之后才知道
+	// 每个文件自称是谁，所以这一步只能在这里做（ADR-0005「启动顺序」）。
+	disabled := make(map[string]bool, len(o.Disabled))
+	for _, name := range o.Disabled {
+		disabled[name] = true
+	}
+	for i := range probes {
+		if probes[i].err == nil && disabled[probes[i].manifest.Name] {
+			probes[i].disabled = true
+		}
+	}
 
 	out := make([]host.Plugin, 0, len(probes))
+	// kept 记录已接受的插件名 → 文件：两个文件自称同一个名字（升级残留一个
+	// 旧产物）时只能留一个——都装上会有两个进程抢同一条路由，表现为同一条
+	// 消息回两遍，而日志里两个都"正常"。
+	kept := make(map[string]string, len(probes))
 	for _, pr := range probes {
 		if pr.err != nil {
 			// 跳过是刻意选择而不是兜底：启动日志里留一条 Error，落款写文件路径
@@ -103,12 +119,41 @@ func Load(ctx context.Context, o Options) ([]host.Plugin, error) {
 			log.Info("插件在 [plugins].disabled 里，不启动", "plugin", pr.name, "file", pr.file)
 			continue
 		}
+		p := newProxy(pr, o)
+		if err := validateManifest(out, p); err != nil {
+			log.Error("插件清单校验失败，已跳过", "plugin", pr.name, "file", pr.file, "err", err)
+			continue
+		}
+		if first, dup := kept[pr.name]; dup {
+			log.Error("插件重名，已跳过", "plugin", pr.name, "file", pr.file, "kept", first)
+			continue
+		}
+		kept[pr.name] = pr.file
 		log.Info("发现插件", "plugin", pr.name, "version", pr.manifest.Version,
 			"api_version", pr.manifest.APIVersion, "commands", len(pr.manifest.Commands),
 			"optional", len(pr.optional))
-		out = append(out, newProxy(pr, o))
+		out = append(out, p)
 	}
 	return out, nil
+}
+
+// validateManifest 用**核心自己的**路由构建器校验清单：api_version 一致、
+// intents 可解析、每个命令恰好 Prefix 或 Pattern 之一、正则可编译、前缀不占
+// 核心保留词、权限位合法（ADR-0005 决策 5「复用现有的全部启动期校验」）。
+//
+// 为什么绕一圈调 core.NewRouter 而不是在这里再写一遍：保留前缀表与 intent
+// 语法都住在 core，抄一份到这里就必然有一天两边不一致——那一天的现场是
+// "探测放过了，核心却拒绝"，而核心拒绝是**整体启动失败**。代价是这里多一个
+// import 边（pluginproc → core），换来装配期校验只有一份实现。
+//
+// accepted 是已经通过校验的插件：把候选与它们一起构建，任何新错误都只能来自
+// 候选本身。
+func validateManifest(accepted []host.Plugin, cand host.Plugin) error {
+	trial := make([]host.Plugin, 0, len(accepted)+1)
+	trial = append(trial, accepted...)
+	trial = append(trial, cand)
+	_, err := core.NewRouter(trial)
+	return err
 }
 
 // scan 列出目录里的普通文件，按文件名排序。
