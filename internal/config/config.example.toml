@@ -105,6 +105,25 @@ fetch_name = true
 # 通知走主动消息，受 [active].enabled 与每日预算约束，但不受 [active].plugins 限制。
 notify = "owner"
 
+# 自更新（ADR-0006）：/upgrade 是唯一的更新入口，只在人主动敲的时候发请求。
+# 启动期不检查、不自愈，也不会未经允许替换二进制。
+[upgrade]
+# 总开关。false 时连检查都不发请求——不是"检查了但不下载"。
+enabled = true
+# 元数据通道：index.json 与 checksums.txt **永远**从这里取（GitHub API 端点）。
+api_base = "https://api.github.com"
+# 二进制通道：可指向镜像站。只在没有 token 时生效。
+# 校验和与二进制分两个通道是结构约束，不是约定：镜像被投毒时二进制变了、
+# 校验和没变，sha256 必然对不上。
+asset_base = "https://github.com"
+# 私有仓凭据（细粒度 token，只需 Contents: read）。留空表示仓库匿名可读。
+#
+# 设了它之后三份产物（index.json / checksums.txt / 二进制）全部改走 api_base
+# 的 release asset 端点，因为私有资产无法在镜像上匿名取。反过来，token
+# **绝不会**发给 asset_base 的主机——那是用户可配置的镜像，把 GitHub 凭据
+# 送过去等于泄露（ADR-0006 决策 13）。
+# token = "github_pat_xxx"
+
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取
 [plugins.echo]
 reply_prefix = ""

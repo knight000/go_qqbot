@@ -44,6 +44,35 @@ type Config struct {
 	Log        Log        `toml:"log"`
 	Debug      Debug      `toml:"debug"`
 	Plugins    Plugins    `toml:"plugins"`
+	Upgrade    Upgrade    `toml:"upgrade"`
+}
+
+// Upgrade 是自更新配置（ADR-0006 决策 2/3）。
+//
+// 两个地址分开不是可选项：「校验和与二进制不同通道」是结构约束，不是约定。
+// index.json 与 checksums.txt 永远从 api_base 取；二进制默认从 asset_base 取
+// （可指向镜像），设了 token 之后三份产物全走 api_base——私有仓的资产无法在
+// 镜像上匿名取，而 token 绝不能发给用户可配置的镜像主机。
+type Upgrade struct {
+	// Enabled 是总开关，默认 true。关掉之后连检查都不发请求，
+	// 不是"检查了但不下载"。
+	Enabled *bool `toml:"enabled"`
+	// APIBase 是元数据通道（GitHub API 端点），默认 https://api.github.com。
+	APIBase string `toml:"api_base"`
+	// AssetBase 是二进制通道，默认 https://github.com；可指向镜像。
+	// 只在没有 token 时生效。
+	AssetBase string `toml:"asset_base"`
+	// Token 是私有仓凭据（细粒度 token，只需 contents:read）。
+	// 它在文件里就是明文——与 [app].secret 是同一类东西，配置本身要 600。
+	Token string `toml:"token"`
+}
+
+// UpgradeEnabled 返回自更新开关的最终值（默认 true）。
+func (c *Config) UpgradeEnabled() bool {
+	if c.Upgrade.Enabled == nil {
+		return true
+	}
+	return *c.Upgrade.Enabled
 }
 
 // Plugins 是 `[plugins]` 表：既有核心侧的停用名单，也有各插件的配置段。
@@ -425,6 +454,14 @@ func (c *Config) applyDefaults() {
 	c.Debug.Level = strings.ToLower(strings.TrimSpace(c.Debug.Level))
 	if c.Log.Format == "" {
 		c.Log.Format = "text"
+	}
+	// 自更新两个地址的默认值必须在这里（而不是空串让 upgrade 包兜）：
+	// /ping 与启动日志里要能看到实际生效的地址，空白的配置项看不出用的是哪一个。
+	if c.Upgrade.APIBase == "" {
+		c.Upgrade.APIBase = "https://api.github.com"
+	}
+	if c.Upgrade.AssetBase == "" {
+		c.Upgrade.AssetBase = "https://github.com"
 	}
 }
 
