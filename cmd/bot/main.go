@@ -56,6 +56,12 @@ const (
 )
 
 func main() {
+	// 子命令在 flag.Parse 之前分派：`qqbot init -c x` 的 -c 属于 init，
+	// 不能落到启动用的 flag 集合里。不带子命令时完全是原来的启动行为。
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		os.Exit(runInit(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	req, err := run()
 	if err != nil {
 		var fatal *gateway.FatalError
@@ -95,7 +101,7 @@ func main() {
 
 // run 正常退出时返回 nil；返回非 nil 表示需要由 main 重新执行自身（/reload）。
 func run() (*core.RestartRequest, error) {
-	cfgPath := flag.String("c", "config/config.local.toml", "配置文件路径")
+	cfgPath := flag.String("c", defaultConfigPath, "配置文件路径")
 	debugMode := flag.Bool("debug", false, "调试模式：打印收到的事件、命中的插件与回复内容（等同 [debug].enabled=true）")
 	flag.Parse()
 

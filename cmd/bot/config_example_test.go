@@ -1,7 +1,6 @@
 package main
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/BurntSushi/toml"
@@ -48,13 +47,14 @@ func TestExamplePluginWithoutSectionFails(t *testing.T) {
 	}
 }
 
-// config.example.toml 是使用者复制一份就能启动的那份文件。插件声明了
-// config_schema 之后，「声明即必填」意味着任何一个键缺失都会让新克隆的仓库
-// 第一次启动就失败，所以这里对着磁盘上的真实文件跑一遍校验，而不是手写 map。
+// 示例配置是 `qqbot init` 真的会写出去的那份字节（config.ExampleTOML 内嵌
+// 自 internal/config/config.example.toml）。插件声明了 config_schema 之后，
+// 「声明即必填」意味着任何一个键缺失都会让新用户第一次启动就失败，所以这里
+// 直接对着内嵌字节跑一遍校验——校验的就是用户拿到的那份东西。
 func TestExampleConfigSatisfiesEveryPluginSchema(t *testing.T) {
 	var cfg config.Config
-	if _, err := toml.DecodeFile(filepath.Join("..", "..", "config", "config.example.toml"), &cfg); err != nil {
-		t.Fatalf("读取示例配置: %v", err)
+	if _, err := toml.Decode(string(config.ExampleTOML()), &cfg); err != nil {
+		t.Fatalf("解析内嵌示例配置: %v", err)
 	}
 
 	// 示例插件已经迁成独立产物（ADR-0005 决策 10），编译期注册表不存在了。
