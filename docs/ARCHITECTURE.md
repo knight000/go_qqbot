@@ -278,7 +278,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16 |
 | 10 | ① `host.Params.Str` 区分「键缺失」与「键存在但为空串」：空串返回 `""` 而不是默认值；② `Host.Store.Query` 的只读改由 SQLite `query_only` 连接保证、SQL 原样执行（不再自动追加 `LIMIT`），行数在取行时截断到 1000 | #30 |
 | 11 | `host` 导出主动消息的三个失败哨兵 `ErrActiveQuota` / `ErrActiveDisabled` / `ErrRateLimited`：`SendActive` 的返回错误用 `errors.Is` 可判，插件不必 import `internal/core` 就能把「今日预算已满」「配置未开启」「平台 429」分成三条处置路径。**调用签名未变**，插件只需把 `api_version` 改成 11 | #34 |
-| 12 | 契约包 `internal/host` → `pkg/host`：独立 module 的插件现在能直接 import，插件不必再与核心共用一次构建。**`Host` 的方法签名一个字都没变**，变的是「不匹配」的含义——11 及以前是编译错误，12 起是运行期握手拒绝（插件照常编译通过，核心拒绝加载并写进启动报告）。实现侧 `Options.HTTP` 的类型从 `*httpx.Client` 换成 `pkg/host.HTTPBackend`（契约包不再依赖实现包），插件侧 `HTTP` 接口与错误口径不变 | #38 |
+| 12 | 契约包 `internal/host` → `pkg/host`：独立 module 的插件现在能直接 import，插件不必再与核心共用一次构建。**`Host` 的方法签名一个字都没变**，变的是「不匹配」的含义——11 及以前是编译错误，12 起是运行期握手拒绝（插件照常编译通过，核心拒绝加载并写进启动报告）。实现侧 `Options.HTTP` 的类型从 `*httpx.Client` 换成 `pkg/host.HTTPBackend`（契约包不再依赖实现包），插件侧 `HTTP` 接口与错误口径不变。同一版本起 `Host` 的载体是**线协议**，帧格式、方法表与错误码见 §3.9 | #38 / #39 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
@@ -460,6 +460,67 @@ H3 40px、代码 27px / 行高 39px。完整数值落在 `internal/render/style.
 （未识别语法按纯文本原样输出，不报错）、缓存、页脚时间戳、深色主题、自动分页。
 
 **已知妥协**：代码块内出现中文时列不对齐——等宽与全角不同族，`1 汉字 ≠ 2 半角`。
+
+### 3.9 插件线协议（P3，ADR-0005 / #39）
+
+P3 之后核心与插件是**两个进程**，之间只有一条 stdio 通道。协议的实现在 `pkg/rpc`，插件二进制的入口在 `pkg/rpcsdk`（`Serve(host.Plugin)`）。本节只写线上长什么样；`host` 的语义仍是 §3.3 那一套，一个字都没变——子进程只是一个 proxy。
+
+**帧**
+
+```text
++---------+---------+--------------------+--------------------+
+| N (4B)  | H (4B)  | 头部 H 字节 (JSON)  | 正文 N-4-H 字节     |
++---------+---------+--------------------+--------------------+
+```
+
+- `N` 数的是**它自己之后**的全部字节（`N = 4 + H + len(正文)`）：读侧先读 4 字节拿到 N，N 与「还要读多少」是同一个数，没有第二层换算。上限 16 MiB；头部上限 1 MiB。长度校验在分配内存**之前**——一个错乱的前缀不该先把进程 OOM 掉。
+- **正文槽只有一个**，只装 `Image.data`。`Renderer.Markdown` 返回 1–3 MB 的 PNG，单帧直传、不做 base64：塞进 JSON 会多出 4/3 的膨胀与一份同样大的临时字符串，而两端的常驻预算只有几十 MB（§3.8 的账）。
+- 对端在**帧边界**退出 → `io.EOF`，这是子进程下班（`Run` 返回 nil）；读到一半对端没了 → `io.ErrUnexpectedEOF`，这是故障。两者都用 `io.ReadFull`，所以「半包」不会伪装成「空帧」。
+
+**多路复用**。请求是 `{id, method, params, deadline?}`，应答是 `{id, result?, error?}`，`id` 由发侧自增，两端的命名空间互不相干。两端**都是客户端也是服务端**：核心既服务 `host.*` 又调用 `plugin.*`，插件反过来。这不是对称美学——它是「`Init` 里可以调 `Host`」的前提：读循环在自己的协程里跑，一个等应答的调用不会把自己堵死。每个入站请求各起一个协程，所以 `Session.Await` 这类慢调用不会排住同一连接上的其他调用。
+
+**超时**。调用方的 ctx 截止时间捎进请求头（unix 纳秒），对端用 `context.WithDeadline` 重建。跨进程**不设**更宽松的超时（决策 7）：`Handle` 3 s、`Job` 60 s 的口径原样适用，否则最慢的插件会把整个 per-peer 队列拖住。
+
+**方法表**
+
+| 方向 | 方法 | 对应契约 |
+|---|---|---|
+| 核心 → 插件 | `plugin.manifest` | `Plugin.Manifest()`，外加「本产物实现了哪几个可选接口」 |
+| 核心 → 插件 | `plugin.init` | `Plugin.Init(ctx, Host)`，配置段原样随行 |
+| 核心 → 插件 | `plugin.handle` | `Plugin.Handle(ctx, Event) (*Reply, error)`；`nil` 与空 `Reply` 分开传 |
+| 核心 → 插件 | `plugin.start` / `plugin.close` / `plugin.run_job` | `Starter` / `Closer` / `JobRunner`；**未实现则方法不存在** |
+| 插件 → 核心 | `host.reply` / `host.send_active` | `Sender` |
+| 插件 → 核心 | `host.kv_get` / `host.kv_set` / `host.kv_delete` | `KV` 与 `PeerKV(peer)`：`peer` 为空即全局键空间 |
+| 插件 → 核心 | `host.query` | `QueryStore` |
+| 插件 → 核心 | `host.http_get` / `host.http_post` / `host.http_get_with_header` / `host.http_get_once` | `HTTP`；`timeout` 参数即 `WithTimeout` 视图，不引入 handle |
+| 插件 → 核心 | `host.schedule` | `Scheduler` |
+| 插件 → 核心 | `host.is_admin` / `host.admin_targets` | `Host.IsAdmin` / `Admins` |
+| 插件 → 核心 | `host.render` | `Renderer`；应答帧的正文槽带 PNG |
+| 插件 → 核心 | `host.session_await` | `Session` |
+
+**三个访问器不过通道**：`Host.Plugin()`、`Host.Config()`、`Host.Log()`。它们返回的是握手时（`plugin.init`）已经给出的不可变值，或者进程本地的 stderr。给它们各开一个方法意味着每次打日志、每个 handler 里的 `h.Plugin()` 都要一次往返，而返回的是同一个常量；更糟的是「读配置」会变成一次可能失败、可能超时的 IPC，而那个调用点通常没有写错误处理的位置。`HTTP.WithTimeout` 同理：它是本地视图，每次调用把 `timeout` 带进参数。
+
+**错误码**。错误跨进程只走数值码，不走字符串——§3.3 已经写明错误串只供排障、不得解析，靠 `HasPrefix` 分类的话，句子一润色就静默改了控制流。两端各自持一张表：发侧折成码，收侧还原成**本地哨兵**，`errors.Is` / `errors.As` 在两端照常成立。
+
+| 码 | 含义 | 附带的字段 |
+|---|---|---|
+| 0 | 成功 | — |
+| 1 | 未分类错误 | `msg`（原文，仅供排障） |
+| 2 / 3 / 4 | `ErrActiveQuota` / `ErrActiveDisabled` / `ErrRateLimited` | `msg` 保留包装里的场景与 peer |
+| 5 / 7 | `ErrSessionBusy` / `ErrRenderTimeout` | 同上 |
+| 6 | `ErrRenderTooLarge`（`RenderTooLargeError`） | `need_height`，插件据此决定拆几条 |
+| 8 | `*HTTPStatusError` | `status` + `msg` = **body**（Torn 的业务码在里面，这是唯一被允许读错误串的地方） |
+| 9 / 10 | `context.Canceled` / `DeadlineExceeded` | — |
+| 11 / 12 / 13 | `rpc.ErrMethodNotFound` / `ErrConnClosed` / `ErrHandlerPanic` | — |
+| **1000+** | 实现自定义段 | 见下 |
+
+`Register(code, err)` 只收 1000 及以后：让实现方「顺手」复用 2 号会把两个不同的哨兵变成同一个。`core.ErrPassiveExhausted` 用 **1000**——它**故意**不进契约（#36，没有第二个真实消费方），但必须能过通道，所以由核心在实现段注册。收侧认不出的码还原成 `*rpc.RemoteError`，而 `RemoteError` 再被编回去时**保持原码**：否则「插件把不认识的错误转手抛回来」会让核心再也认不出自己的哨兵。
+
+**数值保真**。JSON 里的数字默认变成 `float64`，而 TOML 与 SQLite 给的都是 `int64`。收侧统一 `UseNumber` 再把整数收回 `int64`，否则两处会静默走样：配置里的 `n = 7` 变成 `7.0` 后被 `Params.Decode` 解进 `int` 字段会直接报错；查询结果里的整数列变成 `float64` 会让 `row["n"].(int64)` 这类常规断言失败——而且**只在跨进程时**失败。HTTP 出参是唯一的例外：核心侧把它当 `json.RawMessage` 原样转回，收侧按插件自己的类型解，与进程内那条路逐字一致（包括「数字就是 float64」这件事）。
+
+**已知取舍**：`host.Query` 的 BLOB 列以 base64 字符串到达（JSON 没有 bytes）；`Event.Raw` / `Payload`（≤32 KiB）走 JSON 而不是正文槽，代价约 30% 编码开销，换来「正文槽只有一个、语义唯一」。
+
+**本票不做**：spawn、`--manifest` 探测、退避重启与熔断在 #40；`plugins/bin/` 的释放、`/upgrade` 与文档收口在 #41–#46。
 
 ---
 
