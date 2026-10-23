@@ -6,8 +6,23 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=qqbot
-WorkingDirectory=/opt/qqbot
-ExecStart=/opt/qqbot/bin/qqbot -c /etc/qqbot/config.toml
+# 二进制装在 /var/lib/qqbot/bin 而不是 /opt/qqbot/bin：/upgrade apply 的落位
+# 是「同卷临时文件 + rename」（ADR-0006 决策 5），要求目标目录对服务账号可写，
+# 而 ProtectSystem=strict 把 /opt 与 /usr 一起钉成只读。
+#
+# 另一条路是给 /opt/qqbot/bin 加一条 ReadWritePaths——它能跑，但代价是把
+# 「程序目录只读」这一条加固面永久放开：升级通道本身就是远程代码执行通道
+# （ADR-0006「代价」第一条），再给它一块系统级的可写程序目录只是扩大了
+# 攻击面，换来的仅仅是一个路径写法。/var/lib/qqbot 本来就要写（库、插件、
+# 快照），把 bin 放进去不需要新增任何一条 ReadWritePaths。
+#
+# WorkingDirectory 与数据目录重合：插件子进程不设 cmd.Dir/cmd.Env
+# （internal/pluginproc/spawn.go），cwd 直接继承核心；而 [store].path 若写
+# 相对路径（示例的 ./.temp/data/qqbot.db）就是相对它解析的。核心与插件必须
+# 看到同一个 cwd，否则 ImageSourceFile 的相对路径会两边各读一处（§3.9 的
+# 已知取舍）。
+WorkingDirectory=/var/lib/qqbot
+ExecStart=/var/lib/qqbot/bin/qqbot -c /etc/qqbot/config.toml
 # 双保险：cron 与主动消息日预算都由程序内的 Asia/Shanghai 决定（不读 TZ），
 # 但 Debian 12 默认 UTC，日志时间戳与任何依赖本地时区的库都会偏 8 小时。
 Environment=TZ=Asia/Shanghai
@@ -31,6 +46,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# 一棵可写树覆盖全部运行期写入：SQLite 与 WAL、<datadir>/plugins/bin 的插件
+# 产物、<datadir>/upgrade 的 state.json 与快照、以及自更新要替换的
+# <datadir>/bin/qqbot（与其 .new/.old 同目录）。
 ReadWritePaths=/var/lib/qqbot
 
 [Install]
