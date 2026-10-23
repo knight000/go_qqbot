@@ -37,3 +37,19 @@ func TestAPIVersionMatchesArchitectureTable(t *testing.T) {
 			APIVersion, last)
 	}
 }
+
+// TestAPIVersionIsTwelve 把版本号钉成字面量。
+//
+// 表尾比对只能保证「表与常量一致」，两个一起忘了涨也会绿；这条用例要求
+// 涨版本时必须同时想清楚「插件要改什么」——版本号就是这句话的声明。
+//
+// 7  引入 *HTTPStatusError；8 引入 Yield 取代 Broadcast、Event.Command/Args
+// 与前缀词边界、Event.Mentioned / Raw（#11 / #12 / #13）；9 引入 Host.Session()
+// 与 Event.Session（ADR-0004）；10 改了 Params.Str 的空串语义与 Store.Query
+// 的只读实现（#30）；11 导出主动消息的三个失败哨兵（#34）；
+// 12 把契约外置为 pkg/host，不匹配从编译错误变成握手拒绝（ADR-0005 / #38）。
+func TestAPIVersionIsTwelve(t *testing.T) {
+	if APIVersion != "12" {
+		t.Fatalf("APIVersion=%q，期望 \"12\"", APIVersion)
+	}
+}

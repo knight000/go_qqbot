@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // pngHeader 是 PNG 的 8 字节签名，够 http.DetectContentType 认出来。

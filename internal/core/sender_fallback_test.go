@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // TestImageOnlyFailureSendsFallbackText 钉住 #25 要的"降级"：纯图片回复

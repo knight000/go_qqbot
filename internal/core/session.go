@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // sessionBackend 把 store.DB 与 Router 适配成 host.SessionBackend。

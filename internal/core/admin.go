@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // /admin 属于核心保留指令（不在插件路由里），因为它是权限本身的入口：

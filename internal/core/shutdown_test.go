@@ -13,8 +13,8 @@ import (
 
 	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/config"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // gatedPlugin 的 Handle 卡在 gate 上，用来验证"关停要等在途事件处理完再关插件"。

@@ -1,7 +1,7 @@
 package core
 
 import (
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // 平台 intent 位（bot.intents 位掩码）。只列本核心真正解码过的事件所在的那几位，

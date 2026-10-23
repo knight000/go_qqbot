@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // ErrPassiveExhausted 是本地被动窗口用尽（群 5 次/5 分钟、单聊 4 次/小时）。

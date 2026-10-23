@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/termcolor"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // Level 是调试轨迹的详细程度。

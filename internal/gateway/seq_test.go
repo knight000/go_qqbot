@@ -19,9 +19,9 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // seqPlatform 是第一轮发 READY + 两帧 dispatch、后续轮只记录握手的假平台。

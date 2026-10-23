@@ -13,7 +13,7 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 
 | `internal/core` | 事件去重、群准入（白/黑名单）、落库、路由、按 peer 串行、被动回复额度、发图（上传 + `msg_type=7`）、调度器、7 天 GC、`/reload` 自重启、`/reset` 分级重置 |
 | `internal/buildinfo` | 版本与 VCS commit 识别（`dev cc908d87+dirty`），供启动日志、`/ping`、`/reload` 对比 |
 | `internal/store` | SQLite WAL + 单写连接 + 分批删除 + `incremental_vacuum` |
-| `internal/host` | 插件契约与能力实现（KV / 只读 Query / 受白名单约束的 HTTP / 管理员判定 / 收件人目录 / 日志） |
+| `pkg/host` | 插件契约与能力实现（KV / 只读 Query / HTTP 转发（域名白名单由核心注入的客户端保证）/ 管理员判定 / 收件人目录 / 日志）；只依赖标准库与叶子依赖，不 import `internal/*` |
 | `internal/logx` | slog 文本/JSON handler；终端里 `WARN` 黄、`ERROR` 红，JSON 永不上色 |
 | `internal/termcolor` | 是否该上色的唯一判定：真终端才上色，落盘与 journald 保持纯文本 |
 | `internal/sysinfo` | 跨平台资源采集：CPU、内存、进程 RSS、分区容量、目录占用（无 cgo） |
@@ -538,7 +538,7 @@ go generate ./cmd/bot && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s
 cmd/bot/          入口与唯一装配点
 internal/gateway/ WSS 状态机、心跳、resume、事件解码
 internal/core/    路由、幂等、频控、调度、GC、认领、/admin 权限
-internal/host/    Host 能力实现（插件唯一可见的 API）
+pkg/host/         插件契约与 Host 能力实现（插件唯一可见的 API）
 internal/sysinfo/ 跨平台资源采集（build tag 分 windows / linux）
 internal/store/   schema、迁移、分批 GC、管理员与身份映射
 internal/instance/ 单实例文件锁（flock / CreateFile 独占共享）

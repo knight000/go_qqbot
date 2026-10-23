@@ -22,9 +22,9 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // fakePlatform 是一个能"按剧本关闭"的假平台。

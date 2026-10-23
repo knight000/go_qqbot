@@ -2,13 +2,10 @@ package host
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/knight000/go_qqbot/internal/httpx"
 )
 
 var registry struct {
@@ -68,18 +65,38 @@ type AdminBackend interface {
 	AdminTargets(ctx context.Context) ([]AdminTarget, error)
 }
 
-// Options 是构造插件宿主的输入。Domains 来自插件 Manifest。
+// HTTPBackend 是出站 HTTP 的**实现侧**契约：由核心注入（P3 之后就是 RPC 客户端），
+// 插件看不到它——插件只看到 HTTP。
+//
+// 它存在是为了让本包不必 import 实现包（ADR-0005 决策 1）：契约一旦 import
+// internal/httpx，等于把一个实现细节永久烧进跨进程格式。
+//
+// 错误口径与 HTTP 相同：**非 2xx 必须返回 *HTTPStatusError**。翻译在实现方完成
+// （它认识 httpx 的类型或线协议的错误码），本包只做转发——契约包不该知道
+// 实现侧的错误长什么样。网络失败与 ctx 取消照 Go 原样返回，不得包装。
+type HTTPBackend interface {
+	GetJSON(ctx context.Context, url string, out any) error
+	PostJSON(ctx context.Context, url string, in, out any) error
+	GetJSONWithHeader(ctx context.Context, url string, header map[string]string, out any) error
+	GetJSONOnce(ctx context.Context, url string, header map[string]string, out any) error
+	// WithTimeout 返回共享连接池与全部限流状态、只替换整体超时的视图。
+	WithTimeout(d time.Duration) HTTPBackend
+}
+
+// Options 是构造插件宿主的输入。HTTP 由核心按插件收窄，其余都来自装配点。
 type Options struct {
-	Name    string
-	Config  Params
-	Sender  Sender
-	KV      KVBackend
-	DB      QueryBackend
-	Admin   AdminBackend
-	HTTP    *httpx.Client
-	Sched   Scheduler
-	Log     *slog.Logger
-	Domains []string
+	Name   string
+	Config Params
+	Sender Sender
+	KV     KVBackend
+	DB     QueryBackend
+	Admin  AdminBackend
+	// HTTP 是该插件的出站客户端，**已按 Manifest.AllowedDomains 收窄**：
+	// 白名单判定只有一份实现，在核心的装配处，本包不重复判断。
+	// 零值时 HTTP() 每次调用都返回「未初始化」，不会静默放行。
+	HTTP  HTTPBackend
+	Sched Scheduler
+	Log   *slog.Logger
 	// Renderer 为零值时由 NewService 换成拒绝性替身，见 Renderer()。
 	Renderer Renderer
 	// Session 为零值时同样换成拒绝性替身，见 Session()。
@@ -113,7 +130,7 @@ func NewService(o Options) *Service {
 		kv:        &kvStore{db: o.KV, plugin: o.Name},
 		kvBackend: o.KV,
 		query:     &queryStore{db: o.DB},
-		http:      &httpClient{raw: o.HTTP, domains: o.Domains},
+		http:      &httpClient{raw: o.HTTP},
 		sched:     &pluginSched{name: o.Name, inner: o.Sched},
 		log:       logger.With("plugin", o.Name),
 		sender:    o.Sender,
@@ -231,42 +248,39 @@ func (q *queryStore) Query(ctx context.Context, query string, args ...any) ([]Ro
 	return out, nil
 }
 
-type httpClient struct {
-	raw     *httpx.Client
-	domains []string
-}
+type httpClient struct{ raw HTTPBackend }
 
-func (h *httpClient) client() (*httpx.Client, error) {
+// backend 返回注入的出站客户端。零值必须报错而不是放行：
+// 插件拿不到错误就会误以为请求成功。
+func (h *httpClient) backend() (HTTPBackend, error) {
 	if h.raw == nil {
 		return nil, fmt.Errorf("HTTP 后端未初始化")
 	}
-	return h.raw.WithDomains(h.domains), nil
+	return h.raw, nil
 }
 
 func (h *httpClient) GetJSON(ctx context.Context, url string, out any) error {
-	c, err := h.client()
+	c, err := h.backend()
 	if err != nil {
 		return err
 	}
-	return wrapHTTPErr(c.GetJSON(ctx, url, out))
+	return c.GetJSON(ctx, url, out)
 }
 
 func (h *httpClient) GetJSONWithHeader(ctx context.Context, url string, header map[string]string, out any) error {
-	c, err := h.client()
+	c, err := h.backend()
 	if err != nil {
 		return err
 	}
-	return wrapHTTPErr(c.GetJSONWithHeader(ctx, url, header, out))
+	return c.GetJSONWithHeader(ctx, url, header, out)
 }
 
 func (h *httpClient) GetJSONOnce(ctx context.Context, url string, header map[string]string, out any) error {
-	c, err := h.client()
+	c, err := h.backend()
 	if err != nil {
 		return err
 	}
-	// 429 / 5xx 走的是 httpx 循环里保存的 lastErr，同样是 *httpx.HTTPError，
-	// 所以转换必须发生在这里，而不是只包住 GetJSONWithHeader。
-	return wrapHTTPErr(c.GetJSONOnce(ctx, url, header, out))
+	return c.GetJSONOnce(ctx, url, header, out)
 }
 
 func (h *httpClient) WithTimeout(d time.Duration) HTTP {
@@ -275,32 +289,15 @@ func (h *httpClient) WithTimeout(d time.Duration) HTTP {
 	if h.raw == nil {
 		return h
 	}
-	return &httpClient{raw: h.raw.WithTimeout(d), domains: h.domains}
+	return &httpClient{raw: h.raw.WithTimeout(d)}
 }
 
 func (h *httpClient) PostJSON(ctx context.Context, url string, in, out any) error {
-	c, err := h.client()
+	c, err := h.backend()
 	if err != nil {
 		return err
 	}
-	return wrapHTTPErr(c.PostJSON(ctx, url, in, out))
-}
-
-// wrapHTTPErr 把 httpx 的非 2xx 错误翻译成宿主契约里的类型，
-// 让插件不必 import internal/httpx。
-//
-// 刻意不 Unwrap 出原始的 *httpx.HTTPError：两个类型同时可命中会让调用方
-// 分不清该信哪个，也会让「插件只依赖 host」这条边界在错误处理上失效。
-// 非 HTTPError 的错误（网络失败、ctx 取消、解析失败）原样返回。
-func wrapHTTPErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	var he *httpx.HTTPError
-	if errors.As(err, &he) {
-		return &HTTPStatusError{Status: he.Status, Body: he.Body}
-	}
-	return err
+	return c.PostJSON(ctx, url, in, out)
 }
 
 // pluginSched 替插件把 JobSpec.Plugin 填上。

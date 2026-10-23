@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // 本文件是「主动消息失败可判别」的契约验收（#34）。插件只能 import host，

@@ -3,7 +3,7 @@ package core
 import (
 	"context"
 
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // 权限的填充与判定都放在核心，插件只读 Event.Actor。分两条来源：

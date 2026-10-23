@@ -5,6 +5,12 @@
 //   - 隔离由核心承担：HTTP 域名白名单来自 Manifest.AllowedDomains，KV 按插件
 //     命名空间隔离，权限由 Manifest.Permission 在路由阶段拦截。
 //
+// 包位置是契约的一部分（ADR-0005 决策 1）：它叫 pkg/host 而不是 internal/host，
+// 是为了让独立 module 的插件能 import 它。因此本包**不得 import 任何 internal/*
+// 或其它实现包**——P1 时期这是编译期约束，P3 之后是线协议的约束（契约一旦
+// 依赖实现，等于把一个实现细节永久烧进跨进程格式）。需要实现能力时，在本包
+// 定义窄接口（KVBackend / AdminBackend / HTTPBackend …），由核心注入。
+//
 // Manifest.Capabilities 是保留字段：核心从不读取它，它只是插件作者的自述，
 // 既不构成授权也不构成拒绝。别把它当权限清单读（评审 §4.1）。
 //
@@ -62,8 +68,17 @@ import (
 // import internal/core 就能把「日预算用尽」「配置未开启」「平台 429」
 // 分成三条处置路径。**调用签名未变**，插件只需把 api_version 改成 11。
 //
+// 版本 12：`Host` 的载体从「编译期接口」变成「线协议」（ADR-0005 / #38）。
+//   - 契约包从 `internal/host` 外置为 `pkg/host`：独立 module 的插件现在能
+//     直接 import 它，插件不必再和核心共用一次构建；
+//   - **方法签名一个字都没变**，变的是「不匹配」的含义：11 及以前不匹配是
+//     编译错误，12 起是运行期握手拒绝——插件照常编译通过，核心拒绝加载它，
+//     并在启动报告里写明原因；
+//   - 实现侧新增 `HTTPBackend`：`Options.HTTP` 不再是 `*httpx.Client`，
+//     让契约包彻底不依赖实现包。插件侧看到的 `HTTP` 接口与错误口径不变。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "11"
+const APIVersion = "12"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //
@@ -333,6 +348,8 @@ type KV interface {
 //
 // 上游返回非 2xx 时，方法返回 *HTTPStatusError（不是 httpx 的类型）：
 // 插件据此分辨「429 → 冷却」与「普通失败」，而且不需要 import internal/httpx。
+// 翻译由核心的 HTTPBackend 适配器完成——本包不认识实现侧的错误类型，
+// 这正是它可以外置成 pkg/host 的前提。
 type HTTP interface {
 	GetJSON(ctx context.Context, url string, out any) error
 	PostJSON(ctx context.Context, url string, in, out any) error
@@ -357,7 +374,8 @@ type HTTP interface {
 // context.DeadlineExceeded），调用方用 errors.Is 区分。
 //
 // 存在的理由是边界：插件想判 429 就必须读状态码，而读 httpx 的具体类型
-// 会把插件绑到核心的内部实现上。所以由 host 翻译，插件只依赖本类型。
+// 会把插件绑到核心的内部实现上。所以由核心在装配处翻译成这个类型，
+// 插件只依赖它——契约包不 import 实现包，插件也不必。
 type HTTPStatusError struct {
 	Status int
 	Body   string

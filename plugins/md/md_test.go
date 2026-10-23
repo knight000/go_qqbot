@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // fakeHost 只填本插件用到的能力：日志与渲染器。

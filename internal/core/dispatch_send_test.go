@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // blockingAPI 让 SendMessage 一直阻塞到 ctx 取消，模拟"在途大图上传"。

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 type fakePlugin struct{ m host.Manifest }

@@ -248,7 +248,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 - 同优先级冲突的静态检测**当前未实现**：两条规则同时命中不会报错，启动期也发现不了。实际行为见 §3.4（评审 §4.7 第一行 / §2.3）。
 - `capabilities` 是**保留字段**，当前不参与任何门控；真正起门控作用的是哪三项，见 §3.3 末段（评审 §4.1）。
 
-`Event` 是插件能看到的全部事件事实（字段语义见 `internal/host/host.go`）：
+`Event` 是插件能看到的全部事件事实（字段语义见 `pkg/host/host.go`）：
 
 | 字段 | 含义 | 备注 |
 |---|---|---|
@@ -278,6 +278,7 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 9 | ① `Host` 新增 `Session()`（`Await(ctx, ev, state, ttl)`）：peer 级、一次性会话接管，被占用返回 `host.ErrSessionBusy`；② `Event.Session` 非空表示这条消息是对本插件 `Await` 的回应，此时 `Command` / `Args` 恒为空 | #16 |
 | 10 | ① `host.Params.Str` 区分「键缺失」与「键存在但为空串」：空串返回 `""` 而不是默认值；② `Host.Store.Query` 的只读改由 SQLite `query_only` 连接保证、SQL 原样执行（不再自动追加 `LIMIT`），行数在取行时截断到 1000 | #30 |
 | 11 | `host` 导出主动消息的三个失败哨兵 `ErrActiveQuota` / `ErrActiveDisabled` / `ErrRateLimited`：`SendActive` 的返回错误用 `errors.Is` 可判，插件不必 import `internal/core` 就能把「今日预算已满」「配置未开启」「平台 429」分成三条处置路径。**调用签名未变**，插件只需把 `api_version` 改成 11 | #34 |
+| 12 | 契约包 `internal/host` → `pkg/host`：独立 module 的插件现在能直接 import，插件不必再与核心共用一次构建。**`Host` 的方法签名一个字都没变**，变的是「不匹配」的含义——11 及以前是编译错误，12 起是运行期握手拒绝（插件照常编译通过，核心拒绝加载并写进启动报告）。实现侧 `Options.HTTP` 的类型从 `*httpx.Client` 换成 `pkg/host.HTTPBackend`（契约包不再依赖实现包），插件侧 `HTTP` 接口与错误口径不变 | #38 |
 
 ### 3.3 Host 能力（唯一对外通道）
 
@@ -288,8 +289,8 @@ Lifecycle:  Init(ctx, Host) → Start(ctx) → [Handle(ctx, Event) | Job(ctx, Jo
 | 主动消息错误哨兵 | `host.ErrActiveQuota` / `host.ErrActiveDisabled` / `host.ErrRateLimited`：`SendActive` 的失败原因用 `errors.Is` 判别，三者互斥；错误串多数带场景/peer 或插件名（429 还带剩余冷却），只供排障 | 纯判别，不改变发送行为；`ErrActiveQuota` 同时覆盖「日预算账本不可用」的 fail-closed 拒发；网络失败与本地校验失败不属于任何一类 |
 | `KV` / `PeerKV(peer)` | 按插件命名空间隔离的 KV，支持 TTL；`PeerKV` 多一层会话维度 | 只能读写自己的命名空间；`/reset session` 只清 `PeerKV` 写入的部分 |
 | `Store.Query` | 只读、参数化、行数上限 1000。只读由读连接的 `PRAGMA query_only` 保证（`WITH … DELETE` 这类写法同样被拒，不靠语句前缀过滤）；1000 行在取行时截断，SQL 不被改写，所以插件看到的语句与自己写的一致 | 不允许 DDL/写操作 |
-| `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝；白名单在重定向的**每一跳**都重新校验（拒绝 scheme 变化）；429 按 `Retry-After` 冷却域名桶（缺省 60s），冷却期内不出网 |
-| `HTTPStatusError` | `{Status int, Body string}`；`HTTP` 的四个方法在非 2xx 时返回它，`Error()` 只含状态码 | 由 host 翻译 `*httpx.HTTPError` 而来，**插件不需要 import `internal/httpx`** 就能分辨 429 与普通失败；网络错误与 ctx 取消不包装 |
+| `HTTP` | `GetJSON` / `PostJSON` / `GetJSONWithHeader` / `GetJSONOnce` / `WithTimeout` | 域名白名单 + 超时 + 重试 + 自动降级；未声明域名一律拒绝；白名单在**装配处**（`Core.hostHTTPBackend`）用 `WithDomains` 收窄后注入（`pkg/host` 不认识域名，判定只有一份）；白名单在重定向的**每一跳**都重新校验（拒绝 scheme 变化）；429 按 `Retry-After` 冷却域名桶（缺省 60s），冷却期内不出网 |
+| `HTTPStatusError` | `{Status int, Body string}`；`HTTP` 的四个方法在非 2xx 时返回它，`Error()` 只含状态码 | 由核心的 `hostHTTP` 适配器翻译 `*httpx.HTTPError` 而来（契约包不认识 `httpx`，这正是它能外置成 `pkg/host` 的前提），**插件不需要 import `internal/httpx`** 就能分辨 429 与普通失败；网络错误与 ctx 取消不包装 |
 | `Config()` | `[plugins.<name>]` 只读视图：`Str` / `Bool` / `Int` / `Duration` / `Decode(ptr)` | 只能读自己的配置段；`Manifest.config_schema` 在装配期校验（声明即必填，四种类型）；`Decode` 把整段解成结构体，错误带段名与键名 |
 | `Scheduler.Register` | 注册 Job（cron 表达式 + 超时；`PerPeer` 时按在群展开） | 仅启动期可注册 |
 | `Log` | 结构化日志，自动带 plugin 字段 | 敏感字段脱敏 |
@@ -336,7 +337,7 @@ qqbot/
   cmd/bot/main.go              入口，集中注册插件（P1 的唯一“装配点”）
   internal/gateway/            WSS 状态机、心跳、resume、分片
   internal/core/               路由、幂等、频控、调度、媒体、GC
-  internal/host/               Host 接口实现（插件唯一可见的 API）
+  pkg/host/                    插件契约与 Host 实现（插件唯一可见的 API）
   internal/store/              schema、迁移、GC
   internal/httpx/              统一出站客户端
   plugins/qqbot-plugin-torn/   插件：Torn 查询（独立仓的嵌套克隆，未跟踪）
@@ -345,6 +346,10 @@ qqbot/
   deploy/qqbot.service
   docs/ARCHITECTURE.md
 ```
+
+`pkg/host` 是**契约包**：只放接口、类型、哨兵与常量，**不得 import 任何 `internal/*`**（含 `internal/httpx`，见下），也**不依赖任何 `knight000` 的包**——`go list -deps ./pkg/host` 除自身外只有标准库与一项叶子依赖 `BurntSushi/toml`（`Params.Decode` 用，零传递依赖，核心与插件本来就都要它）。这条约束现在是编译期的，P3 之后是**线协议**的：契约一旦依赖实现包，等于把一个实现细节永久烧进跨进程格式（ADR-0005 决策 1）。
+
+出站 HTTP 就是这条边界的实例：契约包只定义 `HTTPBackend`（四个 JSON 方法 + `WithTimeout`），怎么发请求全在 `internal/httpx`，怎么把非 2xx 翻成 `*host.HTTPStatusError` 在 `hostHTTP` 适配器里，怎么按 `Manifest.AllowedDomains` 收窄客户端在 `Core.hostHTTPBackend`（装配点，`WithDomains` 只在那里调一次）。三件事都在核心，契约侧只留接口。`Host` 的实现（`Service`）也在同一个包里，但它只引用本包内定义的窄接口（`KVBackend` / `Sender` / `HTTPBackend`），实现一律由装配点注入。
 
 **Go 构建不拆分**：私有插件不是独立 module，也不是 submodule——它是放在 `plugins/<repo>/` 下的一个**嵌套克隆**，被 `.gitignore` 忽略，随核心模块一起编译。
 
@@ -367,7 +372,7 @@ qqbot-plugin-torn/              插件工作区：核心仓的克隆
 
 推论：同一个核心提交在不同工作区可能产出不同二进制（取决于 `plugins_gen.go` 生成时目录里有什么）。这是「核心不引用业务插件」的代价，换来核心仓克隆即可构建、插件仓有独立提交历史。
 
-> 为什么不拆成独立 module：`internal/host` 按 Go 规则只能被 `github.com/knight000/go_qqbot/` 路径下的包 import，另一个模块路径必然编译失败；把契约移出 `internal/` 是另一件事，当前不做。
+> 为什么不拆成独立 module（现状）：契约**已经**移出 `internal/`（`pkg/host`，#38），所以「另一个模块路径 import 不到」这个理由不再成立——P3 的插件正是独立 module 并直接 `require` 核心（ADR-0005 决策 1）。但插件**当前仍随核心模块一起编译**：`plugins_gen.go` 与 `go generate` 那一套还没拆（那是 #41 的范围），所以上面「插件目录不能有 `go.mod`」暂依旧成立。
 
 ⚠️ `git clean -xdf` 会连同插件目录里的 `.git` 一起删掉——插件仓有未推送提交时不要跑。
 
@@ -398,7 +403,7 @@ Go 项目的长期维护成本几乎全部来自依赖链，而不是自己的�
 | 字体光栅 | `golang.org/x/image` | TrueType/OpenType 解析、字形光栅与 `font.Drawer` 都在这里，自写光栅器不现实；间接引入 `x/text` |
 
 后两项服务于**渲染**能力（见 §3.8），已随该能力落地进入 `go.mod`：解析在 `internal/render`，
-契约（接口与哨兵）在 `internal/host/render.go`。
+契约（接口与哨兵）在 `pkg/host/render.go`。
 
 不上依赖的部分：HTTP 用标准库 `net/http`（连接复用、超时、退避自己写，约 100 行）；测试用标准 `testing` + fake Host，不引 testify。目标 Go 版本 1.26+（`slog` 与循环变量语义修复；`modernc.org/sqlite v1.60` 要求 1.26）。
 

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 	"github.com/robfig/cron/v3"
 )
 

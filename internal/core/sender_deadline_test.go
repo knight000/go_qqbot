@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // deadlineAPI 记下每次出站拿到的 ctx deadline。上传与发消息分开记，

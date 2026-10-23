@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/knight000/go_qqbot/internal/api"
-	"github.com/knight000/go_qqbot/internal/host"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // uploadImage 上传一张图片并返回 file_info。

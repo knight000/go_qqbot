@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/config"
-	"github.com/knight000/go_qqbot/internal/host"
 	"github.com/knight000/go_qqbot/internal/store"
+	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // newAdminCore 构造一个只装了存储与发送器的最小 Core，用于跑 /admin 与 /group 指令。
