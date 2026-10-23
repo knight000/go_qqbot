@@ -54,8 +54,9 @@ func loadOne(t *testing.T, mode string, mutate func(*pluginproc.Options)) (host.
 
 	logs := newLogs()
 	o := pluginproc.Options{
-		Dir: dir,
-		Log: logs.logger(),
+		Dir:          dir,
+		Log:          logs.logger(),
+		ProbeTimeout: probeForTest,
 		ConfigFor: func(string) map[string]any {
 			return map[string]any{"greeting": "你好"}
 		},
@@ -303,9 +304,10 @@ func TestCrashBacksOffThenDisables(t *testing.T) {
 
 	logs := newLogs()
 	plugins, err := pluginproc.Load(context.Background(), pluginproc.Options{
-		Dir:     dir,
-		Log:     logs.logger(),
-		Backoff: []time.Duration{10 * time.Millisecond},
+		Dir:          dir,
+		Log:          logs.logger(),
+		Backoff:      []time.Duration{10 * time.Millisecond},
+		ProbeTimeout: probeForTest,
 	})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
