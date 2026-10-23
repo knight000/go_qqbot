@@ -14,6 +14,7 @@ package pluginproc_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,6 +46,13 @@ const (
 	// modeAlias 自称 "echo"：验「两个文件抢同一个插件名」。文件名只是标签，
 	// 名字由 manifest 说了算，所以这种撞车是可能的（升级残留一个旧文件）。
 	modeAlias = "alias"
+	// modeBadInit 的 Init 返回错误：这是"配置写错"，与"产物崩溃"的处置不同。
+	modeBadInit = "badinit"
+	// modeStubborn 无视 plugin.close，并且在 Serve 返回后装死：三级关闭的
+	// 第二、三级（EOF / 信号）必须还能把它收掉。
+	modeStubborn = "stubborn"
+	// modePlain 只实现 host.Plugin 的三个必选接口，不实现任何可选接口。
+	modePlain = "plain"
 )
 
 func TestMain(m *testing.M) {
@@ -60,7 +68,8 @@ func TestMain(m *testing.M) {
 func helperMode() string {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
 	switch base {
-	case modeEcho, modeSlow, modeCrashy, modeBadAPI, modeReserved, modeHangManifest, modeGarbage, modeAlias:
+	case modeEcho, modeSlow, modeCrashy, modeBadAPI, modeReserved, modeHangManifest, modeGarbage,
+		modeAlias, modeBadInit, modeStubborn, modePlain:
 		return base
 	}
 	return ""
@@ -105,9 +114,19 @@ func runAsPlugin(mode string) {
 		os.Exit(3)
 	}
 
-	if err := rpcsdk.Serve(newHelperPlugin(mode)); err != nil {
+	var p host.Plugin = newHelperPlugin(mode)
+	if mode == modePlain {
+		p = plainPlugin{h: p.(*helperPlugin)}
+	}
+	if err := rpcsdk.Serve(p); err != nil {
 		fmt.Fprintln(os.Stderr, mode+":", err)
 		os.Exit(1)
+	}
+	if mode == modeStubborn && !hasManifestFlag() {
+		// 装死：连 EOF 都不理会（用 Sleep 而不是 select{}——后者会被 Go 的
+		// 死锁检测判成 "all goroutines are asleep" 直接 panic 退出，
+		// 那就不是"杀不掉"而是"自己死了"，验不到第二三级）。
+		time.Sleep(30 * time.Second)
 	}
 }
 
@@ -172,6 +191,9 @@ func (p *helperPlugin) Manifest() host.Manifest {
 }
 
 func (p *helperPlugin) Init(_ context.Context, h host.Host) error {
+	if p.mode == modeBadInit {
+		return errors.New("配置里的 token 为空")
+	}
 	p.mu.Lock()
 	p.h, p.cfg = h, h.Config().Str("greeting", "<none>")
 	p.mu.Unlock()
@@ -190,6 +212,10 @@ func (p *helperPlugin) Start(context.Context) error {
 // Close 是三级关闭的第一级（RPC close）：它写了 marker，才证明核心是先
 // 请插件自己收摊、再动信号。
 func (p *helperPlugin) Close(context.Context) error {
+	if p.mode == modeStubborn {
+		// 不理会 close：让核心的 1s 期限到期，走到第二、三级。
+		time.Sleep(30 * time.Second)
+	}
 	appendMarker("close=" + p.mode)
 	return nil
 }
@@ -219,6 +245,18 @@ func (p *helperPlugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply,
 	default:
 		return &host.Reply{Content: ev.Args}, nil
 	}
+}
+
+// plainPlugin 只暴露 host.Plugin 的三个必选方法：Start / Close / RunJob
+// 都不实现，手工转发三条，避免嵌入把可选接口一起"继承"过来。
+type plainPlugin struct{ h *helperPlugin }
+
+func (p plainPlugin) Manifest() host.Manifest { return p.h.Manifest() }
+
+func (p plainPlugin) Init(ctx context.Context, h host.Host) error { return p.h.Init(ctx, h) }
+
+func (p plainPlugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
+	return p.h.Handle(ctx, ev)
 }
 
 // install 把测试二进制复制成 bin/<mode>，返回落地的路径。
