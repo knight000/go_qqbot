@@ -119,8 +119,9 @@ func TestLoadCachesManifestFromSingleProbe(t *testing.T) {
 
 	logs := newLogs()
 	plugins, err := pluginproc.Load(context.Background(), pluginproc.Options{
-		Dir: dir,
-		Log: logs.logger(),
+		Dir:          dir,
+		Log:          logs.logger(),
+		ProbeTimeout: probeForTest,
 	})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -162,7 +163,7 @@ func TestLoadSkipsInvalidManifests(t *testing.T) {
 			plugins, err := pluginproc.Load(context.Background(), pluginproc.Options{
 				Dir:          dir,
 				Log:          logs.logger(),
-				ProbeTimeout: 2 * time.Second,
+				ProbeTimeout: probeForTest,
 			})
 			if err != nil {
 				t.Fatalf("单个插件坏掉不该让 Load 失败: %v", err)
@@ -232,9 +233,10 @@ func TestLoadSkipsDisabledPlugin(t *testing.T) {
 
 	logs := newLogs()
 	plugins, err := pluginproc.Load(context.Background(), pluginproc.Options{
-		Dir:      dir,
-		Log:      logs.logger(),
-		Disabled: []string{modeEcho},
+		Dir:          dir,
+		Log:          logs.logger(),
+		Disabled:     []string{modeEcho},
+		ProbeTimeout: probeForTest,
 	})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -256,8 +258,9 @@ func TestLoadDropsDuplicateManifestName(t *testing.T) {
 
 	logs := newLogs()
 	plugins, err := pluginproc.Load(context.Background(), pluginproc.Options{
-		Dir: dir,
-		Log: logs.logger(),
+		Dir:          dir,
+		Log:          logs.logger(),
+		ProbeTimeout: probeForTest,
 	})
 	if err != nil {
 		t.Fatalf("Load: %v", err)

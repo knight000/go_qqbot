@@ -34,6 +34,14 @@ const (
 	pidEnv    = "HELPER_PID"
 )
 
+// probeForTest 是不验超时的用例统一给的探测期限。
+//
+// 2 秒是发布口径（ADR-0005 决策 5），不是本机的测试口径：`go test ./...`
+// 会并行跑几个包，这时冷启一个 5 MB 的测试二进制（杀软扫描 + CPU 被占满）
+// 超过 2 秒是常事，于是"探测失败"变成随机红。探测超时本身由
+// TestLoadKillsProbeThatHangsPastTimeout 用 1 秒专门盯着。
+const probeForTest = 10 * time.Second
+
 // 角色名。文件名（去掉 .exe）就是角色，见 helperMode。
 const (
 	modeEcho         = "echo"         // 正常插件：回显、记账、写 stderr
