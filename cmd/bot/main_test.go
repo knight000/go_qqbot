@@ -139,25 +139,3 @@ func TestSignalRegistrationPrecedesSlowStartup(t *testing.T) {
 		prev, prevAt = marker, at
 	}
 }
-
-// 过渡期（#41 之前）四个内置插件还在二进制里，插件目录里可能同时躺着一份
-// 同名产物。两份都装上的后果不是"多一个进程"，而是路由构建时命令撞车、
-// 整台机器人起不来——与 ADR-0005 决策 6「一个坏插件不该拖垮启动」正好相反。
-// 所以按名字去重，且 in-process 的那个优先：它一定与核心同版本。
-func TestMergePluginsDedupesByName(t *testing.T) {
-	// 用指针：值类型会按字段相等，identity 断言就退化成永远成立。
-	inproc := []host.Plugin{&fakePlugin{name: "echo"}, &fakePlugin{name: "adminping"}}
-	sub := []host.Plugin{&fakePlugin{name: "echo"}, &fakePlugin{name: "torn"}}
-
-	got := mergePlugins(inproc, sub, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
-	names := pluginNames(got)
-	if names != "adminping,echo,torn" {
-		t.Fatalf("合流后的插件 = %q，期望 adminping,echo,torn（重名只留一个）", names)
-	}
-	// 留下来的必须是 in-process 那个，不是"先到先得"的巧合。
-	for _, p := range got {
-		if p.Manifest().Name == "echo" && p != inproc[0] {
-			t.Fatalf("重名时留下了子进程那个，应当保留 in-process")
-		}
-	}
-}

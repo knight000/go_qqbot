@@ -29,8 +29,6 @@ import (
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
-func init() { host.Register(&Plugin{}) }
-
 // readProcessMemory 是本进程内存的采集入口。做成变量只为一件事：支持平台上
 // 真实采集几乎不会失败，"采集失败"分支只能靠注入来验证。
 var readProcessMemory = sysinfo.ReadProcessMemory

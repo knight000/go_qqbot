@@ -8,6 +8,10 @@ import (
 
 	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/pkg/host"
+	"github.com/knight000/go_qqbot/plugins/adminping"
+	"github.com/knight000/go_qqbot/plugins/bootnotice"
+	"github.com/knight000/go_qqbot/plugins/echo"
+	"github.com/knight000/go_qqbot/plugins/md"
 )
 
 // 私有插件（开发工作区里 go generate 进来的那些）一旦声明 ConfigSchema，
@@ -53,10 +57,10 @@ func TestExampleConfigSatisfiesEveryPluginSchema(t *testing.T) {
 		t.Fatalf("读取示例配置: %v", err)
 	}
 
-	plugins := host.Registered()
-	if len(plugins) == 0 {
-		t.Fatal("没有注册任何插件（先在 cmd/bot 下跑 go generate）")
-	}
+	// 示例插件已经迁成独立产物（ADR-0005 决策 10），编译期注册表不存在了。
+	// 这条测试要守的是「入库的示例配置满足入库的示例插件的 schema」，所以
+	// 这里显式列出四个包——列表本身就是"随仓库发布的示例插件"的定义。
+	plugins := []host.Plugin{&echo.Plugin{}, &adminping.Plugin{}, &bootnotice.Plugin{}, &md.Plugin{}}
 	manifests := make([]host.Manifest, 0, len(plugins))
 	for _, p := range plugins {
 		manifests = append(manifests, p.Manifest())
