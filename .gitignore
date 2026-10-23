@@ -35,10 +35,11 @@ qqbot.exe
 !/plugins/bootnotice
 !/plugins/md
 
-# 由 tools/genplugins 生成：把 plugins/ 下的插件编进二进制的唯一开关。
-# 不入库——核心仓克隆下来只带 main.go 里的示例插件，插件工作区跑一次
-# `go generate ./cmd/bot` 即可把新插件纳入构建。
-/cmd/bot/plugins_gen.go
+# 出厂插件产物：`go run ./tools/build plugins` 按平台写进各目录，再由核心
+# go:embed 内嵌（ADR-0005 决策 11）。产物不入库，只保留 .gitkeep 占位——
+# 目录里没有匹配文件时 //go:embed 直接编译失败。
+/internal/pluginbundle/dist/*/*
+!/internal/pluginbundle/dist/*/.gitkeep
 
 # 编辑器 / 本地工具状态
 .idea/
