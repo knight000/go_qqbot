@@ -1,7 +1,9 @@
 # qqbot 配置样例
 #
-# 本地开发：复制为 config.local.toml（已在 .gitignore 中），把 [app] 的 id/secret 填进去。
-# 生产环境：放 /etc/qqbot/config.toml，权限 600，属主 qqbot。
+# 这份文件是 `qqbot init` 写出去的模板（内嵌在二进制里），不需要手工复制。
+#   本地开发：qqbot init          → 写 config/config.local.toml（已在 .gitignore 中）
+#   生产环境：qqbot init -c /etc/qqbot/config.toml（权限 600，属主 qqbot）
+# 生成后把 [app] 的 id/secret 填进去即可启动。
 #
 # 认证（认证存本地 config，按你的要求）：
 #   [app] id / secret 直接写本文件，不再依赖 EnvironmentFile。
