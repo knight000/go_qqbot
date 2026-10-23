@@ -52,9 +52,6 @@ func (r Result) Decode(v any) error {
 	return decodeJSON(r.raw, v)
 }
 
-// Raw 返回未解析的结果，供调用方自己解。
-func (r Result) Raw() json.RawMessage { return r.raw }
-
 // Body 返回这一帧的正文槽（图片字节）。
 func (r Result) Body() []byte { return r.body }
 
@@ -86,7 +83,7 @@ type Conn struct {
 
 	mu      sync.Mutex
 	closed  bool
-	pending map[uint64]chan result
+	pending map[uint64]chan delivery
 	runErr  error
 
 	hmu      sync.RWMutex
@@ -95,7 +92,10 @@ type Conn struct {
 	nextID atomic.Uint64
 }
 
-type result struct {
+// delivery 是一次调用的结局：对端给的结果，或一个已经还原成本地形态的错误。
+// 名字刻意与调用方看到的 Result 区分：一个是通道内部的中转，一个是
+// 「这次调用返回了什么」。
+type delivery struct {
 	hdr  header
 	body []byte
 	err  error
@@ -123,7 +123,7 @@ func NewConn(r io.Reader, w io.Writer, o Options) *Conn {
 		reg:      o.Registry,
 		log:      o.Logger,
 		done:     make(chan struct{}),
-		pending:  make(map[uint64]chan result),
+		pending:  make(map[uint64]chan delivery),
 		handlers: make(map[string]Handler),
 	}
 	if c.reg == nil {
@@ -235,15 +235,16 @@ func (c *Conn) deliver(hdr header, body []byte) {
 	c.mu.Unlock()
 	if ch == nil {
 		// 调用方已经超时走人。这不是错误，但值得留痕：频繁出现说明
-		// 超时设得比实际耗时紧。
-		c.log.Debug("rpc 丢弃无人等待的应答", "id", hdr.ID, "method", hdr.Method)
+		// 超时设得比实际耗时紧。应答帧里没有 method（只有 id），
+		// 所以别在这一行里找方法名。
+		c.log.Debug("rpc 丢弃无人等待的应答", "id", hdr.ID)
 		return
 	}
 	if hdr.Error != nil {
-		ch <- result{err: c.reg.Decode(hdr.Error)}
+		ch <- delivery{err: c.reg.Decode(hdr.Error)}
 		return
 	}
-	ch <- result{hdr: hdr, body: body}
+	ch <- delivery{hdr: hdr, body: body}
 }
 
 // respond 写应答。err 非 nil 时只写错误码——错误串在 Msg 里，仅供排障。
@@ -261,11 +262,18 @@ func (c *Conn) respond(id uint64, resp Response, err error) {
 		}
 		raw = b
 	}
-	_ = c.send(header{ID: id, Result: raw}, resp.Body)
+	if err := c.send(header{ID: id, Result: raw}, resp.Body); errors.Is(err, ErrFrameTooLarge) {
+		// 结果太大（典型是超限的图片）：回一条小错误，让调用方知道这次
+		// 为什么没成。不发就等于让对面等到超时——那是最难查的一种失败。
+		_ = c.send(header{ID: id, Error: c.reg.Encode(err)}, nil)
+	}
 }
 
-// send 写一帧。写失败会触发收摊：管道断了之后这条连接上的任何调用都不会
-// 再有应答，早失败比让调用方各自超时更好排障。
+// send 写一帧。除了「帧超上限」以外的写失败都会触发收摊：管道断了之后
+// 这条连接上的任何调用都不会再有应答，早失败比让调用方各自超时更好排障。
+//
+// 超上限单独处理——它不是管道的问题，是**这一次**的内容太大（比如一张
+// 超过 32 MiB 的图）。把它当成连接级故障会让后续所有调用一起失败。
 func (c *Conn) send(hdr header, body []byte) error {
 	jb, err := json.Marshal(hdr)
 	if err != nil {
@@ -276,10 +284,12 @@ func (c *Conn) send(hdr header, body []byte) error {
 	if c.writeErr != nil {
 		err = c.writeErr
 	} else if err = writeFrame(c.w, frame{header: jb, body: body}); err != nil {
-		c.writeErr = err
+		if !errors.Is(err, ErrFrameTooLarge) {
+			c.writeErr = err
+		}
 	}
 	c.wmu.Unlock()
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrFrameTooLarge) {
 		c.shutdown(err)
 	}
 	return err
@@ -305,7 +315,7 @@ func (c *Conn) CallBody(ctx context.Context, method string, params any, body []b
 		// 没有任何联系，插件里的 HTTP 调用不会跟着中止（决策 7）。
 		hdr.Deadline = dl.UnixNano()
 	}
-	ch := make(chan result, 1)
+	ch := make(chan delivery, 1)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -366,16 +376,16 @@ func (c *Conn) shutdown(err error) error {
 		c.closed = true
 		c.runErr = err
 		pend := c.pending
-		c.pending = make(map[uint64]chan result, len(pend))
+		c.pending = make(map[uint64]chan delivery, len(pend))
 		c.mu.Unlock()
 
 		for _, ch := range pend {
 			// 带缓冲的通道，这里不会阻塞：调用方可能已经放弃，
 			// 但缓冲位保证发送方（也就是我们）不会卡死。
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				ch <- result{err: fmt.Errorf("%w: 对端半包退出", ErrConnClosed)}
+				ch <- delivery{err: fmt.Errorf("%w: 对端半包退出", ErrConnClosed)}
 			} else {
-				ch <- result{err: ErrConnClosed}
+				ch <- delivery{err: ErrConnClosed}
 			}
 		}
 		// 两端各自实现 io.Closer 就关：插件侧是 stdin/stdout，核心侧是管道。

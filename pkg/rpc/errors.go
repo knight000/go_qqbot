@@ -49,6 +49,7 @@ const (
 	CodeMethodNotFound = 11 // ErrMethodNotFound
 	CodeConnClosed     = 12 // ErrConnClosed
 	CodeHandlerPanic   = 13 // handler 内部 panic，已 recover
+	CodeFrameTooLarge  = 14 // ErrFrameTooLarge：这一次的内容太大，连接没坏
 
 	// CodeImplBase 起是实现自定义码段。注册时低于它的号码一律拒绝：
 	// 让实现方「顺手」复用 2 号会把两个不同的哨兵变成同一个。
@@ -134,6 +135,7 @@ func NewRegistry() *Registry {
 		{CodeMethodNotFound, ErrMethodNotFound},
 		{CodeConnClosed, ErrConnClosed},
 		{CodeHandlerPanic, ErrHandlerPanic},
+		{CodeFrameTooLarge, ErrFrameTooLarge},
 	} {
 		// 默认表自己不可能冲突，冲突即代码写错，直接 panic 比留个
 		// 半残的表更难查。

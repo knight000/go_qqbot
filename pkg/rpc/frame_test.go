@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
@@ -121,6 +122,23 @@ func TestFrameBadLength(t *testing.T) {
 			t.Fatalf("err = %v，期望 ErrBadFrame", err)
 		}
 	})
+}
+
+// TestFrameHeaderTooLargeReadSide：头部上限必须在**读**侧成立。
+//
+// 只在写侧校验等于没有校验：上限是给「对端说了算」的字段兜底的，而写侧
+// 是本单位。帧总长在 32 MiB 之内、头部却声明 8 MiB 的帧，如果不判，
+// 一次 8 MiB 的 make 就发生了——这正是上限要防的那件事。
+func TestFrameHeaderTooLargeReadSide(t *testing.T) {
+	h := maxHeaderBytes + 1
+	total := 4 + h // 4 字节头部长度 + 头部本身，正文为 0
+	buf := make([]byte, 4+total)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(total))
+	binary.BigEndian.PutUint32(buf[4:8], uint32(h))
+
+	if _, err := readFrame(bytes.NewReader(buf)); !errors.Is(err, ErrBadFrame) {
+		t.Fatalf("err = %v，期望 ErrBadFrame（头部超过 %d）", err, maxHeaderBytes)
+	}
 }
 
 // TestFrameTooLarge 断言超上限在**写**侧就失败，不等读侧发现。

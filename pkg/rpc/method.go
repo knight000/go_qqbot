@@ -67,20 +67,3 @@ const (
 	OptionalClose  = MethodPluginClose
 	OptionalRunJob = MethodPluginRunJob
 )
-
-// AllMethods 返回本包认识的全部方法名，供测试与排障自检用。
-//
-// 它不代表某条连接上真的注册了这些方法：插件未必实现 Close，核心也可能
-// 没装配 Renderer——未注册的方法一律回 CodeMethodNotFound。
-func AllMethods() []string {
-	return []string{
-		MethodPluginManifest, MethodPluginInit, MethodPluginHandle,
-		MethodPluginStart, MethodPluginClose, MethodPluginRunJob,
-		MethodHostReply, MethodHostSendActive,
-		MethodHostKVGet, MethodHostKVSet, MethodHostKVDelete,
-		MethodHostQuery,
-		MethodHostHTTPGet, MethodHostHTTPPost, MethodHostHTTPGetHeader, MethodHostHTTPGetOnce,
-		MethodHostSchedule, MethodHostIsAdmin, MethodHostAdminTargets,
-		MethodHostRender, MethodHostSessionAwait,
-	}
-}

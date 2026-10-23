@@ -66,10 +66,7 @@ func badParams(method string, err error) error {
 }
 
 func (s *hostServer) reply(ctx context.Context, req Request) (Response, error) {
-	var p struct {
-		Event eventDTO
-		Msg   replyDTO
-	}
+	var p replyParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostReply, err)
 	}
@@ -81,11 +78,7 @@ func (s *hostServer) reply(ctx context.Context, req Request) (Response, error) {
 }
 
 func (s *hostServer) sendActive(ctx context.Context, req Request) (Response, error) {
-	var p struct {
-		Scene string
-		Peer  string
-		Msg   replyDTO
-	}
+	var p sendActiveParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostSendActive, err)
 	}
@@ -106,7 +99,7 @@ func (s *hostServer) kv(peer string) host.KV {
 }
 
 func (s *hostServer) kvGet(ctx context.Context, req Request) (Response, error) {
-	var p struct{ Peer, Key string }
+	var p kvParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostKVGet, err)
 	}
@@ -114,19 +107,11 @@ func (s *hostServer) kvGet(ctx context.Context, req Request) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
-	return Response{Result: struct {
-		Value []byte
-		Found bool
-	}{val, found}}, nil
+	return Response{Result: kvGetResult{Value: val, Found: found}}, nil
 }
 
 func (s *hostServer) kvSet(ctx context.Context, req Request) (Response, error) {
-	var p struct {
-		Peer  string
-		Key   string
-		Value []byte
-		TTL   int64
-	}
+	var p kvSetParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostKVSet, err)
 	}
@@ -134,7 +119,7 @@ func (s *hostServer) kvSet(ctx context.Context, req Request) (Response, error) {
 }
 
 func (s *hostServer) kvDelete(ctx context.Context, req Request) (Response, error) {
-	var p struct{ Peer, Key string }
+	var p kvParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostKVDelete, err)
 	}
@@ -142,10 +127,7 @@ func (s *hostServer) kvDelete(ctx context.Context, req Request) (Response, error
 }
 
 func (s *hostServer) query(ctx context.Context, req Request) (Response, error) {
-	var p struct {
-		Query string
-		Args  []any
-	}
+	var p queryParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostQuery, err)
 	}
@@ -156,25 +138,7 @@ func (s *hostServer) query(ctx context.Context, req Request) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
-	return Response{Result: struct{ Rows []host.Row }{rows}}, nil
-}
-
-// httpResult 把上游 JSON **原样**带回去，不在核心侧解一遍再编一遍。
-//
-// 解一遍的代价是保真：解进 any 会把所有数字变成 float64（int64 里超过 2^53
-// 的会被改掉），再编回去就是另一份数据了。收侧按自己的 out 类型解，
-// 与进程内那条路逐字一致。
-type httpResult struct {
-	Out json.RawMessage
-}
-
-// httpParams 是四个 HTTP 方法的公共入参（各自的字段互有冗余，但一个结构体
-// 比四个只在两三个字段上有差别的结构体好维护）。
-type httpParams struct {
-	URL     string
-	In      json.RawMessage
-	Header  map[string]string
-	Timeout int64 // 纳秒；0 表示用默认超时
+	return Response{Result: queryResult{Rows: rows}}, nil
 }
 
 // http 返回本次调用要用的客户端。timeout > 0 时取 WithTimeout 视图
@@ -236,7 +200,7 @@ func (s *hostServer) httpGetOnce(ctx context.Context, req Request) (Response, er
 }
 
 func (s *hostServer) schedule(ctx context.Context, req Request) (Response, error) {
-	var p struct{ Spec jobSpecDTO }
+	var p scheduleParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostSchedule, err)
 	}
@@ -247,7 +211,7 @@ func (s *hostServer) schedule(ctx context.Context, req Request) (Response, error
 }
 
 func (s *hostServer) isAdmin(ctx context.Context, req Request) (Response, error) {
-	var p struct{ ID identityDTO }
+	var p isAdminParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostIsAdmin, err)
 	}
@@ -255,7 +219,7 @@ func (s *hostServer) isAdmin(ctx context.Context, req Request) (Response, error)
 	if err != nil {
 		return Response{}, err
 	}
-	return Response{Result: struct{ Admin bool }{ok}}, nil
+	return Response{Result: isAdminResult{Admin: ok}}, nil
 }
 
 func (s *hostServer) adminTargets(ctx context.Context, _ Request) (Response, error) {
@@ -263,11 +227,11 @@ func (s *hostServer) adminTargets(ctx context.Context, _ Request) (Response, err
 	if err != nil {
 		return Response{}, err
 	}
-	return Response{Result: struct{ Targets []adminTargetDTO }{toAdminTargetDTOs(targets)}}, nil
+	return Response{Result: adminTargetsResult{Targets: toAdminTargetDTOs(targets)}}, nil
 }
 
 func (s *hostServer) render(ctx context.Context, req Request) (Response, error) {
-	var p struct{ Src string }
+	var p renderParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostRender, err)
 	}
@@ -277,15 +241,11 @@ func (s *hostServer) render(ctx context.Context, req Request) (Response, error) 
 	}
 	// 1–3 MB 的 PNG 走正文槽：单帧往返、不 base64（ADR-0005 决策 4）。
 	dto, body := encodeImage(img)
-	return Response{Result: struct{ Image imageDTO }{dto}, Body: body}, nil
+	return Response{Result: renderResult{Image: dto}, Body: body}, nil
 }
 
 func (s *hostServer) sessionAwait(ctx context.Context, req Request) (Response, error) {
-	var p struct {
-		Event eventDTO
-		State []byte
-		TTL   int64
-	}
+	var p sessionAwaitParams
 	if err := decodeJSON(req.Params, &p); err != nil {
 		return Response{}, badParams(MethodHostSessionAwait, err)
 	}

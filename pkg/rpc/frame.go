@@ -31,14 +31,19 @@ import (
 )
 
 const (
-	// MaxFrameBytes 是单帧上限（16 MiB）。最坏情况是 Renderer.Markdown 的
-	// 3 MB PNG 加上头部与 base64 过的 Event.Raw，量级差三个数量级；设上限是
-	// 为了让一个错乱的长度前缀（半包、串流、写错端）立刻报错而不是先
-	// make 一个几十 GB 的切片把进程 OOM 掉。
-	MaxFrameBytes = 16 << 20
+	// MaxFrameBytes 是单帧上限（32 MiB）。
+	//
+	// 定这个数的依据是契约而不是「够用」：图片的软限是 20 MB（§3.3），
+	// 加上头部与同样大小的正文，32 MiB 才有余量。设上限是为了让一个错乱的
+	// 长度前缀（半包、串流、写错端）立刻报错，而不是先 make 一个几十 GB 的
+	// 切片把进程 OOM 掉。
+	//
+	// 超限**不是**连接级故障：`send` 会把它当成这一次调用的失败（见 conn.go），
+	// 否则一张 18 MB 的合法图片会把整条连接打死。
+	MaxFrameBytes = 32 << 20
 
 	// maxHeaderBytes 是头部 JSON 的上限。头里最大的是 Event 的 Raw（≤32 KiB，
-	// base64 后 43 KiB）与 Query 的参数，1 MiB 已是三个数量级的余量。
+	// base64 后 43 KiB）与 Query 的参数，1 MiB 已是两个数量级的余量。
 	maxHeaderBytes = 1 << 20
 )
 
@@ -110,8 +115,11 @@ func readFrame(r io.Reader) (frame, error) {
 		return frame{}, err
 	}
 	headerLen := binary.BigEndian.Uint32(payload[0:4])
-	if headerLen < 2 || int(headerLen) > len(payload)-4 {
-		return frame{}, fmt.Errorf("%w: 头部 %d 字节，帧内可用 %d", ErrBadFrame, headerLen, len(payload)-4)
+	// 头部上限在**读侧**也要判：帧总长在上限内、头部却声明成 8 MiB，
+	// 是同一个「对端说了算」的攻击面，只是换了个字段。
+	if headerLen < 2 || int(headerLen) > len(payload)-4 || int(headerLen) > maxHeaderBytes {
+		return frame{}, fmt.Errorf("%w: 头部 %d 字节，帧内可用 %d（上限 %d）",
+			ErrBadFrame, headerLen, len(payload)-4, maxHeaderBytes)
 	}
 	return frame{
 		header: payload[4 : 4+headerLen],

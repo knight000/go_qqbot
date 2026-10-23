@@ -173,6 +173,34 @@ func TestConnHandlerPanic(t *testing.T) {
 	}
 }
 
+// TestConnOversizeResultKeepsConn：超限的结果只让**这一次**调用失败。
+//
+// 这是 §3.9 的一条硬要求：图片软限 20 MB，而帧上限只略高于它；把「内容
+// 太大」当成连接级故障，会让一张 33 MB 的图把后续所有调用一起打成
+// ErrConnClosed——排障时看到的是「插件全死了」，而不是「这张图太大」。
+func TestConnOversizeResultKeepsConn(t *testing.T) {
+	a, b := newPair(t)
+	if err := b.Handle("big", func(context.Context, Request) (Response, error) {
+		// 正文比上限还大：writeFrame 应该在分配缓冲区之前就拒绝。
+		return Response{Body: make([]byte, MaxFrameBytes)}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Handle("ok", func(context.Context, Request) (Response, error) {
+		return Response{Result: struct{}{}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.Call(ctx, "big", nil); !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("err = %v，期望 ErrFrameTooLarge", err)
+	}
+	if _, err := a.Call(ctx, "ok", nil); err != nil {
+		t.Fatalf("超限之后连接不可用了: %v", err)
+	}
+}
+
 // TestConnDeadlinePropagated：调用方的 ctx 截止时间要捎给对端，
 // 否则「核心 3s 后放弃」与「插件还在跑」之间没有任何联系（决策 7）。
 func TestConnDeadlinePropagated(t *testing.T) {

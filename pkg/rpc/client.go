@@ -62,11 +62,11 @@ func ctxOr(ctx context.Context) context.Context {
 }
 
 func (h *HostClient) IsAdmin(ctx context.Context, id host.Identity) (bool, error) {
-	res, err := h.conn.Call(ctxOr(ctx), MethodHostIsAdmin, struct{ ID identityDTO }{toIdentityDTO(id)})
+	res, err := h.conn.Call(ctxOr(ctx), MethodHostIsAdmin, isAdminParams{ID: toIdentityDTO(id)})
 	if err != nil {
 		return false, err
 	}
-	var out struct{ Admin bool }
+	var out isAdminResult
 	if err := res.Decode(&out); err != nil {
 		return false, err
 	}
@@ -79,20 +79,17 @@ type senderClient struct{ h *HostClient }
 
 func (s senderClient) Reply(ctx context.Context, ev *host.Event, msg host.Reply) error {
 	dto, body := encodeReply(&msg)
-	_, err := s.h.conn.CallBody(ctxOr(ctx), MethodHostReply, struct {
-		Event eventDTO
-		Msg   replyDTO
-	}{toEventDTO(ev), dto}, body)
+	_, err := s.h.conn.CallBody(ctxOr(ctx), MethodHostReply, replyParams{
+		Event: toEventDTO(ev), Msg: dto,
+	}, body)
 	return err
 }
 
 func (s senderClient) SendActive(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
 	dto, body := encodeReply(&msg)
-	_, err := s.h.conn.CallBody(ctxOr(ctx), MethodHostSendActive, struct {
-		Scene string
-		Peer  string
-		Msg   replyDTO
-	}{string(scene), peerID, dto}, body)
+	_, err := s.h.conn.CallBody(ctxOr(ctx), MethodHostSendActive, sendActiveParams{
+		Scene: string(scene), Peer: peerID, Msg: dto,
+	}, body)
 	return err
 }
 
@@ -106,14 +103,11 @@ type kvClient struct {
 }
 
 func (k kvClient) Get(ctx context.Context, key string) ([]byte, bool, error) {
-	res, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVGet, struct{ Peer, Key string }{k.peer, key})
+	res, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVGet, kvParams{Peer: k.peer, Key: key})
 	if err != nil {
 		return nil, false, err
 	}
-	var out struct {
-		Value []byte
-		Found bool
-	}
+	var out kvGetResult
 	if err := res.Decode(&out); err != nil {
 		return nil, false, err
 	}
@@ -121,17 +115,14 @@ func (k kvClient) Get(ctx context.Context, key string) ([]byte, bool, error) {
 }
 
 func (k kvClient) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
-	_, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVSet, struct {
-		Peer  string
-		Key   string
-		Value []byte
-		TTL   int64
-	}{k.peer, key, val, int64(ttl)})
+	_, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVSet, kvSetParams{
+		Peer: k.peer, Key: key, Value: val, TTL: int64(ttl),
+	})
 	return err
 }
 
 func (k kvClient) Delete(ctx context.Context, key string) error {
-	_, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVDelete, struct{ Peer, Key string }{k.peer, key})
+	_, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVDelete, kvParams{Peer: k.peer, Key: key})
 	return err
 }
 
@@ -140,17 +131,16 @@ func (k kvClient) Delete(ctx context.Context, key string) error {
 type queryClient struct{ h *HostClient }
 
 func (q queryClient) Query(ctx context.Context, query string, args ...any) ([]host.Row, error) {
-	res, err := q.h.conn.Call(ctxOr(ctx), MethodHostQuery, struct {
-		Query string
-		Args  []any
-	}{query, args})
+	res, err := q.h.conn.Call(ctxOr(ctx), MethodHostQuery, queryParams{Query: query, Args: args})
 	if err != nil {
 		return nil, err
 	}
-	var out struct{ Rows []map[string]any }
+	var out queryResult
 	if err := res.Decode(&out); err != nil {
 		return nil, err
 	}
+	// normalizeRows 对 nil 返回 nil，空行集（`[]`）仍是非 nil 空切片：
+	// 「没有数据」与「查出零行」在插件侧是两种判断，别在这里抹平。
 	return normalizeRows(out.Rows), nil
 }
 
@@ -216,7 +206,7 @@ type schedClient struct{ h *HostClient }
 func (s schedClient) Register(spec host.JobSpec) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := s.h.conn.Call(ctx, MethodHostSchedule, struct{ Spec jobSpecDTO }{toJobSpecDTO(spec)})
+	_, err := s.h.conn.Call(ctx, MethodHostSchedule, scheduleParams{Spec: toJobSpecDTO(spec)})
 	return err
 }
 
@@ -229,7 +219,7 @@ func (a adminDirClient) Targets(ctx context.Context) ([]host.AdminTarget, error)
 	if err != nil {
 		return nil, err
 	}
-	var out struct{ Targets []adminTargetDTO }
+	var out adminTargetsResult
 	if err := res.Decode(&out); err != nil {
 		return nil, err
 	}
@@ -250,11 +240,11 @@ type rendererClient struct{ h *HostClient }
 // Markdown 的返回值可能带 1–3 MB 的 PNG，它走应答帧的正文槽
 // （单帧往返、不 base64，见 frame.go）。
 func (r rendererClient) Markdown(ctx context.Context, src string) (host.Image, error) {
-	res, err := r.h.conn.Call(ctxOr(ctx), MethodHostRender, struct{ Src string }{src})
+	res, err := r.h.conn.Call(ctxOr(ctx), MethodHostRender, renderParams{Src: src})
 	if err != nil {
 		return host.Image{}, err
 	}
-	var out struct{ Image imageDTO }
+	var out renderResult
 	if err := res.Decode(&out); err != nil {
 		return host.Image{}, err
 	}
@@ -266,11 +256,9 @@ func (r rendererClient) Markdown(ctx context.Context, src string) (host.Image, e
 type sessionClient struct{ h *HostClient }
 
 func (s sessionClient) Await(ctx context.Context, ev *host.Event, state []byte, ttl time.Duration) error {
-	_, err := s.h.conn.Call(ctxOr(ctx), MethodHostSessionAwait, struct {
-		Event eventDTO
-		State []byte
-		TTL   int64
-	}{toEventDTO(ev), state, int64(ttl)})
+	_, err := s.h.conn.Call(ctxOr(ctx), MethodHostSessionAwait, sessionAwaitParams{
+		Event: toEventDTO(ev), State: state, TTL: int64(ttl),
+	})
 	return err
 }
 
