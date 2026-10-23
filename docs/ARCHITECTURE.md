@@ -80,7 +80,7 @@ D5 的前提有两层，必须分清：
 | 日志（journald 限额） | 200 MB |
 | 结论 | 20 GB 盘余量充裕；1 GB 内存下与 TS3/WebDAV 共存可行，但需 `MemoryMax` 约束（P3 之后 `MemoryMax` 只约束核心，插件进程各有一份基线） |
 
-上面"32.5 / 33.4 MB"是本机实测（Go 1.27.3，`go run ./tools/build all`，`-trimpath -ldflags "-s -w"`，按 1000 进制计的字节数）。不含出厂副本的核心本体约 20.8 MB（linux）/ 20.9 MB（windows），与 P1 时代的 19.03 / 19.22 MB 相比只多出进程边界与升级相关的代码——四个插件的业务代码移出去之后，核心并没有变小，因为共享的字体、SQLite 与 SQL 驱动本来就占大头。`/upgrade` 预览里的尺寸走 `humanSize`（1024 进制），同一份产物显示为 31.0 MiB。
+上面"32.5 / 33.4 MB"是本机实测（Go 1.27.3，`go run ./tools/build all`，`-trimpath -ldflags "-s -w"`，MB 按十进制换算）。不含出厂副本的核心本体约 20.8 MB（linux）/ 20.9 MB（windows），与 P1 时代的 19.03 / 19.22 MB 相比只多出进程边界与升级相关的代码——四个插件的业务代码移出去之后，核心并没有变小，因为共享的字体、SQLite 与 SQL 驱动本来就占大头。`/upgrade` 预览里的尺寸走 `humanSize`（1024 进制），同一份产物显示为 31.0 MiB。
 
 
 `Raw` 那一行的换算方式：`go test ./internal/gateway -run '^$' -bench BenchmarkDecode -benchmem`
