@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -30,6 +32,11 @@ type fakeRelease struct {
 	// （GitHub 不允许资产名含 "/"）；测试可以把它改成别的形状来验证匹配口径。
 	indexAssetName string
 
+	// pluginIdx 是索引里插件条目的 JSON 片段（保持插入顺序，报告的排序要可断言）。
+	pluginIdx []string
+	// pluginBlobs 是镜像通道按**资产名**提供的插件产物。
+	pluginBlobs map[string][]byte
+
 	api   *httptest.Server
 	asset *httptest.Server
 
@@ -50,10 +57,12 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 		binary:         binary,
 		coreName:       CoreAssetName(version, runtime.GOOS, runtime.GOARCH),
 		indexAssetName: "index.json",
+		pluginBlobs:    map[string][]byte{},
 	}
 	sum := sha256.Sum256(binary)
-	// index.json 与 tools/index 的输出同形：插件资产指向 asset_base 风格
-	// 的直链，但本票不消费它（插件升级是 #45）。
+	// index.json 与 tools/index 的输出同形。默认那条 echo 只是个占位条目
+	// （地址与哈希都是假的）——#44 的预览用例只看版本比较，不看产物。
+	// 真的要下载插件的用例用 addPlugin 换成真产物。
 	f.index = fmt.Sprintf(`{
   "schema": 1,
   "core": {"version": %q},
@@ -71,13 +80,21 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
+		assets := []map[string]any{
+			{"id": 1, "name": f.indexAssetName, "size": len(f.index)},
+			{"id": 2, "name": "checksums.txt", "size": len(f.sums)},
+			{"id": 3, "name": f.coreName, "size": len(f.binary)},
+		}
+		// 插件产物也要出现在资产列表里：有 token 时它们走 api 资产端点，
+		// 客户端只能按资产名去换 id。id 按资产名排序分配（与 pluginByID 一致）。
+		for i, name := range f.pluginAssetNames() {
+			assets = append(assets, map[string]any{
+				"id": int64(101 + i), "name": name, "size": len(f.pluginBlobs[name]),
+			})
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"tag_name": f.tag,
-			"assets": []map[string]any{
-				{"id": 1, "name": f.indexAssetName, "size": len(f.index)},
-				{"id": 2, "name": "checksums.txt", "size": len(f.sums)},
-				{"id": 3, "name": f.coreName, "size": len(f.binary)},
-			},
+			"assets":   assets,
 		})
 	})
 	mux.HandleFunc("/repos/o/r/releases/assets/", func(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +107,11 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 		case strings.HasSuffix(r.URL.Path, "/3"):
 			_, _ = w.Write(f.binary)
 		default:
+			// 插件产物：id 从 101 起按资产名顺序分配，这里按名字反查。
+			if blob, ok := f.pluginByID(r.URL.Path); ok {
+				_, _ = w.Write(blob)
+				return
+			}
 			http.NotFound(w, r)
 		}
 	})
@@ -106,6 +128,10 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
+		if blob, ok := f.pluginBlobs[path.Base(r.URL.Path)]; ok {
+			_, _ = w.Write(blob)
+			return
+		}
 		if !strings.HasSuffix(r.URL.Path, "/"+f.coreName) {
 			http.NotFound(w, r)
 			return
@@ -115,4 +141,89 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 	f.asset = httptest.NewServer(amux)
 	t.Cleanup(f.asset.Close)
 	return f
+}
+
+// addPlugin 让这次"发布"带上一个插件产物：索引里写本平台资产（地址是
+// tools/index 生成的那种 github 直链），镜像通道按资产名提供字节。
+//
+// 返回资产名。索引会按插入顺序重建，所以报告的排序可以直接断言。
+func (f *fakeRelease) addPlugin(name, version string, blob []byte) string {
+	f.t.Helper()
+	asset := "qqbot-plugin-" + name + "-" + version + "-" + currentPlatform() + exeSuffix()
+	sha := sha256Hex(blob)
+	f.pluginIdx = append(f.pluginIdx, fmt.Sprintf(
+		`{"name": %q, "version": %q, "assets": {%q: {"url": %q, "sha256": %q}}}`,
+		name, version, currentPlatform(),
+		"https://github.com/o/r/releases/download/"+f.tag+"/"+asset, sha))
+	f.pluginBlobs[asset] = blob
+	f.rebuildIndex()
+	return asset
+}
+
+// rewritePlugin 覆盖某个已加插件的索引版本（造"索引与产物自称不一致"的现场），
+// 产物字节不动。
+func (f *fakeRelease) rewritePluginVersion(name, version string) {
+	f.t.Helper()
+	for i, frag := range f.pluginIdx {
+		if strings.Contains(frag, fmt.Sprintf("%q", name)) {
+			var entry struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+				Assets  map[string]struct {
+					URL    string `json:"url"`
+					SHA256 string `json:"sha256"`
+				} `json:"assets"`
+			}
+			if err := json.Unmarshal([]byte(frag), &entry); err != nil {
+				f.t.Fatalf("解析索引片段: %v", err)
+			}
+			for plat, a := range entry.Assets {
+				f.pluginIdx[i] = fmt.Sprintf(
+					`{"name": %q, "version": %q, "assets": {%q: {"url": %q, "sha256": %q}}}`,
+					entry.Name, version, plat, a.URL, a.SHA256)
+			}
+		}
+	}
+	f.rebuildIndex()
+}
+
+func (f *fakeRelease) rebuildIndex() {
+	f.index = fmt.Sprintf(`{"schema":1,"core":{"version":%q},"plugins":[%s]}`,
+		f.version, strings.Join(f.pluginIdx, ","))
+}
+
+// pluginAssetNames 按资产名排序返回已加入的插件产物名。
+func (f *fakeRelease) pluginAssetNames() []string {
+	names := make([]string, 0, len(f.pluginBlobs))
+	for name := range f.pluginBlobs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// pluginByID 按 /releases/assets/<id> 反查插件产物：id 从 101 起、按资产名
+// 排序分配，必须与 latest 里给出的资产列表对得上（否则 token 通道会取错产物）。
+func (f *fakeRelease) pluginByID(rawPath string) ([]byte, bool) {
+	i := strings.LastIndex(rawPath, "/")
+	if i < 0 {
+		return nil, false
+	}
+	var id int64
+	if _, err := fmt.Sscanf(rawPath[i+1:], "%d", &id); err != nil {
+		return nil, false
+	}
+	names := f.pluginAssetNames()
+	idx := int(id - 101)
+	if idx < 0 || idx >= len(names) {
+		return nil, false
+	}
+	return f.pluginBlobs[names[idx]], true
+}
+
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
 }

@@ -125,14 +125,22 @@ func splitChecksumLine(line string) (sum, name string, ok bool) {
 // currentPlatform 是本进程的资产键，例如 "windows-amd64"。
 func currentPlatform() string { return runtime.GOOS + "-" + runtime.GOARCH }
 
+// plugin 在 index 里按名字取一个插件条目（不看平台）。
+func (i *Index) plugin(name string) (IndexPlugin, bool) {
+	for _, p := range i.Plugins {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return IndexPlugin{}, false
+}
+
 // lookup 在 index 里取某个插件的本平台资产。
 func (i *Index) lookup(name string) (IndexPlugin, Asset, bool) {
-	for _, p := range i.Plugins {
-		if p.Name != name {
-			continue
-		}
-		a, ok := p.Assets[currentPlatform()]
-		return p, a, ok
+	p, ok := i.plugin(name)
+	if !ok {
+		return IndexPlugin{}, Asset{}, false
 	}
-	return IndexPlugin{}, Asset{}, false
+	a, ok := p.Assets[currentPlatform()]
+	return p, a, ok
 }
