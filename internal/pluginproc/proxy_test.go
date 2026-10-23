@@ -16,15 +16,15 @@ import (
 // message 造一条进站消息。Command / Args 由核心在路由阶段填好（契约 8）。
 func message(command, args string) *host.Event {
 	return &host.Event{
-		ID:       "m-" + command + "-" + args,
-		Kind:     host.KindMessage,
-		Scene:    host.SceneGroup,
-		PeerID:   "g1",
-		SenderID: "u1",
-		Content:  strings.TrimSpace(command + " " + args),
-		Command:  command,
-		Args:     args,
-		MsgID:    "m1",
+		ID:        "m-" + command + "-" + args,
+		Kind:      host.KindMessage,
+		Scene:     host.SceneGroup,
+		PeerID:    "g1",
+		SenderID:  "u1",
+		Content:   strings.TrimSpace(command + " " + args),
+		Command:   command,
+		Args:      args,
+		MsgID:     "m1",
 		Timestamp: time.Now(),
 		Actor: host.Principal{
 			OpenID: "u1", Scene: host.SceneGroup, PeerID: "g1",
