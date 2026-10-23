@@ -10,7 +10,9 @@ P1（编译期注册）用到现在暴露出三条硬代价，而它们都指向
 
 1. **契约外置为 `pkg/host`，插件独立成 module，直接 `require github.com/knight000/go_qqbot`。** 不另立瘦 SDK module：`APIVersion` 是刻意设计的**唯一**兼容性数字，再加一个 SDK 版本号就会出现"SDK 兼容、`APIVersion` 不兼容"这种必须两头核对的组合状态。代价是插件的 module 缓存会拉进核心的依赖与 6 个 TTF（20 MB 上下），但编译只编真正 import 的包，且缓存里只躺一份——这个代价换一个版本号，值。
 
-   `pkg/host` 只放契约类型、哨兵与常量，**不得 import 任何实现包**（尤其不能为了复用而 import `internal/core` 或 `internal/render`）。这条约束现在是编译期的，P3 之后是**线协议**的，破坏它等于把一个实现细节永久烧进跨进程格式。
+   `pkg/host` 只放契约类型、哨兵与常量，**不得 import 任何实现包**（尤其不能为了复用而 import `internal/core` 或 `internal/render`）。这条约束在 P1 时是编译期的，P3 之后是**线协议**的（破坏它等于把一个实现细节永久烧进跨进程格式）。
+
+   > 实现注记（#46）：四个示例插件仍与核心**同一个 module**（`plugins/<name>`，每个都有 `cmd/<name>/main.go` 作为产物入口）——它们要跟核心一起测、一起随仓发布。"独立 module"是对第三方插件的形态要求：契约已在 `pkg/host`，第三方 `require` 核心后用 `rpcsdk.Serve` 起一个可执行文件，放进 `<datadir>/plugins/bin/` 即可，不参与核心构建。
 
 2. **插件二进制由核心 spawn，不用独立 systemd unit。** 服务账号通常没有 `systemctl` 权限，而一键升级要求核心能"换掉文件 → 拉起新进程"。独立 unit 还会把"重启机器人"和"重启插件"变成两套编排，失败时要同时看两份日志。（插件即 HTTP 服务的形态在 Considered Options 里单独说明。）
 
@@ -21,6 +23,8 @@ P1（编译期注册）用到现在暴露出三条硬代价，而它们都指向
 5. **Manifest 靠 `bin --manifest` 探测，在装配期完成。** 2 秒超时，输出 JSON，然后复用现有的全部启动期校验：`api_version` 与核心一致、`intents` 可解析、每个 `Command` 恰好 Prefix 或 Pattern 之一、正则可编译、前缀不占核心保留词、`config_schema` 的键在 `[plugins.<name>]` 里存在且类型相符。探测失败 = 该插件不加载，记一条 Error；**不 fail-fast 整个启动**（理由见决策 6）。
 
 6. **`api_version` 不匹配 → 拒绝加载该插件，核心照常运行。** 这与 `config_schema` 缺失的 fail-fast 是**刻意不同**的处置：配置写错是人改一下文件的事，插件产物过期是一条网络命令的事；为一个过期插件让机器人整体下线，还会进 systemd 重启循环白烧 Identify 配额（1000/天），代价远大于收益。装载失败必须写进启动日志的插件清单与 bootnotice 的上线报告——否则表现就是"某个指令没反应"，且没有任何线索。
+
+    > 实现注记（#46）：bootnotice 现在拿不到"核心装了哪些插件"——插件是独立进程，契约里没有这个访问器，为一行日志加访问器要动 `APIVersion`。所以装载失败与已装载清单只体现在**核心启动日志**：每个探测失败各一条 Error，`qqbot 启动完成` 那一行的 `plugin_names` 是"哪些插件真的装上了"的唯一权威来源。
 
 7. **超时由 RPC 层强制，沿用现有口径。** `Handle` 3 秒（`dispatch.go:72` 的 `handlerTimeout`）、`Job` 60 秒（`scheduler.go:122`）。超时即取消该请求并把该次调用记为失败；连续超时与崩溃共用同一套熔断计数。不设"更宽松的跨进程超时"——进程边界不该成为放宽语义的理由，否则最慢的那个插件会拖垮整个 per-peer 队列。
 
