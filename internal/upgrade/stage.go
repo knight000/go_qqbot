@@ -107,8 +107,13 @@ func short(s string) string {
 // 都在进程内失败——旧二进制与 state.json 都不动，服务继续跑。
 //
 // 失败时删掉 .new：留着它只会让下一次 /upgrade 或启动期回滚判断困惑。
-func Stage(exe string) (Staged, error) {
-	staged := StagedPath(exe)
+func Stage(exe string) (Staged, error) { return stageFile(exe, StagedPath(exe)) }
+
+// stageFile 校验 staged 这份文件能不能成为 exe：非空、同卷、可执行、可落盘。
+//
+// 抽出来是因为插件用另一套文件名（与插件同目录、点开头）：落位的**规则**
+// 只有一套，文件名只是调用方的事。
+func stageFile(exe, staged string) (Staged, error) {
 	st, err := os.Stat(staged)
 	if err != nil {
 		return Staged{}, fmt.Errorf("找不到已下载的产物 %s: %w", staged, err)

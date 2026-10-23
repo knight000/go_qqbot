@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/knight000/go_qqbot/pkg/host"
 	"github.com/knight000/go_qqbot/pkg/rpc"
+	"github.com/knight000/go_qqbot/pkg/rpcsdk"
 )
 
 // ErrUnavailable 表示这个插件当前没有可用的进程：正在退避重启、已被停用，
@@ -43,6 +45,8 @@ type proxy struct {
 	log       *slog.Logger
 	// backoff 是崩溃重启的等待表（默认 1/2/4/8/16 分钟，测试可缩短）。
 	backoff []time.Duration
+	// probe 是 `--manifest` 的期限，热升级要用它验新产物的身份。
+	probe time.Duration
 
 	mu   sync.Mutex
 	host host.Host
@@ -52,6 +56,9 @@ type proxy struct {
 	// closing 之后不再重启：关停与 /reload 都走 Close，那时"进程退出"是
 	// 预期事件，不能触发退避重启。
 	closing bool
+	// replacing 表示正在热替换：旧进程退出与"新进程还没接上"都是预期的，
+	// 监工不许插手（既不补退避重启，也不抢着 Kill——三级关闭由替换路径自己走）。
+	replacing bool
 	// failures 是连续失败次数（超时与崩溃共用，决策 7/8）；disabled 之后
 	// 不再起进程，调用一律立刻失败。
 	failures int
@@ -77,6 +84,7 @@ func newProxy(pr probeResult, o Options) host.Plugin {
 		reg:       o.Registry,
 		log:       o.logger().With("plugin", name),
 		backoff:   o.backoff(),
+		probe:     o.probeTimeout(),
 	}
 }
 
@@ -85,7 +93,21 @@ func newProxy(pr probeResult, o Options) host.Plugin {
 // 核心在路由、日志、报告里会反复调它；每次往返既慢，又会把"这个插件声明了
 // 什么命令"变成两次独立事实（探测时一次、运行时一次），而路由表是在启动时
 // 一次性建好的——真出现差异也来不及改路由。
-func (p *proxy) Manifest() host.Manifest { return p.manifest }
+//
+// 唯一会变的是版本号：热升级成功之后换成本进程真正在跑的版本，否则
+// `/upgrade` 预览会一直认为"升级没生效"而反复建议同一个版本。加锁是因为
+// 这条路要能被替换路径改写，而它在核心的派发路径上是并发读的。
+func (p *proxy) Manifest() host.Manifest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.manifest
+}
+
+// BinPath 返回当前插件可执行文件的绝对路径。
+//
+// 升级路径要用它把新产物落到同一个目录（同卷才谈得上 rename），而目录
+// 里的文件名只是标签——只有 proxy 自己知道这一份到底叫什么。
+func (p *proxy) BinPath() string { return p.bin }
 
 // Init 起子进程、把 host.* 挂到连接上、把配置快照交给插件。
 //
@@ -240,7 +262,14 @@ func (p *proxy) Close(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
+	return p.stopRunning(ctx, r)
+}
 
+// stopRunning 是三级关闭的全部动作，Close 与热替换共用。
+//
+// 共用是必须的：热替换停旧进程时，插件同样要靠第一级把内存里的状态写回 KV。
+// 少走一级就等于"每次升级丢一次插件内存里的东西"，而这种丢失不会报错。
+func (p *proxy) stopRunning(ctx context.Context, r *runtimeProc) error {
 	// 第一级：请插件自己收摊。它要靠这一步把内存里的状态写回 KV。
 	if p.optional[rpc.OptionalClose] {
 		cctx, cancel := context.WithTimeout(ctx, closeRPCGrace)
@@ -287,6 +316,223 @@ const (
 	closeExitWait = 2 * time.Second
 	closeKillWait = time.Second
 )
+
+// replaceInitTimeout 是新产物完成 init 握手的期限（ADR-0006 决策 6：5 秒）。
+//
+// 5 秒不是拍脑袋：握手只做一次配置下发，正常在 100 ms 内；留到 5 秒是因为
+// 冷启动遇上杀软扫描（Windows 首次读一个新 exe）会明显变慢，而"起不来"
+// 必须能在一个 owner 等得起的时限内被判出来——超时就回滚，机器人不能因为
+// 一次升级卡在一个起不来的插件上。
+const replaceInitTimeout = 5 * time.Second
+
+// ReplaceBinary 用 newPath 指向的产物换掉本插件，只重启这一个子进程。
+//
+// 顺序（每一步都可回退，ADR-0006 决策 2/6）：
+//
+//	验明正身（`--manifest`，名字必须是本插件）
+//	→ 三级关闭旧进程（与 Close 同一套，插件照样收摊）
+//	→ rename(bin, .bin.old) → rename(new, bin)
+//	→ 起新进程 + init 握手（5 秒）
+//
+// 成功：删掉备份、补一次 Start（后台协程属于"代"，新进程要重起）、把清单
+// 换成新产物的（版本号从此是事实）。
+//
+// 失败：rename(.bin.old, bin) 还原、重启旧版本、返回可读错误并记一条 Warn
+// ——旧版本继续服务，绝不留下"目录里没有插件"的现场。
+//
+// 与 Close 的唯一区别：这里**不**把 proxy 标成 closing。closing 是终态
+// （关停之后不再起进程），而热替换的结尾正好相反。
+//
+// Windows 上运行中的 exe 不能覆盖、不能删除，但可以改名（镜像以
+// FILE_SHARE_DELETE 打开）；先停进程再换，两个平台的顺序因此可以一致，
+// 这里不写死 Unix 语义。
+func (p *proxy) ReplaceBinary(newPath string) error {
+	p.mu.Lock()
+	if p.closing {
+		p.mu.Unlock()
+		return fmt.Errorf("pluginproc: 插件 %s 正在关停，不替换二进制", p.name)
+	}
+	if p.replacing {
+		p.mu.Unlock()
+		return fmt.Errorf("pluginproc: 插件 %s 已有一个替换在进行中", p.name)
+	}
+	if p.host == nil {
+		p.mu.Unlock()
+		return fmt.Errorf("pluginproc: 插件 %s 还没初始化过，不能替换二进制", p.name)
+	}
+	p.replacing = true
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.replacing = false
+		p.mu.Unlock()
+	}()
+
+	err := p.replace(newPath)
+	if err != nil {
+		// ADR-0006 决策 6 的另一面：回滚成功也要留一条 Warn。否则现场只剩
+		// "某个插件怎么还是旧版本"，没有任何线索指向"升级试过、失败了"。
+		p.log.Warn("插件热升级失败，已回滚到旧版本", "bin", p.bin, "new", newPath, "err", err)
+	}
+	return err
+}
+
+// replace 是 ReplaceBinary 的主体（状态判定与日志在调用方）。
+func (p *proxy) replace(newPath string) error {
+	// 1. 先问新产物"你是谁"：不碰进程、不碰文件。换上一个自称别的插件的
+	//    产物比不升级坏得多——路由表会指向一个已经不存在的插件。
+	m, opts, err := probeOne(context.Background(), newPath, p.probe)
+	if err != nil {
+		return fmt.Errorf("新产物无法应答 %s: %w", rpcsdk.ManifestFlag, err)
+	}
+	if m.Name != p.name {
+		return fmt.Errorf("新产物自称插件 %q，本插件是 %q：拒绝替换", m.Name, p.name)
+	}
+
+	// 2. 同目录才换：跨目录的 rename 在跨卷时会退化成"复制 + 删除"，
+	//    而正在跑的这份文件必须原地被替换（同卷是决策 5 的前提）。
+	if filepath.Dir(newPath) != filepath.Dir(p.bin) {
+		return fmt.Errorf("新产物 %s 与插件 %s 不在同一目录，拒绝替换", newPath, p.bin)
+	}
+
+	// 3. 停旧进程。cur 先摘掉：从这一刻起派发会得到"不可用"，而这正是
+	//    替换窗口里应有的答案（投给一个正在被拆掉的连接只会得到一堆错误）。
+	p.mu.Lock()
+	old := p.cur
+	p.cur = nil
+	p.mu.Unlock()
+	if old != nil {
+		if err := p.stopRunning(context.Background(), old); err != nil {
+			return p.keepServing(fmt.Errorf("停不掉旧进程: %w", err))
+		}
+	}
+
+	// 4. 换文件：旧映像先改名让位，新产物顶上来（与核心换盘同一套规则）。
+	backup := pluginOldPath(p.bin)
+	_ = os.Remove(backup)
+	if err := renameFile(p.bin, backup); err != nil {
+		return p.keepServing(fmt.Errorf("把旧产物改名为 %s: %w", backup, err))
+	}
+	if err := renameFile(newPath, p.bin); err != nil {
+		if rerr := renameFile(backup, p.bin); rerr != nil {
+			return fmt.Errorf("替换 %s: %v（把旧产物改回原名也失败: %v）", p.bin, err, rerr)
+		}
+		return p.keepServing(fmt.Errorf("替换 %s: %w", p.bin, err))
+	}
+
+	// 5. 起新进程，5 秒内完成 init 握手即为成功。
+	ctx, cancel := context.WithTimeout(context.Background(), replaceInitTimeout)
+	r, err := p.spawn(ctx)
+	cancel()
+	if err != nil {
+		// 文件与进程两样都要回到旧版本，顺序不能反：先换文件再起进程，
+		// 否则新进程会去执行一份已经不存在的产物。
+		if rerr := renameFile(backup, p.bin); rerr != nil {
+			return fmt.Errorf("新版本握手失败（%v），回滚文件也失败: %w", err, rerr)
+		}
+		if rerr := p.start(context.Background()); rerr != nil {
+			return fmt.Errorf("新版本握手失败（%v），重启旧版本也失败: %w", err, rerr)
+		}
+		return fmt.Errorf("新版本 %s 内没有完成握手，已回滚并重启旧版本: %w", replaceInitTimeout, err)
+	}
+
+	p.mu.Lock()
+	p.cur = r
+	p.failures = 0
+	// 新产物等于一次干净的起跑：之前那个版本崩出来的"连续失败"不该跟着它。
+	p.disabled = false
+	before := p.manifest
+	p.manifest = m
+	// 可选接口也以新产物为准：它决定 Start/Close 会不会真的过通道，
+	// 拿旧产物的能力表去调新进程只会得到"方法未注册"。
+	p.optional = make(map[string]bool, len(opts))
+	for _, name := range opts {
+		p.optional[name] = true
+	}
+	needStart := p.started && p.optional[rpc.OptionalStart]
+	p.mu.Unlock()
+	go p.supervise(r)
+
+	if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		p.log.Warn("删除旧版本备份失败", "path", backup, "err", err)
+	}
+	if needStart {
+		// 核心只在启动时调一次 Start；新进程要自己把后台协程起起来。
+		// 失败不算替换失败：插件已经在服务，缺的只是一代 Start——与崩溃
+		// 重启后"补 Start 失败"同一条口径。
+		if err := p.Start(context.Background()); err != nil {
+			p.log.Error("插件升级后 Start 失败", "err", err)
+		}
+	}
+	// 路由表是启动时一次性建好的（ADR-0005 决策 3），热替换不重建它。
+	// 命令集变了必须说出来：否则现场是"插件声明了 /x，敲 /x 却没反应"。
+	if !sameCommands(before, m) {
+		p.log.Warn("新版本的命令集与旧版本不同，路由要等下一次重启才跟上",
+			"from", before.Version, "to", m.Version,
+			"commands_before", len(before.Commands), "commands_after", len(m.Commands))
+	}
+	p.log.Info("插件已热升级", "from", before.Version, "to", m.Version, "bin", p.bin)
+	return nil
+}
+
+// keepServing 用于"还没换成就失败了"的分支：文件已经回到旧版本（或本来
+// 就没动），这里保证还有进程在服务，再把原因原样往上抛。
+func (p *proxy) keepServing(cause error) error {
+	if err := p.start(context.Background()); err != nil {
+		return fmt.Errorf("%w（旧版本也没能重新拉起: %v）", cause, err)
+	}
+	return cause
+}
+
+// pluginOldPath 是热替换时旧产物的备份路径：与插件同目录、点开头。
+//
+// 点开头不是风格问题：装配期的目录扫描会把每个非点开头的普通文件都当成
+// 插件去探测（pluginproc.Load），一份残留的备份会变成"插件重名"从而在下次
+// 启动时刷一条 Error——那条日志看起来像是升级把插件搞坏了。
+func pluginOldPath(bin string) string {
+	return filepath.Join(filepath.Dir(bin), "."+filepath.Base(bin)+".old")
+}
+
+// renameBackoff 是 rename 失败后的重试节奏（第一次立刻试，之后最多再等
+// 约 400 ms）。总预算刻意压在 1 秒以内：热替换的窗口越长，派发被拒的时间
+// 越长，而这类"短暂占用"的真实时长一般只有几十毫秒。
+var renameBackoff = []time.Duration{
+	0, 20 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond,
+}
+
+// renameFile 把 src 改名成 dst，允许 dst 已存在（同卷原子替换），失败重试几次。
+//
+// 为什么要重试：Windows 上刚退出的进程映像与杀软扫描会在几百毫秒内继续
+// 占着目标文件，`MoveFileEx` 这时返回 "Access is denied"（ADR-0006 决策 5
+// 明确认下这条代价）。真实测试里它只在"新进程刚崩、马上要改回来"这一瞬间
+// 出现——而那正是最不能失败的一步（失败就没有可用的插件了）。
+//
+// 重试有天花板：一直失败要如实报错，而不是把热替换卡在这里。
+func renameFile(src, dst string) error {
+	var err error
+	for _, wait := range renameBackoff {
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+		if err = os.Rename(src, dst); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+// sameCommands 比较两代产物的命令集（顺序也算：路由表的优先级依赖顺序）。
+func sameCommands(a, b host.Manifest) bool {
+	if len(a.Commands) != len(b.Commands) {
+		return false
+	}
+	for i := range a.Commands {
+		if a.Commands[i] != b.Commands[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // spawn 起一个进程并完成握手。
 //
@@ -364,14 +610,16 @@ func (p *proxy) supervise(r *runtimeProc) {
 	p.mu.Lock()
 	current := p.cur == r
 	closing := p.closing
+	replacing := p.replacing
 	if current {
 		p.cur = nil
 	}
 	p.mu.Unlock()
 
-	if closing {
-		// 关停路径自己在走三级关闭，监工不许插手：否则它的"连接一断就杀"
-		// 会跳过 SIGTERM 那一级，插件连收尾的机会都没有。
+	if closing || replacing {
+		// 关停路径自己在走三级关闭，热替换也一样：这里的"连接一断就杀"
+		// 会跳过第一级（插件连收尾的机会都没有），替换路径也就没法按
+		// "先收摊再换文件"的顺序做了。
 		return
 	}
 	r.shutdown() // 幂等：连接已关就只差"进程若还活着就杀"
@@ -404,9 +652,10 @@ func (p *proxy) noteExit(err error) {
 // restart 是退避到期后的重试入口。
 func (p *proxy) restart() {
 	p.mu.Lock()
-	closing, disabled := p.closing, p.disabled
+	// replacing 时也要让开：替换路径自己会起进程，这里再起一个就是双开。
+	closing, disabled, replacing := p.closing, p.disabled, p.replacing
 	p.mu.Unlock()
-	if closing || disabled {
+	if closing || disabled || replacing {
 		return
 	}
 	if err := p.start(context.Background()); err != nil {

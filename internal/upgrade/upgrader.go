@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,11 @@ var ErrUpToDate = errors.New("当前已是最新版本")
 type LoadedPlugin struct {
 	Name    string
 	Version string
+	// Bin 是这份插件的可执行文件路径。核心升级要把更高版本的插件产物
+	// 落位到它旁边（同卷），所以路径必须由装配期给：目录里的文件名只是
+	// 标签，猜一个名字去落位可能换掉另一份产物。空表示"定位不到"，
+	// 这种插件只会被跳过。
+	Bin string
 }
 
 // Options 是构造一次升级会话需要的全部输入。
@@ -69,7 +75,9 @@ type Options struct {
 	Plugins []LoadedPlugin
 	// Snapshots 提供库快照；nil 表示这次装配没有数据库。
 	Snapshots Snapshotter
-	Log       *slog.Logger
+	// ProbeTimeout 覆盖"验明正身"那次 `--manifest` 的期限（测试用）。
+	ProbeTimeout time.Duration
+	Log          *slog.Logger
 	// Now 只给测试注入稳定时间；nil 用 time.Now。
 	Now func() time.Time
 }
@@ -117,6 +125,30 @@ func New(o Options) *Upgrader {
 	}
 }
 
+// pluginProbeTimeout 是"验明正身"那次 `--manifest` 的默认期限。
+//
+// 与装配期探测同一个数字（2 秒）：探测只做一次 JSON 编码 + 一次进程启动，
+// 正常在 50 ms 内；留到 2 秒是因为冷启动遇上杀软扫描会明显变慢。测试可以
+// 用 Options.ProbeTimeout 放大它。
+const pluginProbeTimeout = 2 * time.Second
+
+func (u *Upgrader) probeTimeout() time.Duration {
+	if u.opt.ProbeTimeout > 0 {
+		return u.opt.ProbeTimeout
+	}
+	return pluginProbeTimeout
+}
+
+// pluginBin 按名字找回某个已加载插件的可执行文件路径（空表示定位不到）。
+func (u *Upgrader) pluginBin(name string) string {
+	for _, p := range u.opt.Plugins {
+		if p.Name == name {
+			return strings.TrimSpace(p.Bin)
+		}
+	}
+	return ""
+}
+
 // Report 是 `/upgrade`（预览）的内容。它不改任何文件，也不改任何状态。
 type Report struct {
 	Current  string
@@ -134,7 +166,9 @@ type PluginDelta struct {
 	Name   string
 	From   string // 已加载的版本
 	To     string // 发布里的版本
-	Action string // 升 / 跳过
+	Action string // 升 / 跳过（原因） / 失败（原因）
+	// Size 是已落位的产物字节数，0 表示没有下载（跳过或失败）。
+	Size int64
 }
 
 // Preview 只读元数据：一次 releases/latest + 两份小清单，不碰 exe、
@@ -234,7 +268,10 @@ type Plan struct {
 	Snapshot string
 	Staged   int64
 	Plugins  []PluginDelta
-	At       time.Time
+	// PluginStages 是要跟着核心一起落位的插件产物（只含"版本更高"的）。
+	// 落位（下载+校验+验身份）已经在这里做完，Commit 在关停之后只做 rename。
+	PluginStages []PluginStage
+	At           time.Time
 }
 
 // Apply 做完全部"进程还活着时能做"的动作：快照 → 检查 → 下载 → 校验 → Stage，
@@ -315,6 +352,12 @@ func (u *Upgrader) apply(ctx context.Context) (*Plan, error) {
 	}
 	p.Staged = staged.Size
 
+	// 3.5 插件：只升不降（决策 7）。核心换盘要重启进程，所以插件不在这里
+	//     换进程——只把产物落位到点开头的 .new，等 Commit 在关停之后 rename。
+	//     单个插件失败不拦核心升级：核心是这次的主诉求，一个插件资产发漏了
+	//     不该让它一起作废；原因原样进报告（回复里会带出来）。
+	u.stagePlugins(ctx, rel, p)
+
 	// 4. 写标记：从这一刻起，"换过盘"这件事在下一次启动时可见。
 	if err := SaveState(p.StateDir, &State{
 		Tag: p.Tag, From: p.From, To: p.To, Exe: p.Exe,
@@ -328,8 +371,41 @@ func (u *Upgrader) apply(ctx context.Context) (*Plan, error) {
 	return p, nil
 }
 
-// guardVersion 拦住所有"版本号不参与比较"的现场。
+// stagePlugins 把"版本更高"的插件产物落位，并把结论写回 plan（决策 7）。
 //
+// 只升不降这条由 deltas 的 Action 保证：这里处理的是已经判为"升"的那些。
+// 落位不等换盘：正式文件仍然是被子进程执行的那一份，rename 必须等关停
+// （Commit）。所以这里的失败可以完全收住——删掉落位文件，旧版本继续用。
+func (u *Upgrader) stagePlugins(ctx context.Context, rel *Release, p *Plan) {
+	for i := range p.Plugins {
+		d := &p.Plugins[i]
+		if d.Action != "升" {
+			continue
+		}
+		bin := u.pluginBin(d.Name)
+		if bin == "" {
+			d.Action = "跳过（定位不到插件文件路径，无法落位）"
+			continue
+		}
+		entry, asset, ok := rel.Index.lookup(d.Name)
+		if !ok {
+			d.Action = fmt.Sprintf("跳过（发布里没有 %s 的产物）", currentPlatform())
+			continue
+		}
+		staged, err := u.stagePlugin(ctx, rel, d.Name, bin, entry.Version, asset)
+		if err != nil {
+			d.Action = "失败（" + err.Error() + "）"
+			continue
+		}
+		d.Size = staged.Size
+		p.PluginStages = append(p.PluginStages, PluginStage{
+			Name: d.Name, From: d.From, To: d.To,
+			Bin: staged.Bin, NewPath: staged.Path, Size: staged.Size,
+		})
+	}
+}
+
+// guardVersion 拦住所有"版本号不参与比较"的现场。//
 // dev 是本地 go build 的默认值（决策 9）：它既不能判断谁新谁旧，也不该
 // 被 /upgrade "升"到某个正式版本。这条顺带挡住"本地构建混进生产"。
 func (u *Upgrader) guardVersion() error {
@@ -407,6 +483,10 @@ func Commit(p *Plan, log *slog.Logger) error {
 	if log == nil {
 		log = slog.Default()
 	}
+	// 插件先落位：它们的错误与核心换盘互不牵连（一个插件 rename 失败不该
+	// 让核心留在旧版本）。此刻子进程已经随核心关停退出，被替换的文件没有
+	// 任何进程在执行，rename 是纯元数据操作。
+	commitPlugins(p, log)
 	if err := Swap(p.Exe); err != nil {
 		// 换盘没成 → 旧二进制还在（Swap 自己会先试着换回来），
 		// 所以"没有未确认的升级"：标记必须清掉，否则下一次启动会拿一份
@@ -423,6 +503,35 @@ func Commit(p *Plan, log *slog.Logger) error {
 	log.Info("换盘完成，重启后由新版本接管",
 		"from", p.From, "to", p.To, "exe", p.Exe, "old", OldPath(p.Exe))
 	return nil
+}
+
+// commitPlugins 在关停之后按 rename 规则落位插件产物（与核心同一套顺序：
+// 旧文件先改名让位，新文件顶上来；第二步失败就立刻改回去）。
+//
+// 逐个独立：一个插件失败只记 Error，不影响核心换盘，也不影响其它插件。
+// 这正是决策 7 与决策 6 的差别——插件没有 pending 标记，它的"回滚"就是
+// 把旧文件留在 .old 里（下一次 /upgrade plugin 会重新装一遍）。
+func commitPlugins(p *Plan, log *slog.Logger) {
+	for _, st := range p.PluginStages {
+		backup := pluginOldPath(st.Bin)
+		_ = os.Remove(backup)
+		if err := os.Rename(st.Bin, backup); err != nil {
+			log.Error("插件换盘失败（旧产物改名），该插件保持旧版本",
+				"plugin", st.Name, "bin", st.Bin, "err", err)
+			continue
+		}
+		if err := os.Rename(st.NewPath, st.Bin); err != nil {
+			if rerr := os.Rename(backup, st.Bin); rerr != nil {
+				log.Error("插件换盘失败且回滚失败，插件目录可能不可用",
+					"plugin", st.Name, "bin", st.Bin, "err", err, "rollback_err", rerr)
+				continue
+			}
+			log.Error("插件换盘失败，已还原旧版本", "plugin", st.Name, "bin", st.Bin, "err", err)
+			continue
+		}
+		_ = os.Remove(backup)
+		log.Info("插件已随核心升级落位", "plugin", st.Name, "from", st.From, "to", st.To, "bin", st.Bin)
+	}
 }
 
 // humanSize 把字节数写成 MB（十进制，与 release 页面一致）。

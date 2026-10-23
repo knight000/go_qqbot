@@ -99,7 +99,15 @@ func loadedPlugins(plugins []host.Plugin) []upgrade.LoadedPlugin {
 	out := make([]upgrade.LoadedPlugin, 0, len(plugins))
 	for _, p := range plugins {
 		m := p.Manifest()
-		out = append(out, upgrade.LoadedPlugin{Name: m.Name, Version: m.Version})
+		lp := upgrade.LoadedPlugin{Name: m.Name, Version: m.Version}
+		// 只有子进程插件知道自己的可执行文件在哪（pluginproc.proxy 的
+		// BinPath）。核心升级要把更高版本的插件产物落位到它旁边（同卷），
+		// 猜一个"按名字拼出来的路径"可能换掉另一份产物——所以这里拿不到
+		// 路径就留空，升级侧会把那个插件跳过。
+		if bp, ok := p.(interface{ BinPath() string }); ok {
+			lp.Bin = bp.BinPath()
+		}
+		out = append(out, lp)
 	}
 	return out
 }
