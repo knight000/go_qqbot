@@ -42,6 +42,9 @@ const (
 	modeReserved     = "reserved"     // 声明核心保留前缀 /reset
 	modeHangManifest = "hangmanifest" // --manifest 卡死
 	modeGarbage      = "garbage"      // --manifest 输出非 JSON
+	// modeAlias 自称 "echo"：验「两个文件抢同一个插件名」。文件名只是标签，
+	// 名字由 manifest 说了算，所以这种撞车是可能的（升级残留一个旧文件）。
+	modeAlias = "alias"
 )
 
 func TestMain(m *testing.M) {
@@ -57,7 +60,7 @@ func TestMain(m *testing.M) {
 func helperMode() string {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
 	switch base {
-	case modeEcho, modeSlow, modeCrashy, modeBadAPI, modeReserved, modeHangManifest, modeGarbage:
+	case modeEcho, modeSlow, modeCrashy, modeBadAPI, modeReserved, modeHangManifest, modeGarbage, modeAlias:
 		return base
 	}
 	return ""
@@ -74,8 +77,10 @@ func hasManifestFlag() bool {
 
 // runAsPlugin 以插件身份跑到底，不返回。
 func runAsPlugin(mode string) {
-	if pid := os.Getenv(pidEnv); pid != "" {
-		_ = os.WriteFile(pid, []byte(strconv.Itoa(os.Getpid())), 0o644)
+	// 每个角色写自己的 pid 文件：同一轮里可能同时起好几个探测进程，
+	// 共用一个文件会互相覆盖，孤儿检查就失去意义。
+	if dir := os.Getenv(pidEnv); dir != "" {
+		_ = os.WriteFile(filepath.Join(dir, mode+".pid"), []byte(strconv.Itoa(os.Getpid())), 0o644)
 	}
 
 	// 探测阶段的行为：这些角色要证明"探测失败也只是跳过"，所以必须在
@@ -149,8 +154,12 @@ func (p *helperPlugin) Manifest() host.Manifest {
 			Commands:   []host.Command{{Prefix: "/reset"}},
 		}
 	}
+	name := p.mode
+	if p.mode == modeAlias {
+		name = modeEcho
+	}
 	return host.Manifest{
-		Name:       p.mode,
+		Name:       name,
 		Version:    "0.0.0",
 		APIVersion: host.APIVersion,
 		Intents:    []string{"message"},

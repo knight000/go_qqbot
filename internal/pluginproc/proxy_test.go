@@ -40,14 +40,15 @@ func testHost(name string, cfg map[string]any) host.Host {
 }
 
 // loadOne 是绝大多数用例的开头：装一个角色、Load、拿回那个插件。
-// pidFile 指向子进程自报的 pid，供"关停后不留孤儿"类断言使用。
+// pidDir 是子进程自报 pid 的目录（每个角色一个文件），供"关停后不留孤儿"
+// 类断言使用。
 func loadOne(t *testing.T, mode string, mutate func(*pluginproc.Options)) (host.Plugin, *logSink, string) {
 	t.Helper()
 	dir := t.TempDir()
 	install(t, dir, mode)
 
-	pidFile := filepath.Join(t.TempDir(), "pid")
-	t.Setenv(pidEnv, pidFile)
+	pidDir := t.TempDir()
+	t.Setenv(pidEnv, pidDir)
 
 	logs := newLogs()
 	o := pluginproc.Options{
@@ -67,7 +68,7 @@ func loadOne(t *testing.T, mode string, mutate func(*pluginproc.Options)) (host.
 	if len(plugins) != 1 {
 		t.Fatalf("应发现 1 个插件，实际 %d（日志：\n%s）", len(plugins), logs.text())
 	}
-	return plugins[0], logs, pidFile
+	return plugins[0], logs, pidDir
 }
 
 // initPlugin 让插件进程起来。失败即致命：后面的断言都以"进程在跑"为前提。
@@ -78,20 +79,48 @@ func initPlugin(t *testing.T, p host.Plugin, cfg map[string]any) {
 	}
 }
 
-// killByPid 是还没实现 Close 那几个用例的兜底清理：无论如何都不留孤儿进程。
-func killByPid(t *testing.T, pidFile string) {
+// readPid 读某个角色自报的 pid。文件还没出现（进程没起来）返回 0。
+func readPid(t *testing.T, pidDir, mode string) int {
 	t.Helper()
-	blob, err := os.ReadFile(pidFile)
+	blob, err := os.ReadFile(filepath.Join(pidDir, mode+".pid"))
 	if err != nil {
-		return
+		return 0
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(blob)))
 	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+// killByPid 是还没实现 Close 那几个用例的兜底清理：无论如何都不留孤儿进程。
+func killByPid(t *testing.T, pidDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(pidDir)
+	if err != nil {
 		return
 	}
-	if proc, err := os.FindProcess(pid); err == nil {
-		_ = proc.Kill()
+	for _, e := range entries {
+		if pid := readPid(t, pidDir, strings.TrimSuffix(e.Name(), ".pid")); pid > 0 {
+			if proc, err := os.FindProcess(pid); err == nil {
+				_ = proc.Kill()
+			}
+		}
 	}
+}
+
+// waitGone 轮询到进程消失（或超时后报错）。进程退出与句柄回收之间有一小段
+// 延迟，所以"立刻断言"会偶发假失败。
+func waitGone(t *testing.T, pid int, d time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return !processAlive(pid)
 }
 
 // Init 起进程并把配置快照交过去；Handle 把事件转发过去、把回复带回来。
@@ -101,9 +130,9 @@ func TestInitSpawnsAndHandleForwards(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "marker")
 	t.Setenv(markerEnv, marker)
 
-	p, logs, pidFile := loadOne(t, modeEcho, nil)
+	p, logs, pidDir := loadOne(t, modeEcho, nil)
 	initPlugin(t, p, map[string]any{"greeting": "你好"})
-	t.Cleanup(func() { killByPid(t, pidFile) })
+	t.Cleanup(func() { killByPid(t, pidDir) })
 
 	ctx := context.Background()
 	// 1. 配置快照必须过通道（插件读的是 plugin.init 给的 map，不是它自己的环境）。
