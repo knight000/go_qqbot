@@ -97,6 +97,32 @@ func (db *DB) Close() error {
 	return first
 }
 
+// VacuumInto 把当前库完整写成一个独立的快照文件。
+//
+// 用 SQLite 的 `VACUUM INTO` 而不是拷 .db 文件：库里是 WAL 模式，最近的写入
+// 可能还在 -wal 里，只拷主文件会得到一份"少了最后几条消息"的库，而这份快照
+// 存在的唯一意义就是回滚时能还原。
+//
+// 走写连接（MaxOpenConns=1）：VACUUM 期间会独占写，这是有意的——升级路径
+// 本来就不该与业务写入并发，而快照的完整性比吞吐重要。
+func (db *DB) VacuumInto(ctx context.Context, path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("解析快照路径 %s: %w", path, err)
+	}
+	// VACUUM INTO 要求目标不存在，自己先判一次能给出更直白的错误。
+	if _, err := os.Stat(abs); err == nil {
+		return fmt.Errorf("快照目标已存在: %s", abs)
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return fmt.Errorf("创建快照目录: %w", err)
+	}
+	if _, err := db.w.ExecContext(ctx, `VACUUM INTO ?`, filepath.ToSlash(abs)); err != nil {
+		return fmt.Errorf("VACUUM INTO %s: %w", abs, err)
+	}
+	return nil
+}
+
 // columnMigrations 给已存在的库补列。SQLite 的 ADD COLUMN 没有 IF NOT EXISTS，
 // 所以先查 PRAGMA table_info 再决定是否执行。
 var columnMigrations = []struct {
