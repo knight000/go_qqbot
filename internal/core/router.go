@@ -19,7 +19,7 @@ import (
 // 白占一个前缀（第三方插件想用也加载不了），而未列却被处理，则插件声明的
 // 同名命令会被核心静默遮蔽。/grant、/revoke 已随功能移除一并退场。
 var reservedPrefixes = []string{
-	"/claim", "/admin", "/group", "/reset", "/reload", "/restart",
+	"/claim", "/admin", "/group", "/reset", "/reload", "/restart", "/upgrade",
 }
 
 // reservedConflict 判断插件前缀是否占用了核心指令，按**词边界**比较。

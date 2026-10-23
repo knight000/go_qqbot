@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/knight000/go_qqbot/internal/buildinfo"
+	"github.com/knight000/go_qqbot/internal/upgrade"
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
@@ -25,13 +26,20 @@ import (
 //   - Unix 用 exec 原地替换进程映像（PID 不变，systemd cgroup 不受影响）；
 //     Windows 用 spawn 拉起自身后退出（没有 systemd，不存在 cgroup 回收问题）。
 
-// RestartRequest 由 /reload 产生，交给 main 执行重启动作。
+// RestartRequest 由 /reload 或 /upgrade apply 产生，交给 main 执行重启动作。
 type RestartRequest struct {
 	By     string     // 触发者 openid
 	Role   string     // owner / admin
 	Scene  host.Scene // 触发场景
 	Reason string     // 可选备注，写进日志
 	At     time.Time
+
+	// Plan 非 nil 表示这次重启要顺带换盘（/upgrade apply）。
+	//
+	// 只加一个可选字段、不新造一条重启路径（ADR-0006 决策 8）：换盘必须
+	// 发生在"网关断开 → session 落盘 → 关库"之后，而那条序列 /reload 已经
+	// 做对了，复制一份只会得到两处需要同时维护的顺序。
+	Plan *upgrade.Plan
 }
 
 // ErrRestartPending 表示已经有一条重启请求在队列里，避免重复触发。
