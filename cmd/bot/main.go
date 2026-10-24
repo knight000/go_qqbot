@@ -4,8 +4,9 @@
 // 下的独立可执行文件，由 internal/pluginproc 在装配期扫描、探测、spawn。
 // 所以加插件不需要重编译核心，`go build ./cmd/bot` 也不再需要任何 go:generate。
 //
-// 出厂副本（四个示例插件）由 internal/pluginbundle 内嵌，只作释放源；
-// 释放只发生在显式命令 `qqbot init --plugins` 里（#42），启动期不释放、不自愈。
+// 出厂副本（四个示例插件）由 internal/pluginbundle 内嵌。启动期只做对齐
+// （#52）：内嵌版本更高、或契约版本不匹配才替换，磁盘版本更高则保留；
+// 缺文件时补回。释放全部缺失文件仍走显式命令 `qqbot init --plugins`（#42）。
 package main
 
 import (
@@ -33,6 +34,8 @@ import (
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/instance"
 	"github.com/knight000/go_qqbot/internal/logx"
+	"github.com/knight000/go_qqbot/internal/pluginalign"
+	"github.com/knight000/go_qqbot/internal/pluginbundle"
 	"github.com/knight000/go_qqbot/internal/pluginproc"
 	"github.com/knight000/go_qqbot/internal/render"
 	"github.com/knight000/go_qqbot/internal/store"
@@ -256,6 +259,21 @@ func run() (*core.RestartRequest, error) {
 	if err := registry.Register(rpc.CodeImplBase, core.ErrPassiveExhausted); err != nil {
 		return nil, err
 	}
+	// 内嵌副本对齐必须在 Load 之前（#52）：这时插件进程还没起，文件可以
+	// 安全替换。判定矩阵在 internal/pluginalign：内嵌版本更高、或磁盘插件的
+	// api_version 与核心不一致就换；磁盘版本更高则保留（只升不降）。
+	align := pluginalign.Align(ctx, pluginalign.Options{
+		Dir:        filepath.Join(datadir, "plugins", "bin"),
+		Bundle:     pluginbundle.Files(),
+		Versions:   pluginbundle.Versions(),
+		APIVersion: host.APIVersion,
+		Log:        log.With("component", "pluginalign"),
+	})
+	if align.Changed() > 0 {
+		log.Info("出厂插件已对齐",
+			"added", len(align.Added), "replaced", len(align.Replaced))
+	}
+
 	procPlugins, err := pluginproc.Load(ctx, pluginproc.Options{
 		Dir:       filepath.Join(datadir, "plugins", "bin"),
 		ConfigFor: cfg.Plugin,

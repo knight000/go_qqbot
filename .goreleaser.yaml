@@ -43,6 +43,8 @@ builds:
       - arm64
     # 只有这三个平台有出厂插件副本（internal/pluginbundle/dist/），
     # windows/arm64 编译得出但没有 go:embed 的插件，发了也启动不了。
+    # 插件产物随核心内嵌；release 里只在插件有更新时才上传对应资产（#52），
+    # 所以资产数量不再是固定值——升级与启动对齐都不依赖"发布里一定有插件"。
     ignore:
       - goos: windows
         goarch: arm64

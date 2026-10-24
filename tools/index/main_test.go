@@ -323,3 +323,251 @@ func TestParseArgsRequiresTag(t *testing.T) {
 		t.Errorf("out 默认值 = %q，应当空着由 staging 推导", o.out)
 	}
 }
+
+// makePrevious 造一份"上一次发布"的 index.json：先用 generate 生成，
+// 再把指定插件的版本改低（模拟"它上次发的是旧版本"）。其余插件与当前
+// 版本相同，应当被沿用。
+func makePrevious(t *testing.T, root string, oldVersions map[string]string) string {
+	t.Helper()
+	dist := filepath.Join(root, "internal", "pluginbundle", "dist")
+	dir := filepath.Join(root, "old")
+	out := filepath.Join(dir, "index.json")
+	if err := generate(options{tag: "v1.0.0", repo: "o/r", dist: dist, staging: dir, out: out}); err != nil {
+		t.Fatalf("生成上一版 index: %v", err)
+	}
+	if len(oldVersions) == 0 {
+		return out
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var idx index
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatal(err)
+	}
+	for i := range idx.Plugins {
+		if v, ok := oldVersions[idx.Plugins[i].Name]; ok {
+			idx.Plugins[i].Version = v
+			for key, a := range idx.Plugins[i].Assets {
+				// 资产名里带版本，改版本时一并改掉，保持"上一版长什么样"自洽。
+				parts := strings.SplitN(key, "-", 2)
+				a.URL = "https://github.com/o/r/releases/download/v1.0.0/" +
+					assetName(idx.Plugins[i].Name, v, platform{os: parts[0], arch: parts[1]})
+				idx.Plugins[i].Assets[key] = a
+			}
+		}
+	}
+	data, err = json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// 版本相同的插件原样沿用上一条目：URL/sha256 都指向上一版 tag，且**不拷进
+// staging**——staging 里有什么就上传什么，不拷就不会被 gh release upload 带走。
+func TestGenerateCarriesForwardUnchangedPlugins(t *testing.T) {
+	root := fixture(t)
+	dist := filepath.Join(root, "internal", "pluginbundle", "dist")
+	prev := makePrevious(t, root, nil)
+	staging := filepath.Join(root, "new")
+
+	// 模拟上一次本地运行留下的残留：沿用的条目不该把它一起上传。
+	stale := filepath.Join(staging, "qqbot-plugin-echo-stale-windows-amd64.exe")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := generate(options{
+		tag: "v1.1.0", repo: "o/r", dist: dist, staging: staging, previous: prev,
+	}); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+
+	idx := readIndex(t, filepath.Join(staging, "index.json"))
+	if len(idx.Plugins) != 4 {
+		t.Fatalf("沿用后仍应登记 4 个插件，实际 %d", len(idx.Plugins))
+	}
+	for _, p := range idx.Plugins {
+		for key, a := range p.Assets {
+			if !strings.Contains(a.URL, "/v1.0.0/") {
+				t.Errorf("%s/%s 应沿用上一版 tag，实际 %q", p.Name, key, a.URL)
+			}
+			if a.SHA256 == "" {
+				t.Errorf("%s/%s 沿用时 sha256 不能为空", p.Name, key)
+			}
+		}
+	}
+
+	// staging 里除了 index.json 不该有别的文件：本次没有任何插件更新。
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "index.json" {
+			t.Errorf("沿用的插件不该出现在 staging 里，实际有 %s", e.Name())
+		}
+	}
+}
+
+// 只有涨了版本的插件才重新产出资产：其余 3 个沿用，1 个新发 × 3 平台。
+func TestGenerateUploadsOnlyChangedPlugins(t *testing.T) {
+	root := fixture(t)
+	dist := filepath.Join(root, "internal", "pluginbundle", "dist")
+	prev := makePrevious(t, root, map[string]string{"md": "0.0.1"})
+	staging := filepath.Join(root, "new")
+
+	if err := generate(options{
+		tag: "v1.1.0", repo: "o/r", dist: dist, staging: staging, previous: prev,
+	}); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+
+	idx := readIndex(t, filepath.Join(staging, "index.json"))
+	mdVer := pluginVersion(t, "md")
+	var newAssets int
+	for _, p := range idx.Plugins {
+		for key, a := range p.Assets {
+			switch p.Name {
+			case "md":
+				if p.Version != mdVer {
+					t.Errorf("md 的版本应更新到 %s，实际 %s", mdVer, p.Version)
+				}
+				if !strings.Contains(a.URL, "/v1.1.0/") {
+					t.Errorf("md/%s 应指向本次 tag，实际 %q", key, a.URL)
+				}
+				newAssets++
+			default:
+				if !strings.Contains(a.URL, "/v1.0.0/") {
+					t.Errorf("%s/%s 应沿用上一版 tag，实际 %q", p.Name, key, a.URL)
+				}
+			}
+		}
+	}
+	if newAssets != len(releasePlatforms) {
+		t.Errorf("本次新发资产数 = %d，期望 %d", newAssets, len(releasePlatforms))
+	}
+
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	for _, e := range entries {
+		if e.Name() == "index.json" {
+			continue
+		}
+		files = append(files, e.Name())
+		if !strings.HasPrefix(e.Name(), "qqbot-plugin-md-") {
+			t.Errorf("staging 里出现了未变化的插件资产: %s", e.Name())
+		}
+	}
+	if len(files) != len(releasePlatforms) {
+		t.Errorf("staging 里的插件资产数 = %d，期望 %d: %v", len(files), len(releasePlatforms), files)
+	}
+}
+
+// 没有上一条目（新增插件）或没有 -previous → 照旧全量产出。
+func TestGenerateWithoutPreviousUploadsEverything(t *testing.T) {
+	root := fixture(t)
+	dist := filepath.Join(root, "internal", "pluginbundle", "dist")
+	staging := filepath.Join(root, "new")
+
+	if err := generate(options{tag: "v1.1.0", repo: "o/r", dist: dist, staging: staging}); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "qqbot-plugin-") {
+			n++
+		}
+	}
+	if want := len(releasePlatforms) * 4; n != want {
+		t.Errorf("没有 -previous 时应全量产出 %d 个资产，实际 %d", want, n)
+	}
+}
+
+// 上一版 index.json 读不动时直接报错：拿半份清单去"沿用"会让某些插件
+// 永远发不出去，比流水线红掉更难查。
+func TestGenerateRejectsBrokenPrevious(t *testing.T) {
+	root := fixture(t)
+	dist := filepath.Join(root, "internal", "pluginbundle", "dist")
+	bad := filepath.Join(root, "bad.json")
+	if err := os.WriteFile(bad, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := generate(options{
+		tag: "v1.1.0", repo: "o/r", dist: dist, staging: filepath.Join(root, "new"), previous: bad,
+	})
+	if err == nil {
+		t.Fatal("上一版 index.json 解析失败时应当报错")
+	}
+	if !strings.Contains(err.Error(), "上一版") {
+		t.Errorf("错误串应说明是上一版清单的问题，实际: %v", err)
+	}
+}
+
+// 上一版里某个插件的资产不全，但它本次涨了版本 → 不影响发布（反正要重发）。
+// 只有"要沿用的条目"才必须完整，否则上一版的一次残缺会永久挡住后续发布。
+func TestGenerateIgnoresBrokenEntryWhenVersionChanged(t *testing.T) {
+	root := fixture(t)
+	dist := filepath.Join(root, "internal", "pluginbundle", "dist")
+	prev := makePrevious(t, root, map[string]string{"md": "0.0.1"})
+
+	data, err := os.ReadFile(prev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var idx index
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatal(err)
+	}
+	for i := range idx.Plugins {
+		if idx.Plugins[i].Name == "md" {
+			delete(idx.Plugins[i].Assets, "linux-arm64")
+		}
+	}
+	data, err = json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(prev, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staging := filepath.Join(root, "new")
+	if err := generate(options{tag: "v1.1.0", repo: "o/r", dist: dist, staging: staging, previous: prev}); err != nil {
+		t.Fatalf("涨了版本的插件不该被上一版的残缺挡住: %v", err)
+	}
+	var mdAssets int
+	for _, e := range mustReadDir(t, staging) {
+		if strings.HasPrefix(e.Name(), "qqbot-plugin-md-") {
+			mdAssets++
+		}
+	}
+	if mdAssets != len(releasePlatforms) {
+		t.Errorf("md 应重发 %d 个平台，实际 %d", len(releasePlatforms), mdAssets)
+	}
+}
+
+func mustReadDir(t *testing.T, dir string) []os.DirEntry {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}

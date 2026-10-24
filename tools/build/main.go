@@ -23,6 +23,13 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/knight000/go_qqbot/internal/pluginbundle"
+	"github.com/knight000/go_qqbot/pkg/host"
+	"github.com/knight000/go_qqbot/plugins/adminping"
+	"github.com/knight000/go_qqbot/plugins/bootnotice"
+	"github.com/knight000/go_qqbot/plugins/echo"
+	"github.com/knight000/go_qqbot/plugins/md"
 )
 
 const usageText = `用法：go run ./tools/build <plugins|core|all> [-target os/arch] [-o 路径]
@@ -269,7 +276,70 @@ func buildPlugins(root string, p plan) error {
 		}
 		fmt.Printf("build: 插件 %s -> %s\n", name, out)
 	}
+	return writeVersions(dir, selectVersions(names))
+}
+
+// writeVersions 把 `<name>=<version>` 清单写进插件产物目录。
+//
+// 它随 //go:embed all: 一起进核心，是启动期对齐（#52）唯一的版本来源。
+// 覆盖写而不是追加：删掉的插件必须从清单里消失，否则启动期每次都会去补
+// 一个已经不存在的产物。
+func writeVersions(dir string, versions map[string]string) error {
+	var b strings.Builder
+	b.WriteString("# 由 go run ./tools/build plugins 生成：插件名=版本\n")
+	names := make([]string, 0, len(versions))
+	for name := range versions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		b.WriteString(name + "=" + versions[name] + "\n")
+	}
+	path := filepath.Join(dir, pluginbundle.VersionsFile)
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		return fmt.Errorf("写插件版本清单 %s: %w", path, err)
+	}
 	return nil
+}
+
+// selectVersions 只保留本次真的产出了产物的插件。
+//
+// 清单里写进一个没编的插件，启动期就会拿内嵌副本去补一个不存在的文件，
+// 每次启动刷一条 warn。没有版本信息的插件（用户自己放进 plugins/ 的）
+// 也不写：它们不归出厂副本管。
+func selectVersions(names []string) map[string]string {
+	known := pluginVersions()
+	out := make(map[string]string, len(names))
+	for _, name := range names {
+		v := strings.TrimSpace(known[name])
+		if v == "" {
+			fmt.Fprintf(os.Stderr, "build: 插件 %s 没有版本信息，不写入 %s\n", name, pluginbundle.VersionsFile)
+			continue
+		}
+		out[name] = v
+	}
+	return out
+}
+
+// pluginVersions 读四个出厂插件自报的版本。
+//
+// 与 tools/index 同一口径（显式列出示例插件，而不是扫目录）：版本号的事实
+// 源是各插件的 Manifest()，这里只做转述。
+func pluginVersions() map[string]string {
+	plugins := []host.Plugin{
+		&adminping.Plugin{},
+		&bootnotice.Plugin{},
+		&echo.Plugin{},
+		&md.Plugin{},
+	}
+	out := make(map[string]string, len(plugins))
+	for _, p := range plugins {
+		m := p.Manifest()
+		if m.Name != "" {
+			out[m.Name] = m.Version
+		}
+	}
+	return out
 }
 
 func buildCore(root string, p plan) error {

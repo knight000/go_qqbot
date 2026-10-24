@@ -484,7 +484,7 @@ retry_delay = "30s"
 插件已经是独立进程（ADR-0005），所以这里的边界和 P1 时代完全不同：
 
 - **插件代码改动不需要 `/reload`，也不需要重编译核心**：把新产物放进 `<datadir>/plugins/bin/` 就是装上（同名文件覆盖后敲一次 `/reload`，或对单个插件用 `/upgrade plugin`）；
-- `/reload` **不重新编译任何东西**。它重启的是核心进程，新进程在装配期会重新扫 `plugins/bin/`，所以新放进去的插件会随之加载、被删掉的插件就此消失；
+- `/reload` **不重新编译任何东西**。它重启的是核心进程，新进程在装配期会重新扫 `plugins/bin/`，所以新放进去的插件会随之加载、被删掉的第三方插件就此消失。出厂插件（四个示例）是例外：启动期会用内嵌副本补回缺失的文件，要停用请写进 `[plugins].disabled`（#52）；
 - 只想换一个插件时用 `/upgrade plugin <名称>`，它只重启那个插件的子进程，核心与其它插件不重启。
 
 ```
@@ -537,6 +537,16 @@ go run ./tools/build all -target linux/amd64 -o dist/qqbot-linux-amd64
 ```
 
 正式发布走 tag：push `v*` 之后 CI 依次跑「三个平台的插件产物 → GoReleaser 编核心与 checksums.txt → `tools/index` 生成 index.json → 下载回来冒烟」。版本号只经 `-ldflags -X .../buildinfo.Version` 注入，本地 `tools/build` 不注入（所以本地产物是 `dev`，`/upgrade` 会拒绝自更新——这正是防止本地构建混进生产的闸门）。
+
+一次发布里的资产形状（#52）：
+
+| 资产 | 什么时候有 |
+| --- | --- |
+| `qqbot-<ver>-<os>-<arch>[.exe]` | 每次发布，3 个平台 |
+| `checksums.txt` / `index.json` | 每次发布 |
+| `qqbot-plugin-<name>-<ver>-<os>-<arch>` | **只在该插件版本号变了时上传**；没变就沿用上一版资产，index.json 里的 url 仍指向旧 tag |
+
+插件版本号没变 = 没更新。所以**改了插件代码必须涨 `Manifest().Version`**；契约版本（`host.APIVersion`）变化时由启动期对齐兜底，不依赖版本号。核心每次发布都带着一份内嵌插件副本，覆盖升级核心后启动时会把插件对齐到内嵌版本（只升不降；磁盘版本更高时保留并记一条 info）。
 
 服务器上不需要 `scp` + `systemctl restart` 了：tag 发出去之后在 QQ 里敲 `/upgrade` 看一眼、`/upgrade apply` 应用即可。要手工换文件（离线 / 救火）见上面的「离线恢复」。
 
