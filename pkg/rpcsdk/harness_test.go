@@ -228,6 +228,26 @@ type plugin struct {
 	conn     *rpc.Conn
 	manifest host.Manifest
 	optional []string
+	cmd      *exec.Cmd
+	// stderr 收着插件写在标准错误上的全部输出。只能在进程退出之后读：
+	// exec 用内部协程往里抄，提前读就是一场数据竞争。
+	stderr *bytes.Buffer
+}
+
+// stderrAfterStop 收掉子进程并返回它的 stderr 全文。
+//
+// 判定插件日志通道（#48）必须看真实的管道内容——handler 设没设、设成什么，
+// 在核心眼里只有"stderr 上出现了什么"这一个事实。
+func (p *plugin) stderrAfterStop() string {
+	p.t.Helper()
+	_ = p.conn.Close()
+	if p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
+	}
+	// Wait 会等 stderr 的抄写协程结束，之后读缓冲区才安全。
+	// 重复 Wait 只返回错误，用例结尾的清理照样能收干净。
+	_ = p.cmd.Wait()
+	return p.stderr.String()
 }
 
 // startPlugin 起子进程、接好两条管道、做完 init。任何一步失败都是致命错误。
@@ -275,7 +295,7 @@ func startPlugin(t *testing.T, h *harness) *plugin {
 	if err := conn.CallInit(ctx, "testplugin", map[string]any{"greeting": "hi", "n": int64(7)}); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	return &plugin{t: t, conn: conn, manifest: m, optional: optional}
+	return &plugin{t: t, conn: conn, manifest: m, optional: optional, cmd: cmd, stderr: &stderr}
 }
 
 // event 造一条进站消息。Command / Args 由核心在路由阶段填好（契约 8），
