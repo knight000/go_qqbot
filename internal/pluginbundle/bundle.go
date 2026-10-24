@@ -1,9 +1,13 @@
 // Package pluginbundle 是核心二进制里内嵌的出厂插件副本。
 //
-// 内嵌副本**只作释放源**（ADR-0005 决策 11）：运行期的事实源永远是
+// 内嵌副本是**释放源与对齐源**（ADR-0005 决策 11）：运行期的事实源永远是
 // <datadir>/plugins/bin/ 里的文件——在就是装着，不在就是没装。核心启动期
-// 不释放、不自愈（决策 12），释放只发生在显式命令 `qqbot init --plugins`
-// 里（#42）。所以本包只提供三个原语：Files / Names / Extract，不碰装配。
+// 不做无条件的释放，而是用内嵌副本做一次「只升不降」的对齐（#52）：内嵌
+// 版本更高、或磁盘插件的 api_version 与核心不一致才替换，缺文件时补回。
+// 那套判定住在 internal/pluginalign，本包只提供原语。
+//
+// 释放全部缺失文件仍走显式命令 `qqbot init --plugins`（#42）：本包提供
+// Files / Names / Versions / Extract 四个原语，不碰装配。
 //
 // 产物位置是 internal/pluginbundle/dist/<goos>_<goarch>/ 而不是仓库根的
 // dist/：go:embed 的模式不得引用包目录之外的文件，这是唯一可行的位置
@@ -34,6 +38,47 @@ func Files() fs.FS {
 		return emptyFS{}
 	}
 	return embeddedFS
+}
+
+// VersionsFile 是版本清单在产物目录里的文件名。
+//
+// 下划线前缀是必须的：namesOf 会跳过 `.` 与 `_` 开头的文件（那是给 .gitkeep
+// 与 Go 工具链约定留的），而 //go:embed all: 会把它们也嵌进来。于是清单既
+// 随二进制发布，又不会被 Names / Extract 当成一个插件。
+const VersionsFile = "_versions"
+
+// Versions 返回内嵌副本里每个插件自报的版本（name → version）。
+//
+// 清单缺失、为空或格式坏时返回空 map：版本对齐是尽力而为的能力，不能因为
+// 一份清单读不动就让机器人起不来。半份清单同样作废（见 versionsOf），
+// 免得"某些插件没版本"被静默当成"不用对齐"。
+func Versions() map[string]string {
+	return versionsOf(embeddedFS)
+}
+
+// versionsOf 解析 `<name>=<version>` 逐行清单。允许空行与 # 注释。
+func versionsOf(fsys fs.FS) map[string]string {
+	out := map[string]string{}
+	if fsys == nil {
+		return out
+	}
+	data, err := fs.ReadFile(fsys, VersionsFile)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, ver, ok := strings.Cut(line, "=")
+		name, ver = strings.TrimSpace(name), strings.TrimSpace(ver)
+		if !ok || name == "" || ver == "" {
+			return map[string]string{}
+		}
+		out[name] = ver
+	}
+	return out
 }
 
 // Names 返回本平台出厂插件的名字，按字典序。

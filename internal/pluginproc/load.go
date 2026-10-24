@@ -232,6 +232,16 @@ func probeAll(ctx context.Context, files []string, timeout time.Duration) []prob
 	return results
 }
 
+// ProbeManifest 起一次 `<bin> --manifest`，返回它自称的清单。
+//
+// 装配期之外只有一个消费方：启动期用内嵌副本对齐插件目录
+// （internal/pluginalign）要先知道磁盘上那份是谁、哪一版，才能决定换不换。
+// 探测协议与 Load 完全同源，不另写一份。
+func ProbeManifest(ctx context.Context, bin string, timeout time.Duration) (host.Manifest, error) {
+	m, _, err := probeOne(ctx, bin, timeout)
+	return m, err
+}
+
 // probeOne 起 `bin --manifest` 并解析 stdout。
 func probeOne(ctx context.Context, bin string, timeout time.Duration) (host.Manifest, []string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)

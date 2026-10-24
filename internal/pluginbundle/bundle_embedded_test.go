@@ -48,6 +48,28 @@ func requireBundle(t *testing.T) {
 	}
 }
 
+// 版本清单必须随产物一起进二进制：启动期对齐（#52）靠它判断"内嵌的比
+// 磁盘新"。清单文件名带下划线前缀，namesOf 会跳过它——这里同时确认它没有
+// 被当成第五个插件。
+func TestEmbeddedBundleCarriesVersions(t *testing.T) {
+	requireBundle(t)
+
+	versions := pluginbundle.Versions()
+	if len(versions) != len(pluginbundle.Names()) {
+		t.Fatalf("版本清单 %v 与插件清单 %v 数量不一致", versions, pluginbundle.Names())
+	}
+	suffix := ""
+	if runtime.GOOS == "windows" {
+		suffix = ".exe"
+	}
+	for _, file := range pluginbundle.Names() {
+		name := strings.TrimSuffix(file, suffix)
+		if strings.TrimSpace(versions[name]) == "" {
+			t.Errorf("插件 %s 没有版本号：清单里是 %v", name, versions)
+		}
+	}
+}
+
 func TestEmbeddedBundleIsTheFourExamplePlugins(t *testing.T) {
 	requireBundle(t)
 
@@ -81,7 +103,9 @@ func TestExtractThenLoadFindsFourPlugins(t *testing.T) {
 // 启动期只读目录、不释放（ADR-0005 决策 12：删除即卸载）。
 //
 // 这条守的是 pluginproc.Load：它一旦开始"发现文件缺失就补回来"，
-// 用户就再也没法靠删文件卸载一个示例插件。
+// 用户就再也没法靠删文件卸载一个示例插件。启动期的补回由
+// internal/pluginalign 显式负责（#52，只补出厂插件、只升不降），
+// 与 Load 的"只看不动"是两件事。
 func TestDeletedPluginIsNotRestoredAtStartup(t *testing.T) {
 	requireBundle(t)
 
