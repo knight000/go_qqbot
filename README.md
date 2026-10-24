@@ -55,11 +55,11 @@ $EDITOR config/config.local.toml
 
 ```text
 已生成配置：config/config.local.toml
-数据目录：.temp\data
-出厂插件：adminping.exe, bootnotice.exe, echo.exe, md.exe → .temp\data\plugins\bin
+数据目录：data
+出厂插件：adminping.exe, bootnotice.exe, echo.exe, md.exe → data\plugins\bin
 ```
 
-> 数据目录按 `[store].path`（默认 `./.temp/data/qqbot.db`）的目录相对**当前工作目录**解析，不是相对配置文件。换目录安装时要么 `cd` 过去再 init，要么在配置里写绝对路径（见下面的 Debian 步骤）。上面是仓库内开发的形态，数据落在 `./.temp/data/`（已 gitignore）。
+> 数据目录按 `[store].path`（默认 `./data/qqbot.db`）的目录相对**当前工作目录**解析，不是相对配置文件。换目录安装时要么 `cd` 过去再 init，要么在配置里写绝对路径（见下面的 Debian 步骤）。上面是仓库内开发的形态，数据落在 `./data/`（已 gitignore）。
 
 启动日志里能确认插件真的装上了（这几行都在连网关之前，网关连不上照样打）：
 
@@ -93,7 +93,7 @@ sudo -u qqbot bash -c 'cd /var/lib/qqbot && ./bin/qqbot init -c /etc/qqbot/confi
 # 3. 把 [store].path 改成绝对路径，再让插件落到新的数据目录
 sudo -u qqbot vi /etc/qqbot/config.toml              # path = "/var/lib/qqbot/qqbot.db"
 sudo -u qqbot /var/lib/qqbot/bin/qqbot init --plugins -c /etc/qqbot/config.toml
-sudo rm -rf /var/lib/qqbot/.temp                    # 第 2 步按相对路径释放的那一份
+sudo rm -rf /var/lib/qqbot/data                     # 第 2 步按相对路径释放的那一份
 
 # 4. 装 unit 并启动
 sudo install -m 0644 deploy/qqbot.service /etc/systemd/system/qqbot.service
@@ -278,7 +278,7 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 普通日志与轨迹共用同一副行首，扫起来是连续的：
 
 ```
-[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping 权限=bot-admin
+[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping role=bot-admin
 [13:50:34] [WARN] 队列已满，丢弃事件 peer=g1
 [13:50:34] [ERROR] 插件处理失败 plugin=md err="i/o timeout"
 ```

@@ -24,11 +24,11 @@ func TestTextFormat(t *testing.T) {
 	var buf bytes.Buffer
 	h := newTextHandler(&buf, slog.LevelInfo, false)
 	r := record("adminping 插件已初始化", slog.LevelInfo,
-		slog.String("plugin", "adminping"), slog.String("权限", "bot-admin"))
+		slog.String("plugin", "adminping"), slog.String("role", "bot-admin"))
 	if err := h.Handle(context.Background(), r); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	want := "[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping 权限=bot-admin\n"
+	want := "[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping role=bot-admin\n"
 	if got := buf.String(); got != want {
 		t.Fatalf("格式不符\n期望 %q\n实际 %q", want, got)
 	}

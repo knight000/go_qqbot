@@ -1,19 +1,26 @@
 package adminping
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/knight000/go_qqbot/internal/sysinfo"
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
 // fakeHost 只填本插件用到的能力（日志与配置）；鉴权已不在插件里，IsAdmin 不参与。
-type fakeHost struct{ cfg host.Params }
+// log 为 nil 时丢弃日志，需要观察日志的用例自己塞一个打到 buffer 的 logger。
+type fakeHost struct {
+	cfg host.Params
+	log *slog.Logger
+}
 
 func (f *fakeHost) Plugin() string              { return "adminping" }
 func (f *fakeHost) Config() host.Params         { return f.cfg }
@@ -30,6 +37,9 @@ func (f *fakeHost) IsAdmin(context.Context, host.Identity) (bool, error) {
 	return false, nil
 }
 func (f *fakeHost) Log() *slog.Logger {
+	if f.log != nil {
+		return f.log
+	}
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
@@ -40,6 +50,32 @@ func newPlugin(t *testing.T) *Plugin {
 		t.Fatalf("Init: %v", err)
 	}
 	return p
+}
+
+// Init 的日志字段名必须是 ASCII 键：`role` 而不是中文键。
+// 字段名是给机器读的——中文键进 jq / Loki / journald 的字段提取要额外转义，
+// 也会和同一份日志里的 plugin、err 分裂成两套 grep 规则。
+func TestInitLogsASCIIKeys(t *testing.T) {
+	var buf bytes.Buffer
+	h := &fakeHost{log: slog.New(slog.NewJSONHandler(&buf, nil))}
+	if err := (&Plugin{}).Init(context.Background(), h); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("日志不是一行 JSON：%v（原文 %q）", err, buf.String())
+	}
+	if got, want := rec["role"], "bot-admin"; got != want {
+		t.Errorf("role=%v，期望 %v（原文 %q）", got, want, buf.String())
+	}
+	for k := range rec {
+		for _, r := range k {
+			if r > unicode.MaxASCII {
+				t.Errorf("日志字段名含非 ASCII 字符：%q（原文 %q）", k, buf.String())
+			}
+		}
+	}
 }
 
 // ev 构造一条投递到本插件的事件。command 是路由层填好的 Event.Command

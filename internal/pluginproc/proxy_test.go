@@ -3,10 +3,12 @@ package pluginproc_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -499,4 +501,87 @@ func TestRunJobForwardsSpec(t *testing.T) {
 	if n := countLines(t, marker, line); n != 1 {
 		t.Fatalf("插件没收到 %q（实际日志行见 marker 文件）", line)
 	}
+}
+
+// 插件日志按**真实等级**重放（#48）。
+//
+// 从前 stderr 的整行被当成一条 Info：插件的 WARN/ERROR 到了核心一律降级，
+// 配 `[log].level = "warn"` 时还会被全部过滤——现场表现是"插件在报错，日志
+// 里一条都没有"。这里逐条断言等级、字段，以及"一行只有一组前缀"。
+func TestPluginLogKeepsLevelAndAttrs(t *testing.T) {
+	p, logs, _ := loadOne(t, modeWarn, nil)
+	initPlugin(t, p, nil)
+
+	// 等级是插件的等级；attrs 平铺在正文后面；plugin= 只出现一次——插件自报
+	// 的那份要被进程身份覆盖，否则按 plugin= 聚合会把同一个插件算成两个。
+	if got, want := waitLogLine(t, logs.text, "磁盘快满了"),
+		"WARN 磁盘快满了 plugin=warn pct=91"; got != want {
+		t.Fatalf("插件 WARN 行 = %q，期望 %q", got, want)
+	}
+
+	// 老格式（TextHandler 那种 `2026/10/24 22:00:00 INFO x`）认不出就当原文
+	// 打出来：日志通道不能因为一行不合约定的输出丢信息，更不能让启动失败。
+	if got, want := waitLogLine(t, logs.text, "legacy 行"),
+		"INFO 2026/10/24 22:00:00 INFO legacy 行 plugin=warn"; got != want {
+		t.Fatalf("老格式行 = %q，期望 %q", got, want)
+	}
+}
+
+// 配 `[log].level = "warn"` 时插件的 WARN 必须还在、INFO 要按配置消失。
+//
+// 这是这次修复的现场价值：等级丢失不只是格式难看，而是让 WARN/ERROR 在
+// 生产配置下彻底不可见。用标准库 handler 当参照——它按等级过滤的规则是
+// 独立于本仓库的既定事实，不会跟着被测代码一起改。
+func TestPluginWarnSurvivesLevelFilter(t *testing.T) {
+	sink := &syncBuffer{}
+	p, _, _ := loadOne(t, modeWarn, func(o *pluginproc.Options) {
+		o.Log = slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	})
+	initPlugin(t, p, nil)
+
+	if got := waitLogLine(t, sink.text, "磁盘快满了"); !strings.Contains(got, "level=WARN") {
+		t.Fatalf("配 level=warn 时插件的 WARN 被降级或丢了：%q", got)
+	}
+	if got := sink.text(); strings.Contains(got, "插件已就绪") {
+		t.Fatalf("配 level=warn 时 INFO 行不该出现：\n%s", got)
+	}
+}
+
+// waitLogLine 等到日志里出现含 sub 的那一行并原样返回。
+//
+// 必须等：插件的 stderr 由 exec 的内部协程搬进日志，Init 返回不代表那几行
+// 已经落进去了。只轮询、不睡眠固定时长，慢机器上也不会假红。
+func waitLogLine(t *testing.T, text func() string, sub string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		for _, line := range strings.Split(text(), "\n") {
+			if strings.Contains(line, sub) {
+				return line
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等不到含 %q 的日志行：\n%s", sub, text())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// syncBuffer 是并发安全的日志落点：插件 stderr 由 exec 的抄写协程写进来，
+// 用例这边同时在读——bytes.Buffer 在这种场景下会撞数据竞争。
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) text() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
