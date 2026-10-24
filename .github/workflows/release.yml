@@ -154,18 +154,28 @@ jobs:
           ' index.json
 
           # 只校验**本次新发**条目的 sha256：沿用条目指向旧 tag，本 release
-          # 里没有那个文件。new_count=0 时显式跳过，别让一个空 jq 输出
-          # 在 while 里"什么都没校验"地假通过。
+          # 里没有那个文件。先把清单落到文件再逐行校验：jq 失败会被 set -e
+          # 直接抓住，while 也不会因为管道子 shell 把计数丢掉。
           if [ "$new_count" -gt 0 ]; then
             jq -r --arg tag "$GITHUB_REF_NAME" '
               .plugins[] | .assets[]
               | select((.url | split("/") | .[-2]) == $tag)
               | "\(.url | split("/") | last) \(.sha256)"
-            ' index.json |
-              while IFS=' ' read -r asset sha; do
-                [ -n "$asset" ] || continue
-                echo "$sha  $asset" | sha256sum -c -
-              done
+            ' index.json > "$RUNNER_TEMP/new-assets.txt"
+            checked=0
+            # IFS 带 \r：这份清单在本地（Windows 的 jq）可能是 CRLF，
+            # 校验和字段末尾多一个 \r 会让 sha256sum 判成"格式不对"。
+            while IFS=$' \t\r' read -r asset sha; do
+              [ -n "$asset" ] || continue
+              echo "$sha  $asset" | sha256sum -c -
+              checked=$((checked + 1))
+            done < "$RUNNER_TEMP/new-assets.txt"
+            # 行数必须与 new_count 相等：一份被截断的清单不能让校验"少跑几条"
+            # 之后静默通过。
+            if [ "$checked" -ne "$new_count" ]; then
+              echo "新发条目 $new_count 个，实际校验了 $checked 个" >&2
+              exit 1
+            fi
           fi
 
       - name: 4b. 冒烟：产物报告的 version 是 tag 值、commit 是短哈希
