@@ -1,6 +1,8 @@
 package host
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"regexp"
 	"strings"
@@ -12,8 +14,14 @@ import (
 // `api_version` 是整体匹配，插件作者唯一能查到"这一版要跟着改什么"的地方
 // 就是 ARCHITECTURE §3.2 的那张表。常量涨了而表没涨，等于让所有插件在
 // "版本不匹配"的报错里自己猜原因。
+//
+// 架构文档自 2026-10-24 起不入库（见 .gitignore 的 /docs/），干净克隆里没有
+// 这份文件；此时跳过，而不是把"文档不在场"报成失败。
 func TestAPIVersionMatchesArchitectureTable(t *testing.T) {
 	data, err := os.ReadFile("../../docs/ARCHITECTURE.md")
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Skip("docs/ARCHITECTURE.md 不在场（架构文档不入库），跳过版本表一致性校验")
+	}
 	if err != nil {
 		t.Fatalf("读取 ARCHITECTURE.md: %v", err)
 	}

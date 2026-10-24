@@ -1,6 +1,6 @@
 # qqbot
 
-QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 落地。
+QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按架构文档 `docs/ARCHITECTURE.md` 落地（该文档与 `docs/adr/` 只在本地维护，不入库）。
 
 ## 已实现（可运行）
 
