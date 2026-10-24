@@ -165,6 +165,25 @@ func New(o Options) (*Core, error) {
 	}, nil
 }
 
+// 插件装配阶段的期限。Init 与 Start 都是一次请求-应答握手，插件不回帧时
+// 必须能判出来：没有期限的话 core.Start 会永久阻塞，进程活着、systemd 显示
+// active (running)、日志停在上一行，比"插件崩溃"难查得多（#51）。
+//
+// 为什么不从 pluginproc.replaceInitTimeout 取值：core 与 pluginproc 刻意
+// 不互相 import（core 只按方法名做类型断言认热替换能力）。为什么不提到
+// pkg/host：那份契约是给插件作者看的线协议，启动多久算超时是核心自己的
+// 策略，写进契约等于让插件被这个数绑住。两处取值同量级、同语义，各自
+// 带注释说明即可。
+const (
+	// pluginInitTimeout：Init 只做一次配置下发，正常亚秒级。5 秒是为了容忍
+	// 冷启动遇上杀软扫描（Windows 首次读一个新 exe），同时让"起不来"能在
+	// owner 等得起的时限内被判出来。
+	pluginInitTimeout = 5 * time.Second
+	// pluginStartTimeout：Start 可能触发预热（字体、渲染器、后台协程），
+	// 比握手慢一档，给 10 秒。
+	pluginStartTimeout = 10 * time.Second
+)
+
 // Start 依次完成：校验插件配置 → 绑定任务执行者 → 插件 Init（注册 Job）
 // → 启动调度 → 启动插件 → 生成认领令牌。
 func (c *Core) Start(ctx context.Context) error {
@@ -200,7 +219,15 @@ func (c *Core) Start(ctx context.Context) error {
 			Renderer: c.render,
 			Session:  c.session,
 		})
-		if err := p.Init(ctx, svc); err != nil {
+		ictx, cancel := context.WithTimeout(ctx, pluginInitTimeout)
+		err := p.Init(ictx, svc)
+		// 必须在 cancel 之前判：cancel 之后 ictx.Err() 一律是 Canceled。
+		timedOut := errors.Is(err, context.DeadlineExceeded)
+		cancel()
+		if err != nil {
+			if timedOut {
+				return fmt.Errorf("初始化插件 %s timeout（%v）: %w", m.Name, pluginInitTimeout, err)
+			}
 			return fmt.Errorf("初始化插件 %s: %w", m.Name, err)
 		}
 	}
@@ -211,7 +238,14 @@ func (c *Core) Start(ctx context.Context) error {
 
 	for _, p := range c.plugins {
 		if st, ok := p.(host.Starter); ok {
-			if err := st.Start(ctx); err != nil {
+			sctx, cancel := context.WithTimeout(ctx, pluginStartTimeout)
+			err := st.Start(sctx)
+			timedOut := errors.Is(err, context.DeadlineExceeded)
+			cancel()
+			if err != nil {
+				if timedOut {
+					return fmt.Errorf("启动插件 %s timeout（%v）: %w", p.Manifest().Name, pluginStartTimeout, err)
+				}
 				return fmt.Errorf("启动插件 %s: %w", p.Manifest().Name, err)
 			}
 		}
