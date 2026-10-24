@@ -413,10 +413,10 @@ func (c *Config) applyDefaults() {
 		c.Bot.ShardTotal = 1
 	}
 	if c.Store.Path == "" {
-		c.Store.Path = "./.temp/data/qqbot.db"
+		c.Store.Path = "./data/qqbot.db"
 	}
 	if c.Media.Dir == "" {
-		c.Media.Dir = "./.temp/media"
+		c.Media.Dir = "./data/media"
 	}
 	if c.Media.MaxFileBytes <= 0 {
 		c.Media.MaxFileBytes = 8 << 20
