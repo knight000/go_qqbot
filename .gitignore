@@ -44,6 +44,10 @@ qqbot.exe
 /internal/pluginbundle/dist/*/*
 !/internal/pluginbundle/dist/*/.gitkeep
 
+# 架构设计与 ADR 只在本地维护，不入库（2026-10-24 起连同历史一并剔除）。
+# 代码注释里的 `docs/xxx.md §x.y` 指的是这份本地文档，干净克隆里不存在。
+/docs/
+
 # 编辑器 / 本地工具状态
 .idea/
 .vscode/
