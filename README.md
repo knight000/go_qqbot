@@ -278,7 +278,7 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 普通日志与轨迹共用同一副行首，扫起来是连续的：
 
 ```
-[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping 权限=bot-admin
+[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping role=bot-admin
 [13:50:34] [WARN] 队列已满，丢弃事件 peer=g1
 [13:50:34] [ERROR] 插件处理失败 plugin=md err="i/o timeout"
 ```

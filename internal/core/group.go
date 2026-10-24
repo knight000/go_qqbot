@@ -83,12 +83,12 @@ func (c *Core) logGroupGateState(ctx context.Context) {
 	}
 	if s.Allowed == 0 {
 		c.log.Warn("群白名单已开启但没有允许的群，所有群消息都会被丢弃",
-			"已登记群", s.InUse(),
-			"处理", "私聊 /group allow <group_openid>，或由 Bot 管理员在群内发 /group allow")
+			"registered", s.InUse(),
+			"hint", "私聊 /group allow <group_openid>，或由 Bot 管理员在群内发 /group allow")
 		return
 	}
-	c.log.Info("群准入已启用", "白名单", s.Allowed, "已登记群", s.InUse(),
-		"已退出", s.Left, "黑名单开关", c.blacklistEnabled())
+	c.log.Info("群准入已启用", "allowed", s.Allowed, "registered", s.InUse(),
+		"left", s.Left, "blacklist", c.blacklistEnabled())
 }
 
 // groupControlExempt 判断这条被拦下的消息是否可以例外放行到核心指令。
