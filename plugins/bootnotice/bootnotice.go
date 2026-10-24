@@ -103,7 +103,7 @@ func (p *Plugin) run(ctx context.Context) {
 	if len(reachable) == 0 {
 		p.log.Info("没有可私聊的管理员，跳过启动通知",
 			"admins", len(targets),
-			"原因", "管理员列表为空，或授权里没有可用的 openid")
+			"reason", "管理员列表为空，或授权里没有可用的 openid")
 		return
 	}
 	// /reload 是管理员显式要求重启，此时必须发——否则"重启后确认更新是否生效"
