@@ -41,7 +41,7 @@ func (c *Core) ensureOwner(ctx context.Context) error {
 	c.log.Warn("未检测到管理员，已生成一次性认领令牌",
 		"ttl", claimTTL.String(),
 		"token", c.claimToken,
-		"用法", "在目标群或单聊发送 /claim <token>")
+		"hint", "在目标群或单聊发送 /claim <token>")
 	return nil
 }
 

@@ -56,7 +56,7 @@ func (c *Core) onBotJoinedGroup(ctx context.Context, ev *host.Event) {
 	// per-peer 任务的群实例必须在这里补：重启时 Register 只遍历了当时的在群，
 	// 之后新进来的群没有任何别的时机能被展开。
 	c.expandPeerJobs(ctx, groupID)
-	c.log.Info("机器人已加入群", "group", groupID, "操作人", ev.SenderID)
+	c.log.Info("机器人已加入群", "group", groupID, "operator", ev.SenderID)
 	c.trace.GroupLifecycle("加入群", groupID)
 
 	operator := ev.SenderID
@@ -138,7 +138,7 @@ func (c *Core) onBotLeftGroup(ctx context.Context, ev *host.Event) {
 		c.log.Info("已清理退群会话状态", "group", groupID,
 			"kv", counts.KVRows, "sessions", counts.Sessions)
 	}
-	c.log.Info("机器人已退出群", "group", groupID, "操作人", ev.SenderID)
+	c.log.Info("机器人已退出群", "group", groupID, "operator", ev.SenderID)
 	c.trace.GroupLifecycle("退出群", groupID)
 
 	operator := ev.SenderID
@@ -211,8 +211,8 @@ func (c *Core) notifyGroupEvent(ctx context.Context, text string) {
 	// 而真实原因可能只是收件人从没和机器人私聊过、或主动消息被关掉了。
 	if sent == 0 {
 		c.log.Warn("群生命周期通知未送达任何人",
-			"收件人", len(targets), "失败", failed, "模式", mode,
-			"提示", "检查 [active].enabled，以及收件人是否可用于单聊")
+			"recipients", len(targets), "failed", failed, "mode", mode,
+			"hint", "检查 [active].enabled，以及收件人是否可用于单聊")
 	}
 }
 
@@ -316,9 +316,9 @@ func (c *Core) runGroupNameRefresh(requester string, groups []store.Group) {
 	}
 
 	c.log.Info("群名称刷新完成",
-		"总数", st.Total, "更新", st.Updated, "未变化", st.Same,
-		"空名", st.Empty, "手工跳过", st.Manual, "失败", st.Failed,
-		"无权限", st.Forbidden, "提前结束", st.Aborted)
+		"total", st.Total, "updated", st.Updated, "unchanged", st.Same,
+		"empty", st.Empty, "manual", st.Manual, "failed", st.Failed,
+		"forbidden", st.Forbidden, "aborted", st.Aborted)
 	c.reportRefresh(requester, st)
 }
 

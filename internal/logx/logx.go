@@ -209,7 +209,7 @@ func formatValue(v slog.Value) string {
 
 // quote 只在必要时加引号，规则与 slog.TextHandler 一致：
 // 空串、含空白/等号/引号/控制字符、或不是合法 UTF-8 时才转义。
-// 这样 `权限=bot-admin`、`peer=g1` 保持可 grep，`err="i/o timeout"` 也不会歧义。
+// 这样 `role=bot-admin`、`peer=g1` 保持可 grep，`err="i/o timeout"` 也不会歧义。
 func quote(s string) string {
 	if !needsQuoting(s) {
 		return s

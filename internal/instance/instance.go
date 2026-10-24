@@ -300,7 +300,7 @@ func appLockPaths(appID string) (primary, full string) {
 // acquireFile 在 path 上取独占锁并在拿到后写入持有者信息。
 // scope 只用于冲突时把"哪一把锁挡住的"写进错误文案。
 func acquireFile(path string, scope Scope, opts Options) (*fileLock, error) {
-	// 转成绝对路径：错误消息里出现 "./.temp/data/qqbot.db.lock" 这种相对路径时，
+	// 转成绝对路径：错误消息里出现 "./data/qqbot.db.lock" 这种相对路径时，
 	// 用户还得先猜是相对于谁——报错文案的价值就在于能直接照着去查。
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs

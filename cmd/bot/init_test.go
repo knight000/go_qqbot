@@ -135,16 +135,26 @@ func TestInitInEmptyDirCreatesEverything(t *testing.T) {
 		t.Errorf("示例配置不该带凭据，实际 id=%q secret=%q", parsed.App.ID, parsed.App.Secret)
 	}
 
-	// 默认 [store].path = ./.temp/data/qqbot.db，相对子进程的工作目录。
-	datadir := filepath.Join(work, ".temp", "data")
+	// 默认 [store].path = ./data/qqbot.db，相对子进程的工作目录。
+	datadir := filepath.Join(work, "data")
 	if info, err := os.Stat(datadir); err != nil || !info.IsDir() {
 		t.Fatalf("数据目录 %s 未创建: %v", datadir, err)
+	}
+	// 数据目录不能落在 .temp 下：那是仓库内开发期的临时目录名，会被清理脚本
+	// 连数据库带插件一起删掉。
+	if _, err := os.Stat(filepath.Join(work, ".temp")); err == nil {
+		t.Error("默认数据目录不该再创建 .temp/")
 	}
 	binDir := filepath.Join(datadir, "plugins", "bin")
 	for _, name := range []string{"adminping", "bootnotice", "echo", "md"} {
 		if _, err := os.Stat(filepath.Join(binDir, pluginFile(name))); err != nil {
 			t.Errorf("插件 %s 未释放: %v", name, err)
 		}
+	}
+
+	// 输出里的数据目录就是用户唯一能看到的"东西落在哪"，不能是 .temp\data。
+	if !strings.Contains(stdout, "数据目录：data") {
+		t.Errorf("init 输出应报告数据目录 data，实际：\n%s", stdout)
 	}
 
 	// 下一步必须说清楚去哪儿填凭据，否则用户拿着空配置启动只会看到校验错误。
@@ -209,7 +219,7 @@ func TestInitPluginsRestoresOnlyDeleted(t *testing.T) {
 		t.Fatalf("init 失败: %s", stderr)
 	}
 
-	binDir := filepath.Join(work, ".temp", "data", "plugins", "bin")
+	binDir := filepath.Join(work, "data", "plugins", "bin")
 	cfgStamp := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
 	binStamp := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
 	if err := os.Chtimes(cfgPath, cfgStamp, cfgStamp); err != nil {

@@ -56,7 +56,7 @@ func (p *Plugin) Manifest() host.Manifest {
 
 func (p *Plugin) Init(ctx context.Context, h host.Host) error {
 	p.log = h.Log()
-	p.log.Info("adminping 插件已初始化", "权限", host.PermBotAdmin.String())
+	p.log.Info("adminping 插件已初始化", "role", host.PermBotAdmin.String())
 	return nil
 }
 
