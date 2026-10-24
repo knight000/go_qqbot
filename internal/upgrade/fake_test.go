@@ -36,11 +36,19 @@ type fakeRelease struct {
 	pluginIdx []string
 	// pluginBlobs 是镜像通道按**资产名**提供的插件产物。
 	pluginBlobs map[string][]byte
+	// latestNames 是「最新发布」资产列表里的插件产物名。addPluginAtTag 登记到
+	// 旧 tag 的产物故意不在这里：沿用条目必须按 URL 里的 tag 去查，而不是
+	// 拿最新发布的资产列表碰运气。
+	latestNames []string
+	// blobTags 记录每个产物登记在哪个 tag 上：镜像通道只在该 tag 的路径下
+	// 提供它，拿当前 tag 去拼地址会 404（正是 #52 要防的那个错）。
+	blobTags map[string]string
 
 	api   *httptest.Server
 	asset *httptest.Server
 
 	apiHits   atomic.Int64
+	tagHits   atomic.Int64
 	assetHits atomic.Int64
 	// authOnAsset 记录镜像通道上出现过的 Authorization 头（必须永远为空）。
 	authOnAsset atomic.Bool
@@ -58,6 +66,7 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 		coreName:       CoreAssetName(version, runtime.GOOS, runtime.GOARCH),
 		indexAssetName: "index.json",
 		pluginBlobs:    map[string][]byte{},
+		blobTags:       map[string]string{},
 	}
 	sum := sha256.Sum256(binary)
 	// index.json 与 tools/index 的输出同形。默认那条 echo 只是个占位条目
@@ -80,21 +89,22 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
-		assets := []map[string]any{
-			{"id": 1, "name": f.indexAssetName, "size": len(f.index)},
-			{"id": 2, "name": "checksums.txt", "size": len(f.sums)},
-			{"id": 3, "name": f.coreName, "size": len(f.binary)},
-		}
-		// 插件产物也要出现在资产列表里：有 token 时它们走 api 资产端点，
-		// 客户端只能按资产名去换 id。id 按资产名排序分配（与 pluginByID 一致）。
-		for i, name := range f.pluginAssetNames() {
-			assets = append(assets, map[string]any{
-				"id": int64(101 + i), "name": name, "size": len(f.pluginBlobs[name]),
-			})
-		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"tag_name": f.tag,
-			"assets":   assets,
+			"assets":   f.assetList(f.latestNames),
+		})
+	})
+	// 按 tag 取发布：沿用条目指向旧 tag 时，有 token 的客户端走这条路。
+	mux.HandleFunc("/repos/o/r/releases/tags/", func(w http.ResponseWriter, r *http.Request) {
+		f.apiHits.Add(1)
+		f.tagHits.Add(1)
+		if f.broken.Load() {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name": path.Base(r.URL.Path),
+			"assets":   f.assetList(f.pluginAssetNames()),
 		})
 	})
 	mux.HandleFunc("/repos/o/r/releases/assets/", func(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +139,12 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 			return
 		}
 		if blob, ok := f.pluginBlobs[path.Base(r.URL.Path)]; ok {
+			// 只在该产物登记的 tag 路径下提供：拿当前 tag 去拼旧资产会 404。
+			if tag := f.blobTags[path.Base(r.URL.Path)]; tag != "" &&
+				!strings.Contains(r.URL.Path, "/download/"+tag+"/") {
+				http.NotFound(w, r)
+				return
+			}
 			_, _ = w.Write(blob)
 			return
 		}
@@ -149,15 +165,46 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 // 返回资产名。索引会按插入顺序重建，所以报告的排序可以直接断言。
 func (f *fakeRelease) addPlugin(name, version string, blob []byte) string {
 	f.t.Helper()
+	return f.addPluginAtTag(name, version, f.tag, blob)
+}
+
+// addPluginAtTag 把插件产物登记到**指定 tag** 的地址上：沿用条目（#52）的
+// 现场——本次发布的 index.json 里，这个插件的 url 指向上一版 tag。
+func (f *fakeRelease) addPluginAtTag(name, version, tag string, blob []byte) string {
+	f.t.Helper()
 	asset := "qqbot-plugin-" + name + "-" + version + "-" + currentPlatform() + exeSuffix()
 	sha := sha256Hex(blob)
 	f.pluginIdx = append(f.pluginIdx, fmt.Sprintf(
 		`{"name": %q, "version": %q, "assets": {%q: {"url": %q, "sha256": %q}}}`,
 		name, version, currentPlatform(),
-		"https://github.com/o/r/releases/download/"+f.tag+"/"+asset, sha))
+		"https://github.com/o/r/releases/download/"+tag+"/"+asset, sha))
 	f.pluginBlobs[asset] = blob
+	f.blobTags[asset] = tag
+	if tag == f.tag {
+		f.latestNames = append(f.latestNames, asset)
+	}
 	f.rebuildIndex()
 	return asset
+}
+
+// assetList 拼一份发布资产列表。pluginNames 是要列出的插件产物名；
+// id 永远按全部插件产物的字典序分配，与 pluginByID 的反查口径一致。
+func (f *fakeRelease) assetList(pluginNames []string) []map[string]any {
+	assets := []map[string]any{
+		{"id": 1, "name": f.indexAssetName, "size": len(f.index)},
+		{"id": 2, "name": "checksums.txt", "size": len(f.sums)},
+		{"id": 3, "name": f.coreName, "size": len(f.binary)},
+	}
+	idOf := map[string]int64{}
+	for i, name := range f.pluginAssetNames() {
+		idOf[name] = int64(101 + i)
+	}
+	for _, name := range pluginNames {
+		assets = append(assets, map[string]any{
+			"id": idOf[name], "name": name, "size": len(f.pluginBlobs[name]),
+		})
+	}
+	return assets
 }
 
 // rewritePlugin 覆盖某个已加插件的索引版本（造"索引与产物自称不一致"的现场），

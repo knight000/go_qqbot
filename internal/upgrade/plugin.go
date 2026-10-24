@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -242,7 +243,7 @@ func (u *Upgrader) stagePlugin(ctx context.Context, rel *Release, name, bin, ver
 	if strings.TrimSpace(asset.SHA256) == "" {
 		return stagedPlugin{}, fmt.Errorf("索引里没有 %s 的 sha256，拒绝下载", name)
 	}
-	url, err := u.c.assetURL(rel, asset.URL)
+	url, err := u.c.assetURL(ctx, rel, asset.URL)
 	if err != nil {
 		return stagedPlugin{}, err
 	}
@@ -349,23 +350,56 @@ func (b *tailBuffer) tail() string {
 
 // assetURL 把索引里给的产物地址换成"本次该走的那条通道"（决策 3/12）。
 //
-//   - 有 token：按资产名在发布资产列表里找 id，走 api_base 的资产端点——
-//     私有仓的产物在镜像上根本取不到，而且 token 绝不能发给镜像主机；
+//   - 有 token：按**URL 里自带的 tag** 取该 tag 的发布，再按资产名回查 id，
+//     走 api_base 的资产端点——私有仓的产物在镜像上根本取不到，而且 token
+//     绝不能发给镜像主机；
 //   - 没有 token：按 tag + 资产名拼 asset_base 的直链（可能是镜像）。
 //
-// 索引里的地址是生成时写死的 github.com 直链，不能直接拿去下载：那样
-// asset_base 形同虚设。
-func (c *client) assetURL(rel *Release, raw string) (string, error) {
-	name := path.Base(strings.TrimSpace(raw))
+// tag 必须从 URL 里取而不是用当前发布的 tag：没更新的插件会沿用上一条目，
+// 它的地址指向上一版 tag（#52）。用当前 tag 重新拼会 404。
+func (c *client) assetURL(ctx context.Context, rel *Release, raw string) (string, error) {
+	tag, name := splitAssetURL(raw)
 	if name == "" || name == "." || name == "/" {
 		return "", fmt.Errorf("索引里的产物地址不对: %q", raw)
 	}
-	if c.token != "" {
-		id, _, ok := rel.gh.asset(name)
-		if !ok {
-			return "", fmt.Errorf("发布 %s 的资产列表里没有 %s：请确认 CI 上传了它", rel.Tag, name)
-		}
-		return c.apiAssetURL(id), nil
+	if tag == "" {
+		tag = rel.Tag
 	}
-	return c.mirrorURL(rel.Tag, name), nil
+	if c.token == "" {
+		return c.mirrorURL(tag, name), nil
+	}
+	gh := rel.gh
+	if tag != rel.Tag {
+		var err error
+		if gh, err = c.releaseByTag(ctx, tag); err != nil {
+			return "", err
+		}
+	}
+	if gh == nil {
+		return "", fmt.Errorf("没有发布 %s 的资产列表", tag)
+	}
+	id, _, ok := gh.asset(name)
+	if !ok {
+		return "", fmt.Errorf("发布 %s 的资产列表里没有 %s：请确认 CI 上传了它", tag, name)
+	}
+	return c.apiAssetURL(id), nil
+}
+
+// splitAssetURL 从索引里的直链取 (tag, 资产名)。
+//
+// 只认 tools/index 生成的那种形状：.../releases/download/<tag>/<asset>。
+// 不是这个形状时返回空 tag，由调用方退回当前发布的 tag（与旧行为一致）。
+func splitAssetURL(raw string) (tag, name string) {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Path == "" {
+		return "", path.Base(raw)
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := 0; i+3 < len(segs); i++ {
+		if segs[i] == "releases" && segs[i+1] == "download" {
+			return segs[i+2], segs[i+3]
+		}
+	}
+	return "", path.Base(u.Path)
 }

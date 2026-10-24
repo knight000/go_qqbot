@@ -31,12 +31,14 @@ import (
 	"github.com/knight000/go_qqbot/plugins/md"
 )
 
-const usageText = `用法：go run ./tools/index -tag v1.2.3 [-repo owner/repo] [-dist 目录] [-staging 目录] [-out 路径]
+const usageText = `用法：go run ./tools/index -tag v1.2.3 [-previous 上一版/index.json] [-repo owner/repo] [-dist 目录] [-staging 目录] [-out 路径]
 
 把已产出的插件二进制整理成发布资产名、算出 sha256，并写出 plugins/index.json。
 
 选项：
   -tag TAG         发布 tag（必填，含前导 v；core.version 用它去掉 v 的值）
+  -previous 路径   上一版 index.json：版本号相同的插件沿用其条目（URL/sha256
+                   仍指向旧 tag），且不拷进 staging——没更新就不上传
   -repo owner/repo 下载 URL 指向的仓库，默认 ` + defaultRepo + `
   -dist 目录       插件产物根目录，默认 internal/pluginbundle/dist
                    （即 go run ./tools/build plugins 的默认输出位置）
@@ -45,6 +47,7 @@ const usageText = `用法：go run ./tools/index -tag v1.2.3 [-repo owner/repo] 
 
 例：
   go run ./tools/index -tag v0.0.0-p3-smoke
+  go run ./tools/index -tag v0.5.0 -previous /tmp/prev/index.json
 `
 
 const (
@@ -132,11 +135,12 @@ func bundledPlugins() ([]bundled, error) {
 
 // options 是一次生成的全部输入。抽成结构体是为了让路径与命名可测。
 type options struct {
-	tag     string
-	repo    string
-	dist    string
-	staging string
-	out     string
+	tag      string
+	repo     string
+	dist     string
+	staging  string
+	out      string
+	previous string
 }
 
 func (o options) indexPath() string {
@@ -176,6 +180,7 @@ func parseArgs(args []string) (options, error) {
 	dist := fs.String("dist", defaultDist, "插件产物根目录")
 	staging := fs.String("staging", defaultStaging, "待上传资产目录")
 	out := fs.String("out", "", "index.json 路径，默认 <staging>/index.json")
+	previous := fs.String("previous", "", "上一版 index.json（版本相同的插件沿用它）")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
@@ -185,10 +190,15 @@ func parseArgs(args []string) (options, error) {
 	if strings.TrimSpace(*tag) == "" {
 		return options{}, errors.New("缺少 -tag：下载 URL 与 core.version 都要用它（-h 看用法）")
 	}
-	return options{tag: *tag, repo: *repo, dist: *dist, staging: *staging, out: *out}, nil
+	return options{
+		tag: *tag, repo: *repo, dist: *dist, staging: *staging, out: *out,
+		previous: strings.TrimSpace(*previous),
+	}, nil
 }
 
-// generate 写出 index.json，并把每个插件产物按发布资产名拷进 staging。
+// generate 写出 index.json，并把**本次有更新的**插件产物按发布资产名拷进
+// staging。版本号与上一版相同的插件原样沿用上一条目，不拷文件——staging
+// 里有什么就上传什么，没更新就不会被带走（#52）。
 //
 // 拷贝而不是原地改名：internal/pluginbundle/dist/ 是 go:embed 的输入，
 // 改它的文件名会让下一次 `go build` 找不到文件。
@@ -197,8 +207,20 @@ func generate(o options) error {
 	if err != nil {
 		return err
 	}
+	var prev *index
+	if o.previous != "" {
+		prev, err = readPrevious(o.previous)
+		if err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(o.staging, 0o755); err != nil {
 		return fmt.Errorf("创建资产目录 %s: %w", o.staging, err)
+	}
+	// staging 每次重新产出：先清掉上一次留下的插件资产，否则沿用条目会把
+	// 一份过期的同名文件顺带上传（CI 是干净工作区，本地反复跑不是）。
+	if err := cleanStaging(o.staging); err != nil {
+		return err
 	}
 
 	idx := index{
@@ -208,7 +230,21 @@ func generate(o options) error {
 		Core: coreEntry{Version: strings.TrimPrefix(o.tag, "v")},
 	}
 
+	carried := 0
 	for _, p := range plugins {
+		if prev != nil {
+			if e, ok := prev.plugin(p.name); ok && e.Version == p.version {
+				// 沿用：条目原样搬过来（url/sha256 都指向旧 tag），不拷文件。
+				// 只在真正要沿用时才要求资产完整——版本变了的插件反正要重发。
+				if missing := missingAsset(e); missing != "" {
+					return fmt.Errorf("上一版 index.json 里 %s 缺少 %s 的完整资产，无法沿用", p.name, missing)
+				}
+				idx.Plugins = append(idx.Plugins, e)
+				carried++
+				continue
+			}
+		}
+
 		entry := pluginEntry{
 			Name:    p.name,
 			Version: p.version,
@@ -245,7 +281,77 @@ func generate(o options) error {
 	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
 		return fmt.Errorf("写 %s: %w", path, err)
 	}
-	fmt.Printf("index: %d 个插件 × %d 个平台 -> %s\n", len(idx.Plugins), len(releasePlatforms), path)
+	fmt.Printf("index: %d 个插件 × %d 个平台 -> %s（新发 %d，沿用 %d）\n",
+		len(idx.Plugins), len(releasePlatforms), path, len(idx.Plugins)-carried, carried)
+	return nil
+}
+
+// readPrevious 读上一版 index.json。
+//
+// 读不动或 schema 不认识时直接报错：拿半份清单去"沿用"会让某些插件永远
+// 发不出去，比流水线红掉更难查。条目资产是否完整留到"真的要沿用"时再查
+// （版本变了的插件反正要重发，不该被上一版的残缺挡住）。
+func readPrevious(path string) (*index, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取上一版 index.json %s: %w", path, err)
+	}
+	var idx index
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return nil, fmt.Errorf("解析上一版 index.json %s: %w", path, err)
+	}
+	if idx.Schema != schemaVersion {
+		return nil, fmt.Errorf("上一版 index.json 的 schema=%d，本工具只认 %d", idx.Schema, schemaVersion)
+	}
+	for _, p := range idx.Plugins {
+		if p.Name == "" || p.Version == "" {
+			return nil, fmt.Errorf("上一版 index.json 里有插件条目缺少 name/version: %+v", p)
+		}
+	}
+	return &idx, nil
+}
+
+// missingAsset 返回沿用条目缺的第一个平台，完整时返回空串。
+func missingAsset(e pluginEntry) string {
+	for _, tgt := range releasePlatforms {
+		a, ok := e.Assets[tgt.String()]
+		if !ok || a.URL == "" || a.SHA256 == "" {
+			return tgt.String()
+		}
+	}
+	return ""
+}
+
+// plugin 按名字取一条插件条目。
+func (i *index) plugin(name string) (pluginEntry, bool) {
+	for _, p := range i.Plugins {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return pluginEntry{}, false
+}
+
+// cleanStaging 删掉 staging 里的插件资产（只删 qqbot-plugin-* 前缀的文件）。
+//
+// 不碰 index.json 与用户放在这里的其它东西：这个目录可能被 -staging 指到
+// 一个共用目录，删除范围必须有明确边界。
+func cleanStaging(staging string) error {
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("读取资产目录 %s: %w", staging, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), assetPrefix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(staging, e.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("清理上一次的资产 %s: %w", e.Name(), err)
+		}
+	}
 	return nil
 }
 

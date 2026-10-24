@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -59,6 +60,11 @@ type client struct {
 	repo      string
 	meta      *http.Client
 	body      *http.Client
+
+	// tags 缓存按 tag 取过的发布：一次 /upgrade plugin all 里多个插件可能
+	// 指向同一个旧 tag，只查一次（#52）。
+	mu   sync.Mutex
+	tags map[string]*ghRelease
 }
 
 func newClient(apiBase, assetBase, token, repo string) *client {
@@ -78,6 +84,7 @@ func newClient(apiBase, assetBase, token, repo string) *client {
 		repo:      strings.Trim(repo, "/"),
 		meta:      &http.Client{Timeout: metaTimeout},
 		body:      &http.Client{Timeout: bodyTimeout},
+		tags:      map[string]*ghRelease{},
 	}
 }
 
@@ -268,4 +275,37 @@ func hintFor(code int) string {
 	default:
 		return ""
 	}
+}
+
+// releaseByTag 取某个 tag 的发布（按 tag 缓存）。
+//
+// 只给"索引条目指向旧 tag"这一条路用（#52）：插件没更新时沿用上一条目，
+// 有 token 的客户端要按旧 tag 的资产列表回查 id。缓存是必须的——一次
+// /upgrade plugin all 里可能有一半插件都指向同一个旧 tag。
+func (c *client) releaseByTag(ctx context.Context, tag string) (*ghRelease, error) {
+	c.mu.Lock()
+	if rel, ok := c.tags[tag]; ok {
+		c.mu.Unlock()
+		return rel, nil
+	}
+	c.mu.Unlock()
+
+	u := c.apiBase + "/repos/" + c.repo + "/releases/tags/" + url.PathEscape(tag)
+	body, err := c.get(ctx, c.meta, u, "application/vnd.github+json")
+	if err != nil {
+		return nil, fmt.Errorf("取发布 %s: %w", tag, err)
+	}
+	defer body.Close()
+
+	var rel ghRelease
+	if err := json.NewDecoder(io.LimitReader(body, 4<<20)).Decode(&rel); err != nil {
+		return nil, fmt.Errorf("解析发布 %s: %w", tag, err)
+	}
+	if rel.TagName == "" {
+		rel.TagName = tag
+	}
+	c.mu.Lock()
+	c.tags[tag] = &rel
+	c.mu.Unlock()
+	return &rel, nil
 }
