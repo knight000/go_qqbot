@@ -96,6 +96,27 @@ secret = "s"
 	}
 }
 
+// 默认数据目录不能叫 .temp：同一个默认值既是开发期的，也是 init 交给发布件
+// 用户的唯一建议值。名字里带 temp 的目录会被 git clean、清理脚本、rsync
+// --exclude 顺手带走——里面装着数据库、WAL、媒体和全部插件二进制。
+func TestDefaultDataDirIsNotTemp(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+id = "123"
+secret = "s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Store.Path != "./data/qqbot.db" {
+		t.Errorf("[store].path 默认值 = %q，期望 ./data/qqbot.db", cfg.Store.Path)
+	}
+	if cfg.Media.Dir != "./data/media" {
+		t.Errorf("[media].dir 默认值 = %q，期望 ./data/media", cfg.Media.Dir)
+	}
+}
+
 func TestActiveCanBeDisabledExplicitly(t *testing.T) {
 	path := writeConfig(t, `
 [app]
