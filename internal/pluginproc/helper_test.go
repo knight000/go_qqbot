@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -74,6 +75,8 @@ const (
 	modeStubborn = "stubborn"
 	// modePlain 只实现 host.Plugin 的三个必选接口，不实现任何可选接口。
 	modePlain = "plain"
+	// modeWarn 在 Init 里打一条 WARN：验核心按插件的**真实等级**重放（#48）。
+	modeWarn = "warn"
 )
 
 func TestMain(m *testing.M) {
@@ -96,7 +99,7 @@ func helperMode() string {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
 	switch base {
 	case modeEcho, modeSlow, modeCrashy, modeBadAPI, modeReserved, modeHangManifest, modeGarbage,
-		modeAlias, modeBadInit, modeStubborn, modePlain:
+		modeAlias, modeBadInit, modeStubborn, modePlain, modeWarn:
 		return base
 	}
 	return ""
@@ -277,6 +280,14 @@ func (p *helperPlugin) Init(_ context.Context, h host.Host) error {
 	// 逐行转发要验的是"每行都在、都带 plugin 前缀"，所以这里刻意打两行。
 	fmt.Fprintln(os.Stderr, "init: 第一行")
 	fmt.Fprintln(os.Stderr, "init: 第二行")
+	if p.mode == modeWarn {
+		// 插件侧日志的形状（#48）：WARN 与 INFO 各一条，外加一条老格式文本行。
+		// 前两条验"按真实等级重放"与"level=warn 时 Info 被过滤"，第三条验
+		// "不合约定的行照样当 Info 打出来、不影响启动"。
+		slog.Warn("磁盘快满了", "pct", 91)
+		slog.Info("插件已就绪")
+		fmt.Fprintln(os.Stderr, "2026/10/24 22:00:00 INFO legacy 行")
+	}
 	appendMarker("init=" + p.mode + " v" + p.ver + " greeting=" + p.cfg + " name=" + h.Plugin())
 	return nil
 }
