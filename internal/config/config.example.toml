@@ -30,7 +30,7 @@ resume = true
 
 [store]
 # 数据库与 WAL 必须在本地盘，禁止 tmpfs / 网络盘
-path = "./.temp/data/qqbot.db"
+path = "./data/qqbot.db"
 
 [retention]
 messages = "168h"   # 7 天
@@ -42,7 +42,7 @@ job_runs = "168h"
 # enabled = true 当前不产生任何效果——发图片走的是出站富媒体上传，
 # 与这一段配置无关（见 README「发图片」）。
 enabled = false
-dir = "./.temp/media"
+dir = "./data/media"
 max_file_bytes = 8388608
 quota_bytes = 268435456
 
