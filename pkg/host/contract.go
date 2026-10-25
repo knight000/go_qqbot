@@ -94,8 +94,10 @@ var contractChanges = []Change{
 	// 线协议。全局变更，没有使用面能让它变得安全。
 	{Version: 12, Class: Breaking, Surface: "*"},
 
-	// v13：Manifest 新增 Upstream，零值仍是「以核心仓 index.json 为准」。
-	{Version: 13, Class: Additive, Surface: "Manifest.Upstream"},
+	// v13：Manifest 新增两项——Upstream（零值仍是「以核心仓 index.json 为准」）
+	// 与 Uses（插件自报的使用面，#56）。两项都是纯增量：按 12 编译的插件根本没有
+	// 这两个字段，判定整条跳过。记进来的作用只是让表覆盖本版的全部契约变更。
+	{Version: 13, Class: Additive, Surface: "Manifest.Upstream,Manifest.Uses"},
 }
 
 // CheckCompat 判断一个按 builtAgainst 编译、声明了 uses 使用面的插件能否被

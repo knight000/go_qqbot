@@ -755,7 +755,8 @@ go run ./tools/build all -target linux/amd64 -o bin/qqbot
 
 - 插件编译版本必须 ≤ 核心版本（向前兼容不做）；
 - 区间内 **additive** 的变更整条跳过——v4 / v5 / v6 / v9 / v11 / v13 都是这一类，核心涨版本不逼任何人重编译；
-- **behavioral**（签名不变、语义变了：v7 / v8 / v10）与 **breaking**（v12 的 `*`）的成员只要出现在 `Manifest.Uses` 里就拒载。
+- **behavioral**（签名不变、语义变了：v7 / v8 / v10）的成员只要出现在 `Manifest.Uses` 里就拒载；
+- **breaking** 里 `Surface` 为 `*` 的条目（v12 的包外置 + 线协议）**与使用面无关，一律拒载**——按 12 之前编译的插件过不了这一关，声明使用面也救不了。
 
 所以只有「你用到的那一小块被改了」才需要动插件，版本号本身不是待办事项。
 
@@ -788,6 +789,8 @@ go run github.com/knight000/go_qqbot/tools/apisurface@<pin>
 ```text
 [ERROR] 插件清单校验失败，已跳过 plugin=torn file=/var/lib/qqbot/plugins/bin/torn err="插件 torn: 插件按 api 9 编译且用到 Params.Str，而该成员在 v10 有行为（签名不变、语义改变）变更"
 ```
+
+「已跳过」是装配期对**所有**清单校验失败的统一措辞（保留前缀、正则编译失败、权限位非法、拒载都走这一条），拒载只是其中一类；判定用词仍以 `GLOSSARY.md` 为准——拒载 ≠ 加载失败，后者指进程起不来。
 
 照这句话改即可：要么改掉对那个成员的用法（然后重新生成使用面），要么换一个按核心版本编译的产物。探测/校验失败的插件只记 Error、**不让启动失败**——一个过期产物不该让机器人整体下线（ADR-0005 决策 6）。
 
