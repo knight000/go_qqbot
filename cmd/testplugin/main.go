@@ -69,7 +69,11 @@ func (f *fixture) Manifest() host.Manifest {
 		Name:       "testplugin",
 		Version:    "0.0.0",
 		APIVersion: host.APIVersion,
-		Intents:    []string{"message", "notice"},
+		// 使用面由 tools/apisurface 生成（#56），这里是手写的等价值：产物要
+		// 证明它确实穿过 `--manifest` 的线协议（见 pkg/rpcsdk 的探测用例）。
+		// 只列真实引用到的成员——/echo 读 Event.Args。
+		Uses:    []string{"Event.Args"},
+		Intents: []string{"message", "notice"},
 		Commands: []host.Command{
 			{Prefix: "/echo", Description: "回显参数"},
 			{Prefix: "/nil"},

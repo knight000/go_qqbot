@@ -65,9 +65,11 @@ func NewRouter(plugins []host.Plugin) (*Router, error) {
 		if m.Name == "" {
 			return nil, fmt.Errorf("插件 Manifest.Name 为空")
 		}
-		if m.APIVersion != host.APIVersion {
-			return nil, fmt.Errorf("插件 %s 的 api_version=%q，与本核心 %q 不匹配",
-				m.Name, m.APIVersion, host.APIVersion)
+		// 加载判定看的是「插件实际用到的契约成员有没有变」，不是版本号相等
+		// （ADR-0007）。没有声明使用面的插件仍按整体相等拒载，与引入判定
+		// 之前一字不差；错误串点名具体成员，现场可以直接照日志改。
+		if err := host.CheckCompat(m.APIVersion, m.Uses); err != nil {
+			return nil, fmt.Errorf("插件 %s: %w", m.Name, err)
 		}
 
 		intents, err := parseIntents(m.Name, m.Intents)

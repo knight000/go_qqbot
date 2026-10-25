@@ -26,6 +26,7 @@ type manifestDTO struct {
 	Name           string
 	Version        string
 	APIVersion     string
+	Uses           []string
 	Capabilities   []string
 	Intents        []string
 	Commands       []commandDTO
@@ -51,6 +52,7 @@ func toManifestDTO(m host.Manifest) manifestDTO {
 		Name:           m.Name,
 		Version:        m.Version,
 		APIVersion:     m.APIVersion,
+		Uses:           m.Uses,
 		Capabilities:   m.Capabilities,
 		Intents:        m.Intents,
 		Yield:          m.Yield,
@@ -81,6 +83,7 @@ func (d manifestDTO) toHost() host.Manifest {
 		Name:           d.Name,
 		Version:        d.Version,
 		APIVersion:     d.APIVersion,
+		Uses:           d.Uses,
 		Capabilities:   d.Capabilities,
 		Intents:        d.Intents,
 		Yield:          d.Yield,

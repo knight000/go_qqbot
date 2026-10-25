@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -16,6 +17,7 @@ const wireManifest = `{
     "Name": "echo",
     "Version": "1.2.3",
     "APIVersion": "12",
+    "Uses": ["Event.Args", "Params.Duration"],
     "Capabilities": ["demo"],
     "Intents": ["message", "group.notice"],
     "Commands": [
@@ -48,6 +50,9 @@ func TestDecodeManifestWireFormat(t *testing.T) {
 		{"Name", m.Name, "echo"},
 		{"Version", m.Version, "1.2.3"},
 		{"APIVersion", m.APIVersion, "12"},
+		// 使用面必须能穿过线协议：核心的兼容判定读的就是这一份，字段名漂了
+		// 就退化成"所有插件都没声明使用面"，判定悄悄回到整体相等。
+		{"Uses", strings.Join(m.Uses, ","), "Event.Args,Params.Duration"},
 		{"Yield", m.Yield, true},
 		{"Permission", int(m.Permission), 2},
 		{"DenyReply", m.DenyReply, "默认拒绝"},

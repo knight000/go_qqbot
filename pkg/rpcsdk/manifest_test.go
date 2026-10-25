@@ -41,6 +41,12 @@ func TestManifestFlagPrintsManifestAndExitsZero(t *testing.T) {
 	if len(m.Commands) == 0 {
 		t.Fatal("命令表为空：探测拿到的清单必须是插件自我申报的完整那一份")
 	}
+	// 使用面必须真的从产物里念出来：核心的兼容判定读的就是这一份，而它
+	// 只在「探测 → 线协议 → 判定」这条路上走一次，中间任何一段丢字段都会
+	// 让所有插件悄悄退化成"没声明使用面"（= 整体相等），且没有任何报错。
+	if len(m.Uses) != 1 || m.Uses[0] != "Event.Args" {
+		t.Fatalf("Uses = %v，期望 [Event.Args]（使用面必须穿过 --manifest）", m.Uses)
+	}
 	// 三个可选接口都要报出来：核心据此决定发不发 start / close / run_job。
 	if len(optional) != 3 {
 		t.Fatalf("Optional = %v，期望三个可选方法全在", optional)
