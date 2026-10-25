@@ -248,7 +248,7 @@ sudo systemctl start qqbot
 journalctl -u qqbot -n 30 --no-pager | grep '启动完成'
 ```
 
-第 4 步的语义是「只补缺失」：`plugins/bin/` 里已有的文件一律不动，所以你单独升过的插件不会被降级；反过来说，**删掉一个插件就是卸载它**，启动期不会自愈。
+第 4 步的语义是「只补缺失」：`plugins/bin/` 里已有的文件一律不动，所以你单独升过的插件不会被降级。删除的后果分两类：**出厂插件**（四个示例）有内嵌副本，启动期会把缺失的文件补回来，所以删掉它们不等于卸载——要停用请写进 `[plugins].disabled`（#52）；**第三方插件**没有副本可补，删掉文件就是卸载，启动期不会自愈。
 
 干净克隆自编的二进制没有出厂插件可释放：`internal/pluginbundle/dist/<os>_<arch>/` 里只有 `.gitkeep`（`go:embed` 不能出包目录），此时 `init --plugins` 会明确报错：
 
@@ -547,6 +547,8 @@ go run ./tools/build all -target linux/amd64 -o dist/qqbot-linux-amd64
 | `qqbot-plugin-<name>-<ver>-<os>-<arch>` | **只在该插件版本号变了时上传**；没变就沿用上一版资产，index.json 里的 url 仍指向旧 tag |
 
 插件版本号没变 = 没更新。所以**改了插件代码必须涨 `Manifest().Version`**；契约版本（`host.APIVersion`）变化时由启动期对齐兜底，不依赖版本号。核心每次发布都带着一份内嵌插件副本，覆盖升级核心后启动时会把插件对齐到内嵌版本（只升不降；磁盘版本更高时保留并记一条 info）。
+
+已知限制（#52）：插件没更新时 `index.json` 沿用上一版的条目，`url` 指向**旧 tag**。v0.0.1 的客户端只在「磁盘插件落后、且该插件恰好被沿用」这一种组合下会 404，现场表现是升级失败——**重跑一次核心升级即自愈**，不为它做兼容代码。
 
 服务器上不需要 `scp` + `systemctl restart` 了：tag 发出去之后在 QQ 里敲 `/upgrade` 看一眼、`/upgrade apply` 应用即可。要手工换文件（离线 / 救火）见上面的「离线恢复」。
 
