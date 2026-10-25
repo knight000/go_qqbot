@@ -783,7 +783,7 @@ go run github.com/knight000/go_qqbot/tools/apisurface@<pin>
 
 ### 被拒载的日志长什么样
 
-拒载发生在装配期（`internal/pluginproc/load.go`），那个文件不会装进去，日志里留一条 `Error`，`err` 由 `host.CheckCompat` 产出、点名具体成员：
+拒载发生在装配期（`internal/pluginproc/load.go`）：文件留在原地，插件不进路由，日志里留一条 `Error`，`err` 由 `host.CheckCompat` 产出、点名具体成员：
 
 ```text
 [ERROR] 插件清单校验失败，已跳过 plugin=torn file=/var/lib/qqbot/plugins/bin/torn err="插件 torn: 插件按 api 9 编译且用到 Params.Str，而该成员在 v10 有行为（签名不变、语义改变）变更"
