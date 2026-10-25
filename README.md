@@ -782,6 +782,7 @@ plugins/adminping/ 管理员 /ping
 plugins/bootnotice/ 启动/重启主动私聊通知
 plugins/<repo>/   第三方插件：独立 module，放好产物即可，不进核心构建
 tools/build/      构建入口（插件 → 核心的固定顺序）
+tools/apisurface/ 生成第三方插件的使用面（uses_gen.go），兼容判定读它
 deploy/           systemd 单元
 ```
 

@@ -95,13 +95,17 @@ func wantsManifest(args []string) bool {
 // writeManifest 打出一行 JSON。编码用 rpc.EncodeManifest——与 plugin.manifest
 // 的应答是同一个函数，字段名不可能漂移（#39 踩过一次）。
 //
+// 清单取 rpc.PluginManifest 而不是 p.Manifest()：使用面由 tools/apisurface
+// 生成在插件类型上（APISurface），要在这里并进 Uses 才能穿过 --manifest
+// ——核心的兼容判定读的就是这一份（#56）。
+//
 // 名字为空的插件在这里就失败：一个没有名字的清单装进去只会得到一条
 // "谁都不认识"的路由项，早失败比晚失败便宜。
 func writeManifest(p host.Plugin, w io.Writer) error {
 	if p == nil {
 		return errors.New("rpcsdk: 插件不能为 nil")
 	}
-	m := p.Manifest()
+	m := rpc.PluginManifest(p)
 	if m.Name == "" {
 		return errors.New("rpcsdk: 插件 Manifest.Name 不能为空")
 	}

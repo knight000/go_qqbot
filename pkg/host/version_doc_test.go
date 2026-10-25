@@ -11,9 +11,9 @@ import (
 
 // TestAPIVersionMatchesArchitectureTable 防止"改了常量、忘了加版本行"。
 //
-// `api_version` 是整体匹配，插件作者唯一能查到"这一版要跟着改什么"的地方
-// 就是 ARCHITECTURE §3.2 的那张表。常量涨了而表没涨，等于让所有插件在
-// "版本不匹配"的报错里自己猜原因。
+// 涨一次 `api_version` 就是一次契约变更，插件作者唯一能查到"这一版要跟着改
+// 什么"的地方就是 ARCHITECTURE §3.2 的那张表。常量涨了而表没涨，等于让插件
+// 在"兼容判定失败"的报错里自己猜原因。
 //
 // 架构文档自 2026-10-24 起不入库（见 .gitignore 的 /docs/），干净克隆里没有
 // 这份文件；此时跳过，而不是把"文档不在场"报成失败。
@@ -30,9 +30,11 @@ func TestAPIVersionMatchesArchitectureTable(t *testing.T) {
 	if start == nil {
 		t.Fatal("ARCHITECTURE.md 里找不到「契约版本历史」小节标题")
 	}
-	// 只看到下一个小标题为止：后面还有别的表，`| 100 |` 这类行会干扰。
+	// 只看到下一个 **三级** 标题为止：后面还有别的表，`| 100 |` 这类行会干扰。
+	// 必须带那个空格（"\n### "）——`####` / `#####` 是本节内的子标题，
+	// 用 "\n###" 匹配会把它们当成小节结束，表被截掉后报「没有任何版本行」。
 	rest := body[start[1]:]
-	if end := strings.Index(rest, "\n###"); end >= 0 {
+	if end := strings.Index(rest, "\n### "); end >= 0 {
 		rest = rest[:end]
 	}
 	rows := regexp.MustCompile(`(?m)^\| (\d+) \|`).FindAllStringSubmatch(rest, -1)

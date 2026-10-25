@@ -69,9 +69,9 @@ func (f *fixture) Manifest() host.Manifest {
 		Name:       "testplugin",
 		Version:    "0.0.0",
 		APIVersion: host.APIVersion,
-		// 使用面由 tools/apisurface 生成（#56），这里是手写的等价值：产物要
-		// 证明它确实穿过 `--manifest` 的线协议（见 pkg/rpcsdk 的探测用例）。
-		// 只列真实引用到的成员——/echo 读 Event.Args。
+		// Uses 是**手写追加**的那一条路（反射调用扫不到时才写这里），
+		// 与下面的 APISurface（生成器产物的等价物）在清单出口取并集。
+		// 故意与生成项重叠一条，让 pkg/rpcsdk 的探测用例能验证去重。
 		Uses:    []string{"Event.Args"},
 		Intents: []string{"message", "notice"},
 		Commands: []host.Command{
@@ -98,6 +98,15 @@ func (f *fixture) Manifest() host.Manifest {
 		Permission:   host.PermGroupMember,
 		Yield:        true,
 	}
+}
+
+// APISurface 是 tools/apisurface 产物的等价物（#56）：真插件由生成器写这个
+// 方法，这里手写一份，为的是让「使用面 → 清单出口 → --manifest」这条路在
+// 端到端用例里真的被走一遍——生成器自己的用例证明不了线协议这一段。
+//
+// 与 Manifest.Uses 故意重叠一条（Event.Args），去重由 pkg/rpc 保证。
+func (f *fixture) APISurface() []string {
+	return []string{"Event.Args", "JobSpec.Timeout"}
 }
 
 func (f *fixture) Init(_ context.Context, h host.Host) error {

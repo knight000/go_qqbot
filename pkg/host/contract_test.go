@@ -247,7 +247,8 @@ func contractMembers(t *testing.T) map[string]bool {
 				case *ast.TypeSpec:
 					collectTypeMembers(decl, out)
 				case *ast.FuncDecl:
-					if recv := receiverName(decl.Recv); recv != "" {						out[recv+"."+decl.Name.Name] = true
+					if recv := receiverName(decl.Recv); recv != "" {
+						out[recv+"."+decl.Name.Name] = true
 					} else {
 						out[decl.Name.Name] = true
 					}

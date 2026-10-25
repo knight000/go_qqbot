@@ -18,6 +18,9 @@ qqbot.exe
 # 测试夹具同理（pkg/rpcsdk 的端到端用例把产物放进 .temp/，但手跑会落到仓库根）
 /testplugin
 /testplugin.exe
+# 手跑 `go build ./tools/apisurface`（在 torn 上实测时会这么编）的默认产物名
+/apisurface
+/apisurface.exe
 # devrun 的中间产物与 Windows 上被改名腾位的旧二进制
 /bot.new
 /bot.new.exe

@@ -7,6 +7,7 @@ package rpcsdk_test
 import (
 	"context"
 	"os/exec"
+	"slices"
 	"testing"
 	"time"
 
@@ -44,8 +45,12 @@ func TestManifestFlagPrintsManifestAndExitsZero(t *testing.T) {
 	// 使用面必须真的从产物里念出来：核心的兼容判定读的就是这一份，而它
 	// 只在「探测 → 线协议 → 判定」这条路上走一次，中间任何一段丢字段都会
 	// 让所有插件悄悄退化成"没声明使用面"（= 整体相等），且没有任何报错。
-	if len(m.Uses) != 1 || m.Uses[0] != "Event.Args" {
-		t.Fatalf("Uses = %v，期望 [Event.Args]（使用面必须穿过 --manifest）", m.Uses)
+	//
+	// 期望值是两个来源的并集（#56）：夹具的 Manifest.Uses 手写一条
+	// （Event.Args），APISurface 报两条（其中 Event.Args 重复），合并后
+	// 去重、排序。少一条说明合并没发生，多一条说明去重没生效。
+	if want := []string{"Event.Args", "JobSpec.Timeout"}; !slices.Equal(m.Uses, want) {
+		t.Fatalf("Uses = %v，期望 %v（使用面必须穿过 --manifest，且与手写追加项合并去重）", m.Uses, want)
 	}
 	// 三个可选接口都要报出来：核心据此决定发不发 start / close / run_job。
 	if len(optional) != 3 {

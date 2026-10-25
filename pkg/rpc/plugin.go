@@ -111,8 +111,10 @@ func (s *pluginServer) optional() []string {
 }
 
 func (s *pluginServer) manifest(_ context.Context, _ Request) (Response, error) {
+	// 走 PluginManifest 而不是 s.p.Manifest()：使用面（tools/apisurface 的产物）
+	// 在清单出口合并，`--manifest` 那条路也走同一个函数，两处不可能不一致。
 	return Response{Result: manifestResult{
-		Manifest: toManifestDTO(s.p.Manifest()),
+		Manifest: toManifestDTO(PluginManifest(s.p)),
 		Optional: s.optional(),
 	}}, nil
 }
