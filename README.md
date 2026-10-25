@@ -745,6 +745,61 @@ go run ./tools/build all -target linux/amd64 -o bin/qqbot
 
 可以交给返回值的是：接口级 100 QPS 的瞬时超限、平台风控（如 `1100100 消息被限频`），以及用户关闭主动消息这类非频控失败。
 
+## 写一个第三方插件
+
+插件是独立 module、独立可执行文件，核心启动时 spawn 它（ADR-0005）。这一节只讲**契约版本**——它是插件被拒载最常见的原因。
+
+### `api_version` 表达什么
+
+`Manifest.APIVersion` 是**插件编译时所对的契约版本**（一般直接写 `host.APIVersion`），不是「能不能跑」。能不能跑由**使用面**判定：核心取 `(插件编译版本, 核心版本]` 区间内的契约变更，只要有一条非纯增量变更碰到你声明「我用了」的成员，就拒载（`pkg/host/contract.go` 的 `CheckCompat`）。
+
+- 插件编译版本必须 ≤ 核心版本（向前兼容不做）；
+- 区间内 **additive** 的变更整条跳过——v4 / v5 / v6 / v9 / v11 / v13 都是这一类，核心涨版本不逼任何人重编译；
+- **behavioral**（签名不变、语义变了：v7 / v8 / v10）与 **breaking**（v12 的 `*`）的成员只要出现在 `Manifest.Uses` 里就拒载。
+
+所以只有「你用到的那一小块被改了」才需要动插件，版本号本身不是待办事项。
+
+### 一条命令生成使用面
+
+使用面由工具静态扫描生成，**不要手写**。在插件 module 根目录：
+
+```bash
+go run github.com/knight000/go_qqbot/tools/apisurface@<pin>
+```
+
+`<pin>` = 你 `go.mod` 里 `github.com/knight000/go_qqbot` 的版本。生成器必须与它扫描的契约同源，版本对不上会直接失败并告诉你该用哪个 pin。
+
+产物是 `uses_gen.go`，落在 `rpcsdk.Serve(&Plugin{})` 那个插件类型所在的包，**随插件仓入库**。它给该类型加一个 `APISurface() []string` 方法，`pkg/rpc` 在清单出口把它并进 `Manifest.Uses`（与手写项取并集、去重、排序）——两条清单出口（`--manifest` 与 `plugin.manifest`）因此自动同源。
+
+- 反射里才用到的成员静态扫不到：写进 `uses_extra.go` 的 `Manifest.Uses`，与产物合并。
+- CI 里跑 `go run github.com/knight000/go_qqbot/tools/apisurface@<pin> -check`：只校验产物是否最新、不写文件，产物缺失或过期即非零退出。
+- 改了插件代码就重跑。漏跑不会报错，只会把使用面停在旧的那一份，而判定读的就是它。
+
+### 忘了生成会怎样
+
+`uses_gen.go` 没生成、`Manifest.Uses` 又没手写 → 使用面为空 = **依赖每一个成员**，判定退化为「`api_version` 必须等于核心」。**安全但不放行**：编译版本与核心相等才照常加载，比核心旧一律拒载——等于回到引入使用面之前的口径，既不静默放行，也不比从前更严。
+
+方向不能反：若把「没生成」当成「什么都不依赖」，生成器一挂就等于所有插件放行，语义变更会静默穿透，比拒载坏得多。
+
+### 被拒载的日志长什么样
+
+拒载发生在装配期（`internal/pluginproc/load.go`），那个文件不会装进去，日志里留一条 `Error`，`err` 由 `host.CheckCompat` 产出、点名具体成员：
+
+```text
+[ERROR] 插件清单校验失败，已跳过 plugin=torn file=/var/lib/qqbot/plugins/bin/torn err="插件 torn: 插件按 api 9 编译且用到 Params.Str，而该成员在 v10 有行为（签名不变、语义改变）变更"
+```
+
+照这句话改即可：要么改掉对那个成员的用法（然后重新生成使用面），要么换一个按核心版本编译的产物。探测/校验失败的插件只记 Error、**不让启动失败**——一个过期产物不该让机器人整体下线（ADR-0005 决策 6）。
+
+### 排障入口
+
+| 想知道 | 看哪 |
+|---|---|
+| 每个版本改了什么、属于哪个类别 | `pkg/host/contract.go` 的 `contractChanges`——**唯一事实源**，判定逻辑与错误串都由它生成 |
+| 版本号表达什么、每版要做什么 | `pkg/host/host.go` 里 `APIVersion` 的注释（分级表的人读版本，与它同口径） |
+| 判定算法与每条规则的动机 | `pkg/host/contract.go` 的 `CheckCompat` 注释 |
+| 更长的版本史叙述 | 本文档之外，见本地 `docs/ARCHITECTURE.md §3.2`（不入库，干净克隆里没有） |
+
 ## 尚未实现
 
 > 2026-10-18 收敛了整份清单：明确不做的写「不做」，暂不排期的写「搁置」，

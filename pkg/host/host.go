@@ -35,9 +35,15 @@ import (
 // （ADR-0007）。所以本常量涨一次，只有真正被这次变更碰到成员的插件需要动；
 // 纯增量变更不再逼所有插件改字符串重编译。
 //
-// 下面按版本记「这次改了什么、插件要做什么」。它是 contract.go 那张分级表
-// （contractChanges）的人读版本，两处必须同步：分级表管判定，这里管解释。
-// 涨版本时两处都要改，TestContractTableCoversEveryVersion 兜住漏行。
+// 判定规则一句话：插件编译版本必须 ≤ 本版本；区间内的变更里 additive 跳过，
+// behavioral / breaking 的成员只要出现在 Manifest.Uses 里就拒载（成员为 "*"
+// 的一律拒）；Uses 为空 = 依赖每个成员，退化为「插件编译版本必须与本版本
+// 相等」——fail-closed，安全但不放行。
+//
+// 算法在 contract.go 的 CheckCompat，分级表是那里的 contractChanges（**唯一
+// 事实源**）。下面按版本记「这次改了什么、插件要做什么」，是那张表的人读版本，
+// 两处必须同口径：分级表管判定，这里管解释。涨版本时两处都要改，
+// TestContractTableCoversEveryVersion 兜住漏行。
 //
 // 版本 4：任务支持会话维度（JobSpec.PerPeer / JobSpec.Peer），
 // JobRunner 可能收到非空的 Peer。
