@@ -4,13 +4,17 @@
 #
 #   1. 先编插件到 internal/pluginbundle/dist/<os>_<arch>/（核心的 //go:embed 依赖它们）
 #   2. GoReleaser 编核心、发 release、算 checksums.txt
-#   3. 生成 index.json 并连同插件资产一起上传
+#   3. 生成 index.json，只上传**本次有更新**的插件资产
 #   4. 把刚发出去的资产下载回来做冒烟（校验和 / 版本号 / 可启动）
 #
 # 第 1 步一定要三个平台都跑：每个平台的 bundle_<os>_<arch>.go 只 embed 自己
 # 那一个目录，漏一个平台那一步 `go build` 就找不到文件。第 4 步下载的是
 # release 里的真实资产而不是 dist/ 里的中间产物——中间产物绿、上传件坏
 # （比如漏传一个平台）是这条流水线最可能的失败形态。
+#
+# 插件资产按需上传（#52）：版本号与上一版 index.json 相同的插件沿用旧条目、
+# 不进 staging，于是不会被 `gh release upload` 带走。核心里始终带着一份
+# 内嵌副本，启动期由 internal/pluginalign 对齐，所以"没上传"不等于"装不上"。
 name: release
 
 on:
@@ -55,15 +59,40 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 3. 生成 index.json 并上传插件资产
+      - name: 3. 生成 index.json 并上传本次新发的插件资产
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 上一版 index.json 是"哪些插件没更新"的判据（#52）。取不到
+          # （首个带此特性的发布、或上一版还没有 index.json）就全量上传。
+          prev_dir="$RUNNER_TEMP/prev"
+          mkdir -p "$prev_dir"
+          # tag 的父提交上最近的 tag。GITHUB_REF_NAME 在本地不一定是个 ref，
+          # 退一步用 GITHUB_SHA^；两者都失败就是"没有上一版"。
+          prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null \
+            || git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null \
+            || true)"
+          prev_index=""
+          if [ -n "$prev" ]; then
+            if gh release download "$prev" -p index.json --dir "$prev_dir" -R "$GITHUB_REPOSITORY"; then
+              prev_index="$prev_dir/index.json"
+              echo "上一版 index.json: $prev"
+            else
+              echo "::warning::取不到 $prev 的 index.json，本次全量上传插件资产"
+            fi
+          else
+            echo "没有上一版 tag，本次全量上传插件资产"
+          fi
           # index.json 的版本与 sha256 都由这一步现算：插件版本来自 Manifest()，
           # sha256 来自磁盘上的真实产物，URL 末段就是下一个命令上传的文件名。
-          go run ./tools/index -tag "$GITHUB_REF_NAME" -staging dist/plugins
+          args=(-tag "$GITHUB_REF_NAME" -staging dist/plugins)
+          if [ -n "$prev_index" ]; then
+            args+=(-previous "$prev_index")
+          fi
+          go run ./tools/index "${args[@]}"
           ls -l dist/plugins
+          # staging 里有什么就传什么：沿用的插件没被拷进来，所以不会上传。
           # -R 不能省：gh 靠当前目录的 .git 推断仓库，而这里的资产目录在
           # $RUNNER_TEMP 下，不在检出里。
           gh release upload "$GITHUB_REF_NAME" dist/plugins/* --clobber -R "$GITHUB_REPOSITORY"
@@ -95,8 +124,18 @@ jobs:
             test -s "$f" || { echo "缺少资产: $f"; exit 1; }
           done
 
-          # ADR-0006 决策 11 的对象形状：核心按平台，插件共 4 × 3 份资产。
-          test "$(ls qqbot-plugin-* | wc -l)" -eq 12
+          # 插件资产按需上传：本次新发的 = index.json 里 url 的 tag 等于本 tag
+          # 的条目。沿用的条目指向旧 tag，本 release 里根本没有那个文件（#52）。
+          # 用 find 而不是 `ls qqbot-plugin-*`：一个都没有时 ls 会非零退出，
+          # 在 set -euo pipefail 下把"正确地没有插件"变成一条假失败。
+          new_count=$(jq --arg tag "$GITHUB_REF_NAME" \
+            '[.plugins[] | .assets[] | select((.url | split("/") | .[-2]) == $tag)] | length' index.json)
+          got=$(find . -maxdepth 1 -type f -name 'qqbot-plugin-*' | wc -l | tr -d ' ')
+          if [ "$got" -ne "$new_count" ]; then
+            echo "本次新发 $new_count 个插件资产，release 里实际有 $got 个" >&2
+            find . -maxdepth 1 -type f -name 'qqbot-plugin-*' -print >&2
+            exit 1
+          fi
 
           # windows 产物在这个 linux runner 上跑不了，至少确认它是个 PE
           # 而不是被截断的空文件（-s -w 之后也仍然要以 MZ 开头）。
@@ -105,7 +144,8 @@ jobs:
           # checksums.txt 覆盖三个核心产物（ADR：元数据与二进制分两个通道）。
           sha256sum -c checksums.txt
 
-          # index.json 的结构、core.version 与插件/平台覆盖度。
+          # index.json 的结构、core.version 与插件/平台覆盖度。沿用的条目
+          # 也在里面，所以这里仍然是 4 个插件 × 3 个平台。
           jq -e --arg v "$ver" '
             .schema == 1
             and .core.version == $v
@@ -113,12 +153,30 @@ jobs:
             and ([.plugins[].assets | length] | all(. == 3))
           ' index.json
 
-          # index.json 登记的 sha256 必须与真实下载到的插件资产一致：
-          # 它是 /upgrade plugin 校验完整性的唯一依据。
-          jq -r '.plugins[] | .assets[] | "\(.url | split("/") | last) \(.sha256)"' index.json |
-            while read -r asset sha; do
+          # 只校验**本次新发**条目的 sha256：沿用条目指向旧 tag，本 release
+          # 里没有那个文件。先把清单落到文件再逐行校验：jq 失败会被 set -e
+          # 直接抓住，while 也不会因为管道子 shell 把计数丢掉。
+          if [ "$new_count" -gt 0 ]; then
+            jq -r --arg tag "$GITHUB_REF_NAME" '
+              .plugins[] | .assets[]
+              | select((.url | split("/") | .[-2]) == $tag)
+              | "\(.url | split("/") | last) \(.sha256)"
+            ' index.json > "$RUNNER_TEMP/new-assets.txt"
+            checked=0
+            # IFS 带 \r：这份清单在本地（Windows 的 jq）可能是 CRLF，
+            # 校验和字段末尾多一个 \r 会让 sha256sum 判成"格式不对"。
+            while IFS=$' \t\r' read -r asset sha; do
+              [ -n "$asset" ] || continue
               echo "$sha  $asset" | sha256sum -c -
-            done
+              checked=$((checked + 1))
+            done < "$RUNNER_TEMP/new-assets.txt"
+            # 行数必须与 new_count 相等：一份被截断的清单不能让校验"少跑几条"
+            # 之后静默通过。
+            if [ "$checked" -ne "$new_count" ]; then
+              echo "新发条目 $new_count 个，实际校验了 $checked 个" >&2
+              exit 1
+            fi
+          fi
 
       - name: 4b. 冒烟：产物报告的 version 是 tag 值、commit 是短哈希
         run: |

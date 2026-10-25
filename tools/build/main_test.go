@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/knight000/go_qqbot/internal/pluginbundle"
 )
 
 func TestParseTarget(t *testing.T) {
@@ -165,5 +167,41 @@ func writeFile(t *testing.T, root, rel, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// 插件产物目录里必须带一份版本清单：核心启动期靠它判断"内嵌的比磁盘新"
+// （#52）。清单是覆盖写，旧的必须被清掉——否则删掉的插件会永远留在清单里，
+// 启动期每次去补一个已经不存在的产物。
+func TestWriteVersionsRewritesManifest(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, pluginbundle.VersionsFile), []byte("gone=9.9.9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeVersions(dir, map[string]string{"md": "0.3.0", "echo": "0.1.0"}); err != nil {
+		t.Fatalf("writeVersions: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, pluginbundle.VersionsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# 由 go run ./tools/build plugins 生成：插件名=版本\n" +
+		"echo=0.1.0\n" +
+		"md=0.3.0\n"
+	if string(data) != want {
+		t.Fatalf("清单内容 =\n%q\n期望\n%q", data, want)
+	}
+}
+
+// 四个出厂插件的版本必须都能从 Manifest() 读到：清单里的版本号不是手写的，
+// 改了插件代码忘了涨版本号时，这里至少保证不会写进空值。
+func TestPluginVersionsCoverBundled(t *testing.T) {
+	vs := pluginVersions()
+	for _, name := range []string{"adminping", "bootnotice", "echo", "md"} {
+		if strings.TrimSpace(vs[name]) == "" {
+			t.Errorf("插件 %s 没有版本号，无法写入 %s", name, pluginbundle.VersionsFile)
+		}
 	}
 }

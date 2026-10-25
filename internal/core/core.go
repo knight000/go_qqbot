@@ -165,6 +165,25 @@ func New(o Options) (*Core, error) {
 	}, nil
 }
 
+// 插件装配阶段的期限。Init 与 Start 都是一次请求-应答握手，插件不回帧时
+// 必须能判出来：没有期限的话 core.Start 会永久阻塞，进程活着、systemd 显示
+// active (running)、日志停在上一行，比"插件崩溃"难查得多（#51）。
+//
+// 为什么不从 pluginproc.replaceInitTimeout 取值：core 与 pluginproc 刻意
+// 不互相 import（core 只按方法名做类型断言认热替换能力）。为什么不提到
+// pkg/host：那份契约是给插件作者看的线协议，启动多久算超时是核心自己的
+// 策略，写进契约等于让插件被这个数绑住。两处取值同量级、同语义，各自
+// 带注释说明即可。
+const (
+	// pluginInitTimeout：Init 只做一次配置下发，正常亚秒级。5 秒是为了容忍
+	// 冷启动遇上杀软扫描（Windows 首次读一个新 exe），同时让"起不来"能在
+	// owner 等得起的时限内被判出来。
+	pluginInitTimeout = 5 * time.Second
+	// pluginStartTimeout：Start 可能触发预热（字体、渲染器、后台协程），
+	// 比握手慢一档，给 10 秒。
+	pluginStartTimeout = 10 * time.Second
+)
+
 // Start 依次完成：校验插件配置 → 绑定任务执行者 → 插件 Init（注册 Job）
 // → 启动调度 → 启动插件 → 生成认领令牌。
 func (c *Core) Start(ctx context.Context) error {
@@ -200,8 +219,10 @@ func (c *Core) Start(ctx context.Context) error {
 			Renderer: c.render,
 			Session:  c.session,
 		})
-		if err := p.Init(ctx, svc); err != nil {
-			return fmt.Errorf("初始化插件 %s: %w", m.Name, err)
+		if err := withPluginTimeout(ctx, pluginInitTimeout, "初始化", m.Name, func(c context.Context) error {
+			return p.Init(c, svc)
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -211,8 +232,8 @@ func (c *Core) Start(ctx context.Context) error {
 
 	for _, p := range c.plugins {
 		if st, ok := p.(host.Starter); ok {
-			if err := st.Start(ctx); err != nil {
-				return fmt.Errorf("启动插件 %s: %w", p.Manifest().Name, err)
+			if err := withPluginTimeout(ctx, pluginStartTimeout, "启动", p.Manifest().Name, st.Start); err != nil {
+				return err
 			}
 		}
 	}
@@ -226,6 +247,25 @@ func (c *Core) Start(ctx context.Context) error {
 
 	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.App.Sandbox)
 	return nil
+}
+
+// withPluginTimeout 给一次插件装配调用加期限，并把超时翻译成一句能定位的话。
+//
+// Init 与 Start 两处形状完全相同、只有"做什么"（verb）不同：期限、超时判定、
+// 拼错误串各写一遍，改一处就会漏一处。必须在 cancel 之前判超时——cancel 之后
+// ctx.Err() 一律是 Canceled，DeadlineExceeded 再也看不出来。
+func withPluginTimeout(ctx context.Context, d time.Duration, verb, name string, fn func(context.Context) error) error {
+	cctx, cancel := context.WithTimeout(ctx, d)
+	err := fn(cctx)
+	timedOut := errors.Is(err, context.DeadlineExceeded)
+	cancel()
+	if err == nil {
+		return nil
+	}
+	if timedOut {
+		return fmt.Errorf("%s插件 %s timeout（%v）: %w", verb, name, d, err)
+	}
+	return fmt.Errorf("%s插件 %s: %w", verb, name, err)
 }
 
 // hostHTTPBackend 返回按该插件 Manifest.AllowedDomains 收窄过的出站客户端。

@@ -55,11 +55,11 @@ $EDITOR config/config.local.toml
 
 ```text
 已生成配置：config/config.local.toml
-数据目录：.temp\data
-出厂插件：adminping.exe, bootnotice.exe, echo.exe, md.exe → .temp\data\plugins\bin
+数据目录：data
+出厂插件：adminping.exe, bootnotice.exe, echo.exe, md.exe → data\plugins\bin
 ```
 
-> 数据目录按 `[store].path`（默认 `./.temp/data/qqbot.db`）的目录相对**当前工作目录**解析，不是相对配置文件。换目录安装时要么 `cd` 过去再 init，要么在配置里写绝对路径（见下面的 Debian 步骤）。上面是仓库内开发的形态，数据落在 `./.temp/data/`（已 gitignore）。
+> 数据目录按 `[store].path`（默认 `./data/qqbot.db`）的目录相对**当前工作目录**解析，不是相对配置文件。换目录安装时要么 `cd` 过去再 init，要么在配置里写绝对路径（见下面的 Debian 步骤）。上面是仓库内开发的形态，数据落在 `./data/`（已 gitignore）。
 
 启动日志里能确认插件真的装上了（这几行都在连网关之前，网关连不上照样打）：
 
@@ -93,7 +93,7 @@ sudo -u qqbot bash -c 'cd /var/lib/qqbot && ./bin/qqbot init -c /etc/qqbot/confi
 # 3. 把 [store].path 改成绝对路径，再让插件落到新的数据目录
 sudo -u qqbot vi /etc/qqbot/config.toml              # path = "/var/lib/qqbot/qqbot.db"
 sudo -u qqbot /var/lib/qqbot/bin/qqbot init --plugins -c /etc/qqbot/config.toml
-sudo rm -rf /var/lib/qqbot/.temp                    # 第 2 步按相对路径释放的那一份
+sudo rm -rf /var/lib/qqbot/data                     # 第 2 步按相对路径释放的那一份
 
 # 4. 装 unit 并启动
 sudo install -m 0644 deploy/qqbot.service /etc/systemd/system/qqbot.service
@@ -248,7 +248,7 @@ sudo systemctl start qqbot
 journalctl -u qqbot -n 30 --no-pager | grep '启动完成'
 ```
 
-第 4 步的语义是「只补缺失」：`plugins/bin/` 里已有的文件一律不动，所以你单独升过的插件不会被降级；反过来说，**删掉一个插件就是卸载它**，启动期不会自愈。
+第 4 步的语义是「只补缺失」：`plugins/bin/` 里已有的文件一律不动，所以你单独升过的插件不会被降级。删除的后果分两类：**出厂插件**（四个示例）有内嵌副本，启动期会把缺失的文件补回来，所以删掉它们不等于卸载——要停用请写进 `[plugins].disabled`（#52）；**第三方插件**没有副本可补，删掉文件就是卸载，启动期不会自愈。
 
 干净克隆自编的二进制没有出厂插件可释放：`internal/pluginbundle/dist/<os>_<arch>/` 里只有 `.gitkeep`（`go:embed` 不能出包目录），此时 `init --plugins` 会明确报错：
 
@@ -278,7 +278,7 @@ raw = false      # 额外打印平台原始 JSON（仅 full 级别）
 普通日志与轨迹共用同一副行首，扫起来是连续的：
 
 ```
-[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping 权限=bot-admin
+[13:50:33] [INFO] adminping 插件已初始化 plugin=adminping role=bot-admin
 [13:50:34] [WARN] 队列已满，丢弃事件 peer=g1
 [13:50:34] [ERROR] 插件处理失败 plugin=md err="i/o timeout"
 ```
@@ -484,7 +484,7 @@ retry_delay = "30s"
 插件已经是独立进程（ADR-0005），所以这里的边界和 P1 时代完全不同：
 
 - **插件代码改动不需要 `/reload`，也不需要重编译核心**：把新产物放进 `<datadir>/plugins/bin/` 就是装上（同名文件覆盖后敲一次 `/reload`，或对单个插件用 `/upgrade plugin`）；
-- `/reload` **不重新编译任何东西**。它重启的是核心进程，新进程在装配期会重新扫 `plugins/bin/`，所以新放进去的插件会随之加载、被删掉的插件就此消失；
+- `/reload` **不重新编译任何东西**。它重启的是核心进程，新进程在装配期会重新扫 `plugins/bin/`，所以新放进去的插件会随之加载、被删掉的第三方插件就此消失。出厂插件（四个示例）是例外：启动期会用内嵌副本补回缺失的文件，要停用请写进 `[plugins].disabled`（#52）；
 - 只想换一个插件时用 `/upgrade plugin <名称>`，它只重启那个插件的子进程，核心与其它插件不重启。
 
 ```
@@ -537,6 +537,18 @@ go run ./tools/build all -target linux/amd64 -o dist/qqbot-linux-amd64
 ```
 
 正式发布走 tag：push `v*` 之后 CI 依次跑「三个平台的插件产物 → GoReleaser 编核心与 checksums.txt → `tools/index` 生成 index.json → 下载回来冒烟」。版本号只经 `-ldflags -X .../buildinfo.Version` 注入，本地 `tools/build` 不注入（所以本地产物是 `dev`，`/upgrade` 会拒绝自更新——这正是防止本地构建混进生产的闸门）。
+
+一次发布里的资产形状（#52）：
+
+| 资产 | 什么时候有 |
+| --- | --- |
+| `qqbot-<ver>-<os>-<arch>[.exe]` | 每次发布，3 个平台 |
+| `checksums.txt` / `index.json` | 每次发布 |
+| `qqbot-plugin-<name>-<ver>-<os>-<arch>` | **只在该插件版本号变了时上传**；没变就沿用上一版资产，index.json 里的 url 仍指向旧 tag |
+
+插件版本号没变 = 没更新。所以**改了插件代码必须涨 `Manifest().Version`**；契约版本（`host.APIVersion`）变化时由启动期对齐兜底，不依赖版本号。核心每次发布都带着一份内嵌插件副本，覆盖升级核心后启动时会把插件对齐到内嵌版本（只升不降；磁盘版本更高时保留并记一条 info）。
+
+已知限制（#52）：插件没更新时 `index.json` 沿用上一版的条目，`url` 指向**旧 tag**。v0.0.1 的客户端只在「磁盘插件落后、且该插件恰好被沿用」这一种组合下会 404，现场表现是升级失败——**重跑一次核心升级即自愈**，不为它做兼容代码。
 
 服务器上不需要 `scp` + `systemctl restart` 了：tag 发出去之后在 QQ 里敲 `/upgrade` 看一眼、`/upgrade apply` 应用即可。要手工换文件（离线 / 救火）见上面的「离线恢复」。
 

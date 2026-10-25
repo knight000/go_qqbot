@@ -46,7 +46,7 @@ id = "1"
 secret = "s"
 
 [store]
-path = "./.temp/data/qqbot.db"
+path = "./data/qqbot.db"
 
 [upgrade]
 enabled = false

@@ -3,6 +3,7 @@
 /config/env
 
 # 运行期数据
+/data/
 /.temp/
 /media/
 /bin/

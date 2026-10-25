@@ -167,6 +167,9 @@ type PluginDelta struct {
 	From   string // 已加载的版本
 	To     string // 发布里的版本
 	Action string // 升 / 跳过（原因） / 失败（原因）
+	// Source 是这条结论查的是哪个发布：<owner/repo>@<tag>。内置插件是核心仓，
+	// 自带上游的插件是它自己的仓（#53）。空表示没有来源可查。
+	Source string
 	// Size 是已落位的产物字节数，0 表示没有下载（跳过或失败）。
 	Size int64
 }
@@ -392,7 +395,15 @@ func (u *Upgrader) stagePlugins(ctx context.Context, rel *Release, p *Plan) {
 			d.Action = fmt.Sprintf("跳过（发布里没有 %s 的产物）", currentPlatform())
 			continue
 		}
-		staged, err := u.stagePlugin(ctx, rel, d.Name, bin, entry.Version, asset)
+		url, err := u.c.assetURL(ctx, rel, asset.URL)
+		if err != nil {
+			d.Action = "失败（" + err.Error() + "）"
+			continue
+		}
+		staged, err := u.stagePlugin(ctx, pluginArtifact{
+			Name: d.Name, Bin: bin, Version: entry.Version,
+			URL: url, SHA256: asset.SHA256, VersionFrom: "索引",
+		})
 		if err != nil {
 			d.Action = "失败（" + err.Error() + "）"
 			continue

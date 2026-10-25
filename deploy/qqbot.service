@@ -18,7 +18,7 @@ User=qqbot
 #
 # WorkingDirectory 与数据目录重合：插件子进程不设 cmd.Dir/cmd.Env
 # （internal/pluginproc/spawn.go），cwd 直接继承核心；而 [store].path 若写
-# 相对路径（示例的 ./.temp/data/qqbot.db）就是相对它解析的。核心与插件必须
+# 相对路径（示例的 ./data/qqbot.db）就是相对它解析的。核心与插件必须
 # 看到同一个 cwd，否则 ImageSourceFile 的相对路径会两边各读一处（§3.9 的
 # 已知取舍）。
 WorkingDirectory=/var/lib/qqbot

@@ -77,8 +77,13 @@ import (
 //   - 实现侧新增 `HTTPBackend`：`Options.HTTP` 不再是 `*httpx.Client`，
 //     让契约包彻底不依赖实现包。插件侧看到的 `HTTP` 接口与错误口径不变。
 //
+// 版本 13：Manifest 新增 Upstream（#53）。插件可以声明自己的发布源，
+// /upgrade plugin 据此去那个仓查更新；**零值仍是"以核心仓 index.json 为准"**，
+// 所以内置插件与所有存量插件一个字都不用改，只是必须把 api_version 改成 13
+// 才能被新核心加载（整体匹配，见版本 12）。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "12"
+const APIVersion = "13"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //
@@ -504,6 +509,16 @@ type Manifest struct {
 	Permission Perm
 	// DenyReply 是插件级默认的拒绝语，被 Command.DenyReply 覆盖。
 	DenyReply string
+
+	// Upstream 是插件自己的发布源，格式 "owner/repo"（与 api_base 同一主机）。
+	// 空 = 该插件的版本以核心仓 index.json 为准（内置插件都是这种）。
+	// 只用于 /upgrade plugin 定位发布：核心不据此判定任何权限或门控。
+	//
+	// 声明了它就只查它：查不到、没有本平台产物、没有校验和都只是"跳过"，
+	// 绝不回落到核心索引——否则一个拼错的上游会变成"看起来升级成功，
+	// 其实版本没动"。形状不是 owner/repo 的（含 ":"、URL、多段路径）一律
+	// 无效：跳过并记一条 warn。
+	Upstream string
 }
 
 // Plugin 是 P1（编译期注册）插件的生命周期契约。

@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 
 	"github.com/knight000/go_qqbot/pkg/host"
@@ -58,8 +59,15 @@ type Options struct {
 // 两份不一致的可能。
 func Serve(p host.Plugin) error {
 	if wantsManifest(os.Args[1:]) {
+		// 探测这条路不改全局日志：核心只把 stderr 当错误串的尾巴读。
 		return writeManifest(p, os.Stdout)
 	}
+	// 插件日志一律走 stderr 上的 JSON（#48）：核心的 pluginproc 按 level/msg/attrs
+	// 重放，等级才不会丢。标准库默认的 TextHandler 会输出 `2009/11/10 23:00:00
+	// INFO msg k=v`，核心只能整行当一条 Info 打出来——插件的 WARN/ERROR 在
+	// `[log].level = "warn"` 下会被全部过滤掉，现场表现是「插件在报错，日志里
+	// 一条都没有」。stderr 仍是日志通道、线协议没变，所以不涨 api_version。
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	return ServeIO(p, Options{}, os.Stdin, os.Stdout)
 }
 

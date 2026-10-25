@@ -222,7 +222,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	}
 	// per-peer 数量必须单独打出来：只有一个群都没进时它是 0，
 	// 而"任务已注册"与"任务正跑在 0 个群上"在日志里长得一模一样。
-	s.log.Info("调度器启动", "任务", len(keep), "per_peer", perPeer)
+	s.log.Info("调度器启动", "tasks", len(keep), "per_peer", perPeer)
 
 	// 父 ctx 取消（信号退出）等价于 Stop；/reload 路径父 ctx 不会取消，
 	// 由 Core.Shutdown 显式调用 Stop。

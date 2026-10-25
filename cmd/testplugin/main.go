@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"sync"
@@ -99,6 +100,10 @@ func (f *fixture) Init(_ context.Context, h host.Host) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.h = h
+	// 日志通道的验收点（#48）：rpcsdk 应把默认 slog 换成 stderr 上的
+	// JSONHandler，核心才能按真实等级重放。等级与一个 attr 各留一处，
+	// 形状对不对由 pkg/rpcsdk 的用例逐字判定。
+	slog.Warn("testplugin 已初始化", "n", h.Config().Int("n", 0))
 	return nil
 }
 
