@@ -98,6 +98,13 @@ func TestUpgradePluginsSkipsWhenUpstreamUnreachable(t *testing.T) {
 			if got := rep.Results[0].Action; got != c.want {
 				t.Errorf("结论 = %q，期望 %q", got, c.want)
 			}
+			// 查不到 tag 也要说清是哪个仓：这是 owner 唯一能拿去排查的线索。
+			if got := rep.Results[0].Source; got != "o/up" {
+				t.Errorf("来源 = %q，期望 o/up（拿不到 tag 时只写仓）", got)
+			}
+			if n := strings.Count(rep.Text(), "（来源"); n != 1 {
+				t.Errorf("报告里来源应只出现一处，实际 %d 处：\n%s", n, rep.Text())
+			}
 			if len(r.calls) != 0 || f.assetHits.Load() != 0 {
 				t.Error("不可达时既不该下载也不该替换")
 			}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -211,6 +212,11 @@ func parseLogLine(line []byte) (pluginRecord, bool) {
 		return pluginRecord{}, false
 	}
 	if _, err := dec.Token(); err != io.EOF {
+		return pluginRecord{}, false
+	}
+	// 没有 msg 的 JSON 不是一条 slog 记录：重放成"空消息 + 几个字段"会把原文
+	// 丢掉，读者看到的是一条没有内容的日志。退回"整行当 Info"至少不丢信息。
+	if strings.TrimSpace(rec.msg) == "" {
 		return pluginRecord{}, false
 	}
 	return rec, true

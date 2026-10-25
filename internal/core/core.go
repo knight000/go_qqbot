@@ -219,16 +219,10 @@ func (c *Core) Start(ctx context.Context) error {
 			Renderer: c.render,
 			Session:  c.session,
 		})
-		ictx, cancel := context.WithTimeout(ctx, pluginInitTimeout)
-		err := p.Init(ictx, svc)
-		// 必须在 cancel 之前判：cancel 之后 ictx.Err() 一律是 Canceled。
-		timedOut := errors.Is(err, context.DeadlineExceeded)
-		cancel()
-		if err != nil {
-			if timedOut {
-				return fmt.Errorf("初始化插件 %s timeout（%v）: %w", m.Name, pluginInitTimeout, err)
-			}
-			return fmt.Errorf("初始化插件 %s: %w", m.Name, err)
+		if err := withPluginTimeout(ctx, pluginInitTimeout, "初始化", m.Name, func(c context.Context) error {
+			return p.Init(c, svc)
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -238,15 +232,8 @@ func (c *Core) Start(ctx context.Context) error {
 
 	for _, p := range c.plugins {
 		if st, ok := p.(host.Starter); ok {
-			sctx, cancel := context.WithTimeout(ctx, pluginStartTimeout)
-			err := st.Start(sctx)
-			timedOut := errors.Is(err, context.DeadlineExceeded)
-			cancel()
-			if err != nil {
-				if timedOut {
-					return fmt.Errorf("启动插件 %s timeout（%v）: %w", p.Manifest().Name, pluginStartTimeout, err)
-				}
-				return fmt.Errorf("启动插件 %s: %w", p.Manifest().Name, err)
+			if err := withPluginTimeout(ctx, pluginStartTimeout, "启动", p.Manifest().Name, st.Start); err != nil {
+				return err
 			}
 		}
 	}
@@ -260,6 +247,25 @@ func (c *Core) Start(ctx context.Context) error {
 
 	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.App.Sandbox)
 	return nil
+}
+
+// withPluginTimeout 给一次插件装配调用加期限，并把超时翻译成一句能定位的话。
+//
+// Init 与 Start 两处形状完全相同、只有"做什么"（verb）不同：期限、超时判定、
+// 拼错误串各写一遍，改一处就会漏一处。必须在 cancel 之前判超时——cancel 之后
+// ctx.Err() 一律是 Canceled，DeadlineExceeded 再也看不出来。
+func withPluginTimeout(ctx context.Context, d time.Duration, verb, name string, fn func(context.Context) error) error {
+	cctx, cancel := context.WithTimeout(ctx, d)
+	err := fn(cctx)
+	timedOut := errors.Is(err, context.DeadlineExceeded)
+	cancel()
+	if err == nil {
+		return nil
+	}
+	if timedOut {
+		return fmt.Errorf("%s插件 %s timeout（%v）: %w", verb, name, d, err)
+	}
+	return fmt.Errorf("%s插件 %s: %w", verb, name, err)
 }
 
 // hostHTTPBackend 返回按该插件 Manifest.AllowedDomains 收窄过的出站客户端。
