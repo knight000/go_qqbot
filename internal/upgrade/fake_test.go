@@ -47,13 +47,42 @@ type fakeRelease struct {
 	api   *httptest.Server
 	asset *httptest.Server
 
+	// upstreams 是上游仓库的替身（#53）：与核心仓共用同一对 httptest 服务器
+	// （api_base 同主机是硬约定），但路径与资产列表完全独立。
+	upstreams []*fakeUpstream
+
 	apiHits   atomic.Int64
 	tagHits   atomic.Int64
 	assetHits atomic.Int64
+	// upstreamHits 只数上游仓的元数据请求：核心仓的索引与它无关。
+	upstreamHits atomic.Int64
 	// authOnAsset 记录镜像通道上出现过的 Authorization 头（必须永远为空）。
 	authOnAsset atomic.Bool
 	// broken 为 true 时所有请求 500，用来断言"一个请求都不发"。
 	broken atomic.Bool
+}
+
+// fakeUpstream 是一个上游仓库的替身：它只有插件产物，没有 index.json，
+// 也不属于核心仓。
+//
+// tag 故意允许与核心仓同名——同一个 tag 名在两个仓含义不同，这正是
+// "上游必须按自己的仓构造 client"要防的那个错。
+type fakeUpstream struct {
+	repo   string
+	tag    string
+	assets []fakeUpstreamAsset
+	// status 非 0 时所有请求都回它（404 发布不存在 / 500 上游坏了）。
+	status int
+	// brokenJSON 让 releases/latest 回一段不是 JSON 的内容。
+	brokenJSON bool
+}
+
+type fakeUpstreamAsset struct {
+	name string
+	blob []byte
+	// digest 是 GitHub API 的 digest 字段（"sha256:<hex>"）。空串模拟
+	// "上游没给校验和"。
+	digest string
 }
 
 func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
@@ -125,6 +154,9 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 			http.NotFound(w, r)
 		}
 	})
+	// 上游仓的元数据：/repos/<owner>/<repo>/releases/{latest|assets/<id>}。
+	// 注册成子树，让每个用例自己决定扮演哪个仓；核心仓的路径更长，优先级更高。
+	mux.HandleFunc("/repos/", f.serveUpstreamAPI)
 	f.api = httptest.NewServer(mux)
 	t.Cleanup(f.api.Close)
 
@@ -154,9 +186,146 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 		}
 		_, _ = w.Write(f.binary)
 	})
+	// 上游仓的产物直链：/owner/repo/releases/download/<tag>/<asset>。
+	amux.HandleFunc("/", f.serveUpstreamAsset)
 	f.asset = httptest.NewServer(amux)
 	t.Cleanup(f.asset.Close)
 	return f
+}
+
+// addUpstream 让假 API 扮演一个上游仓库（另一个 owner/repo）。
+func (f *fakeRelease) addUpstream(repo, tag string) *fakeUpstream {
+	f.t.Helper()
+	u := &fakeUpstream{repo: repo, tag: tag}
+	f.upstreams = append(f.upstreams, u)
+	return u
+}
+
+func (f *fakeRelease) upstream(repo string) *fakeUpstream {
+	for _, u := range f.upstreams {
+		if u.repo == repo {
+			return u
+		}
+	}
+	return nil
+}
+
+// addPlugin 往上游的最新发布里加一份本平台产物，名字与 tools/index 同形。
+//
+// withDigest=false 模拟 GitHub 返回的 digest 为空：没有校验和就没有可校验的
+// 哈希，只能跳过（与 stagePlugin 的"没有 sha256 就不装"同一口径）。
+func (u *fakeUpstream) addPlugin(plugin, version string, blob []byte, withDigest bool) string {
+	name := "qqbot-plugin-" + plugin + "-" + version + "-" + currentPlatform() + exeSuffix()
+	u.addRaw(name, blob, withDigest)
+	return name
+}
+
+// addRaw 按**给定的资产名**登记一份产物：造"没有本平台产物"的现场时用得上
+// （名字里的平台段不是本机的）。
+func (u *fakeUpstream) addRaw(name string, blob []byte, withDigest bool) {
+	a := fakeUpstreamAsset{name: name, blob: blob}
+	if withDigest {
+		a.digest = "sha256:" + sha256Hex(blob)
+	}
+	u.assets = append(u.assets, a)
+}
+
+// serveUpstreamAPI 扮演上游仓的元数据通道。路径形状：
+// /repos/<owner>/<repo>/releases/latest 与 /repos/<owner>/<repo>/releases/assets/<id>。
+func (f *fakeRelease) serveUpstreamAPI(w http.ResponseWriter, r *http.Request) {
+	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(segs) < 5 || segs[0] != "repos" {
+		http.NotFound(w, r)
+		return
+	}
+	up := f.upstream(segs[1] + "/" + segs[2])
+	if up == nil {
+		http.NotFound(w, r)
+		return
+	}
+	f.upstreamHits.Add(1)
+	if up.status != 0 {
+		http.Error(w, "boom", up.status)
+		return
+	}
+	switch {
+	case len(segs) == 5 && segs[3] == "releases" && segs[4] == "latest":
+		if up.brokenJSON {
+			_, _ = w.Write([]byte("<html>not json</html>"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name": up.tag,
+			"assets":   up.assetList(),
+		})
+	case len(segs) == 6 && segs[3] == "releases" && segs[4] == "assets":
+		var id int64
+		if _, err := fmt.Sscanf(segs[5], "%d", &id); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if i := int(id - upstreamAssetIDBase); i >= 0 && i < len(up.assets) {
+			_, _ = w.Write(up.assets[i].blob)
+			return
+		}
+		http.NotFound(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// upstreamAssetIDBase 是上游产物的资产 id 起点：核心仓用 1/2/3 与 101 起，
+// 这里错开，误用核心仓的 id 会取不到字节。
+const upstreamAssetIDBase = 201
+
+func (u *fakeUpstream) assetList() []map[string]any {
+	out := make([]map[string]any, 0, len(u.assets))
+	for i, a := range u.assets {
+		item := map[string]any{
+			"id": int64(upstreamAssetIDBase + i), "name": a.name, "size": len(a.blob),
+		}
+		// digest 为空时 GitHub 省略该字段，这里同样省略。
+		if a.digest != "" {
+			item["digest"] = a.digest
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// serveUpstreamAsset 扮演上游仓的产物直链（无 token 时走这条）。
+// 只在该产物登记的 tag 下提供：拿别的 tag 去拼地址会 404。
+func (f *fakeRelease) serveUpstreamAsset(w http.ResponseWriter, r *http.Request) {
+	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(segs) < 6 || segs[2] != "releases" || segs[3] != "download" {
+		http.NotFound(w, r)
+		return
+	}
+	up := f.upstream(segs[0] + "/" + segs[1])
+	if up == nil {
+		http.NotFound(w, r)
+		return
+	}
+	f.assetHits.Add(1)
+	if r.Header.Get("Authorization") != "" {
+		f.authOnAsset.Store(true)
+	}
+	if f.broken.Load() {
+		http.Error(w, "boom", http.StatusInternalServerError)
+		return
+	}
+	tag, name := segs[4], segs[5]
+	if tag != up.tag {
+		http.NotFound(w, r)
+		return
+	}
+	for _, a := range up.assets {
+		if a.name == name {
+			_, _ = w.Write(a.blob)
+			return
+		}
+	}
+	http.NotFound(w, r)
 }
 
 // addPlugin 让这次"发布"带上一个插件产物：索引里写本平台资产（地址是

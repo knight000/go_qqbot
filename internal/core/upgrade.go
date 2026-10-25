@@ -267,9 +267,10 @@ func (c *Core) pluginTargets(arg string) (targets []upgrade.PluginTarget, missin
 			continue
 		}
 		targets = append(targets, upgrade.PluginTarget{
-			Name:    m.Name,
-			Version: m.Version,
-			Replace: r,
+			Name:     m.Name,
+			Version:  m.Version,
+			Upstream: m.Upstream,
+			Replace:  r,
 		})
 	}
 	if !all && !found {
