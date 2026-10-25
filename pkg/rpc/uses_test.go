@@ -68,6 +68,11 @@ func TestPluginManifestMergesSurface(t *testing.T) {
 			manual: []string{"Params.Str", "Event.Args"},
 			want:   []string{"Params.Str", "Event.Args"},
 		},
+		{
+			name:   "生成结果为空：手写项仍要做规范化（空格/空串清掉，顺序不动）",
+			manual: []string{" Event.Args ", "", "  "},
+			want:   []string{"Event.Args"},
+		},
 	}
 
 	for _, c := range cases {

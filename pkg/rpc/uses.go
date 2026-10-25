@@ -52,10 +52,21 @@ func PluginManifest(p host.Plugin) host.Manifest {
 // 假信号出现在 diff 与日志对比里。
 //
 // generated 为空表示产物缺失或作者手写了一个空方法——此时**不排序也不去重**，
-// 原样返回 manual，让「没生成」这件事在任何下游都保持可辨认。
+// 让「没生成」这件事在任何下游（日志、diff）都保持可辨认；这一路只做规范化：
+// 去掉每项首尾空格、丢掉空串。
+//
+// 规范化不能省：手写成 " Event.Args" 而判定拿字符串求交，" Event.Args" 与
+// "Event.Args" 永远不相交，症状是声明的成员被当成没声明——方向是静默放行，
+// 正是 ADR-0007 要消灭的那类错。
 func mergeUses(manual, generated []string) []string {
 	if len(generated) == 0 {
-		return manual
+		var out []string
+		for _, u := range manual {
+			if u = strings.TrimSpace(u); u != "" {
+				out = append(out, u)
+			}
+		}
+		return out
 	}
 	seen := make(map[string]bool, len(manual)+len(generated))
 	out := make([]string, 0, len(manual)+len(generated))
