@@ -28,7 +28,22 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// APIVersion 是核心与插件之间的契约版本，不匹配直接拒绝加载。
+// APIVersion 是**本核心编译时所对的契约版本**，也是兼容判定的锚点。
+//
+// 它不再是"插件必须抄一遍的字符串"：能不能加载由 CheckCompat 判——看插件按
+// 哪一版编译、它实际用到的成员在 (那一版, 本版] 区间里有没有非增量变更
+// （ADR-0007）。所以本常量涨一次，只有真正被这次变更碰到成员的插件需要动；
+// 纯增量变更不再逼所有插件改字符串重编译。
+//
+// 判定规则一句话：插件编译版本必须 ≤ 本版本；区间内的变更里 additive 跳过，
+// behavioral / breaking 的成员只要出现在 Manifest.Uses 里就拒载（成员为 "*"
+// 的一律拒）；Uses 为空 = 依赖每个成员，退化为「插件编译版本必须与本版本
+// 相等」——fail-closed，安全但不放行。
+//
+// 算法在 contract.go 的 CheckCompat，分级表是那里的 contractChanges（**唯一
+// 事实源**）。下面按版本记「这次改了什么、插件要做什么」，是那张表的人读版本，
+// 两处必须同口径：分级表管判定，这里管解释。涨版本时两处都要改，
+// TestContractTableCoversEveryVersion 兜住漏行。
 //
 // 版本 4：任务支持会话维度（JobSpec.PerPeer / JobSpec.Peer），
 // JobRunner 可能收到非空的 Peer。
@@ -66,7 +81,8 @@ import (
 // 版本 11：导出主动消息的三个失败哨兵 ErrActiveQuota / ErrActiveDisabled /
 // ErrRateLimited（#34）。SendActive 的返回错误 errors.Is 可判，插件不必
 // import internal/core 就能把「日预算用尽」「配置未开启」「平台 429」
-// 分成三条处置路径。**调用签名未变**，插件只需把 api_version 改成 11。
+// 分成三条处置路径。**调用签名未变**，对旧插件是纯增量——分级表记
+// additive，用到这三个哨兵以外的插件不受影响。
 //
 // 版本 12：`Host` 的载体从「编译期接口」变成「线协议」（ADR-0005 / #38）。
 //   - 契约包从 `internal/host` 外置为 `pkg/host`：独立 module 的插件现在能
@@ -79,8 +95,12 @@ import (
 //
 // 版本 13：Manifest 新增 Upstream（#53）。插件可以声明自己的发布源，
 // /upgrade plugin 据此去那个仓查更新；**零值仍是"以核心仓 index.json 为准"**，
-// 所以内置插件与所有存量插件一个字都不用改，只是必须把 api_version 改成 13
-// 才能被新核心加载（整体匹配，见版本 12）。
+// 所以存量插件一个字都不用改——这是纯增量变更（分级表记 additive），
+// 按 12 编译且声明了使用面的插件直接被放行，不必为了一个它用不到的新字段
+// 重编译。
+//
+// 同期还加了 Manifest.Uses（插件自报的使用面，#55/#56），零值同样安全——
+// 没写就是空使用面，判定退化为「api_version 必须与核心相等」。两项都是纯增量。
 //
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
 const APIVersion = "13"
@@ -474,9 +494,23 @@ type Command struct {
 }
 
 type Manifest struct {
-	Name       string
-	Version    string
+	Name    string
+	Version string
+	// APIVersion 是**插件编译时所对的契约版本**，不是"必须与核心相等的字符串"。
+	// 它是兼容判定的锚点：核心取 (APIVersion, host.APIVersion] 区间内的变更，
+	// 与下面的 Uses 求交（见 contract.go 的 CheckCompat / ADR-0007）。
 	APIVersion string
+	// Uses 是插件实际引用到的契约成员，粒度到成员（"Params.Str"、"Event.Args"），
+	// 不是符号级（"host.Params"）。
+	//
+	// 由 tools/apisurface 静态扫描生成，手写只留 uses_extra.go 兜反射——一个
+	// 两万行的插件约 50~70 条，手写必漏，而漏报在语义兼容下是**静默错行为**，
+	// 比拒载坏得多。
+	//
+	// 空 = 依赖每个成员（fail-closed）：判定退化为「APIVersion 必须等于核心」，
+	// 与引入本字段之前一字不差。内置四插件随核心编译、恒等于核心版本，所以
+	// 它们不生成这个字段，走整体相等。
+	Uses []string
 	// Capabilities 是**保留字段**：核心从不读取，不产生任何授权或拒绝。
 	// 门控是 Manifest 的另外三项——AllowedDomains、Permission、配置里的主动
 	// 消息白名单（评审 §4.1）。删字段要改所有插件的 Manifest，所以保留。

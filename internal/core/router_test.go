@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/knight000/go_qqbot/pkg/host"
@@ -77,11 +78,46 @@ func TestGrantRevokeNoLongerReserved(t *testing.T) {
 	}
 }
 
-func TestRouterRejectsAPIVersionMismatch(t *testing.T) {
+// 加载判定看的是「插件实际用到的契约成员有没有变」，不是版本号相等
+// （ADR-0007）。但整体相等的旧口径必须原样保留：没有声明使用面 = 依赖
+// 每个成员，退化为「必须与核心同版本」——否则放宽的第一步就把所有旧插件
+// 放进来了，语义变更会静默穿透。
+func TestRouterRejectsOlderPluginWithoutUses(t *testing.T) {
 	m := manifest("old", 1, "!old")
-	m.APIVersion = "0"
-	if _, err := NewRouter([]host.Plugin{&fakePlugin{m: m}}); err == nil {
-		t.Fatal("api_version 不匹配时应拒绝加载")
+	m.APIVersion = "12"
+	_, err := NewRouter([]host.Plugin{&fakePlugin{m: m}})
+	if err == nil {
+		t.Fatal("没有声明使用面的旧插件应拒绝加载")
+	}
+	// 拒载原因必须能照着改：点名成员，而不是"版本不等"。
+	if !strings.Contains(err.Error(), "未声明使用面") {
+		t.Fatalf("拒载原因 = %q，期望点明未声明使用面", err.Error())
+	}
+}
+
+// 同一份清单，只要声明了使用面、且不含 v13 新增的 Manifest.Upstream，
+// 就该被 api 13 核心正常加载——torn 的形状（按 12 编译、独立 module）。
+func TestRouterAcceptsOlderPluginWithUses(t *testing.T) {
+	m := manifest("torn", 1, "!torn")
+	m.APIVersion = "12"
+	m.Uses = []string{"Event.Args", "Params.Duration", "JobSpec"}
+	if _, err := NewRouter([]host.Plugin{&fakePlugin{m: m}}); err != nil {
+		t.Fatalf("使用面不含 v13 新增成员的旧插件应能加载: %v", err)
+	}
+}
+
+// 拒载日志必须落到**具体成员**上：现场看到"api_version 不匹配"只会去改字符串
+// 重编译，看到"Params.Str 在 v10 改了语义"才知道要改代码。
+func TestRouterRejectionNamesTheMember(t *testing.T) {
+	m := manifest("legacy", 1, "!legacy")
+	m.APIVersion = "9"
+	m.Uses = []string{"Event.Args", "Params.Str"}
+	_, err := NewRouter([]host.Plugin{&fakePlugin{m: m}})
+	if err == nil {
+		t.Fatal("用到 Params.Str 的 api 9 插件应拒绝加载")
+	}
+	if !strings.Contains(err.Error(), "Params.Str") || !strings.Contains(err.Error(), "v10") {
+		t.Fatalf("拒载原因 = %q，期望点名 Params.Str 与 v10", err.Error())
 	}
 }
 

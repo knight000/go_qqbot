@@ -7,10 +7,11 @@
 //
 // 三条边界：
 //
-//   - **只升不降**：磁盘版本更高就跳过（ADR-0006 决策 7），否则用户单独
-//     升过的插件会被静默降级；
-//   - **契约优先**：磁盘插件的 api_version 与核心不一致时必须换——那种
-//     插件根本加载不了，版本号相同也不能留着；
+//   - **只升不降**：判为兼容时磁盘版本更高就跳过（ADR-0006 决策 7），否则
+//     用户单独升过的插件会被静默降级；
+//   - **拒载优先**：磁盘插件被判拒载（host.CheckCompat 失败）时无条件替换，
+//     不看版本号——那种插件根本加载不了，替换是唯一自愈路径，而内嵌副本按
+//     本核心编译，不会同样被拒；
 //   - **不阻断启动**：任何单个插件对齐失败都只 warn，机器人照常起来。
 //
 // 调用时机只有一个：pluginproc.Load 之前。那时插件进程还没起，文件可以
@@ -46,9 +47,6 @@ type Options struct {
 	Bundle fs.FS
 	// Versions 是内嵌副本的版本清单（pluginbundle.Versions()），name → version。
 	Versions map[string]string
-	// APIVersion 是核心的契约版本（host.APIVersion）。磁盘插件与它不一致
-	// 时必须替换。空字符串表示不做这项判定（只给测试用）。
-	APIVersion string
 	// Log 为 nil 时用 slog.Default()。
 	Log *slog.Logger
 	// Perm 是补回/替换后文件的权限位，默认 0755：插件是子进程可执行文件。
@@ -63,7 +61,7 @@ type Options struct {
 // Report 是一次对齐的结论。四个切片里都是插件名（不是文件名）。
 type Report struct {
 	Added    []string // 缺失、从内嵌副本补回
-	Replaced []string // 内嵌版本更高，或 api_version 不匹配
+	Replaced []string // 内嵌版本更高，或被判拒载
 	Skipped  []string // 磁盘版本更高，或版本号无法比较
 	Failed   []string // 写入失败（只 warn）
 }
@@ -114,8 +112,9 @@ func Align(ctx context.Context, o Options) Report {
 			continue
 		}
 
-		// 契约优先：api_version 不一致的插件连握手都过不去，版本号再高也没用。
-		if o.APIVersion != "" && d.manifest.APIVersion != o.APIVersion {
+		// 拒载优先于版本比较：被判拒载的插件连握手都过不去，留着它等于
+		// 每次启动刷一条 Error。替换不设条件，连版本号不可比较也不管。
+		if compatErr := host.CheckCompat(d.manifest.APIVersion, d.manifest.Uses); compatErr != nil {
 			if err := install(o.Bundle, name, d.path, perm); err != nil {
 				log.Warn("替换出厂插件失败，跳过", "plugin", name, "path", d.path, "err", err)
 				rep.Failed = append(rep.Failed, name)
@@ -123,7 +122,7 @@ func Align(ctx context.Context, o Options) Report {
 			}
 			log.Info("替换出厂插件", "plugin", name,
 				"from", d.manifest.Version, "to", bundleVer,
-				"reason", fmt.Sprintf("api_version %s ≠ %s", d.manifest.APIVersion, o.APIVersion))
+				"reason", "拒载："+compatErr.Error())
 			rep.Replaced = append(rep.Replaced, name)
 			continue
 		}

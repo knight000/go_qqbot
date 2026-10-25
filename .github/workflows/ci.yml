@@ -1,0 +1,57 @@
+name: ci
+
+# 契约分级表的**软校验**（ADR-0007 决策 11）。
+#
+# 能自动证明的做实——`pkg/host` 的测试硬校验「每条 Surface 的成员名真实存在」
+# 「版本号覆盖 4~当前版本」；不能自动证明的只告警：「这次改动到底算不算
+# 不兼容」机器答不了，得人看。
+#
+# 所以这里不失败，只在 PR 上留一条 warning，并允许显式 override
+# （PR 正文写 `Contract-Change: none`，或打 `contract-reviewed` 标签）。
+# 会挡人的硬门禁最后都会被绕过，而绕过一次之后就永远绕过了。
+on:
+  pull_request:
+    paths:
+      - 'pkg/host/**'
+
+permissions:
+  contents: read
+
+jobs:
+  contract-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出（要拿到 base 提交才能算 diff）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: pkg/host 有 diff 而 contract.go 没有 diff → 告警
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "$BASE_SHA" HEAD -- pkg/host)"
+          echo "pkg/host 的改动文件："
+          printf '%s\n' "${changed:-（无）}"
+
+          if [ -z "$changed" ]; then
+            echo "pkg/host 没有改动，跳过"
+            exit 0
+          fi
+          if printf '%s\n' "$changed" | grep -qx 'pkg/host/contract.go'; then
+            echo "contract.go 一起改了，通过"
+            exit 0
+          fi
+          if grep -qi 'Contract-Change: none' <<< "${PR_BODY:-}"; then
+            echo "PR 正文声明了 Contract-Change: none，跳过"
+            exit 0
+          fi
+          if grep -q 'contract-reviewed' <<< "$PR_LABELS"; then
+            echo "带 contract-reviewed 标签，跳过"
+            exit 0
+          fi
+
+          echo "::warning file=pkg/host/contract.go,line=1::pkg/host 有改动但 contractChanges 没动——若这次改的是契约成员的语义，分级表就漏了一条（漏一条等于给一个真实的不兼容变更开后门）；若只是注释或实现细节，请在 PR 正文写 Contract-Change: none，或打 contract-reviewed 标签"
