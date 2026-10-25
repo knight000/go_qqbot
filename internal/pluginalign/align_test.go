@@ -284,9 +284,13 @@ func TestAlignRestoresAllWhenDirMissing(t *testing.T) {
 }
 
 // 用户自己的插件（不在内嵌清单里）不归对齐管：不看、不动、不探测。
+//
+// 出厂插件都在场时一个多余文件都不该探：探测要起进程，一个卡死的第三方插件
+// 会把整轮对齐拖到超时。改名兜底只在"有出厂插件没对上"时才启用。
 func TestAlignIgnoresUnknownPlugins(t *testing.T) {
 	dir := t.TempDir()
 	custom := writeFile(t, dir, "custom", "custom-bytes")
+	writeFile(t, dir, "echo", "echo-user")
 	probed := false
 
 	rep := Align(context.Background(), Options{
@@ -296,19 +300,68 @@ func TestAlignIgnoresUnknownPlugins(t *testing.T) {
 		APIVersion: apiVersion,
 		Log:        (&logSink{}).logger(),
 		Probe: func(_ context.Context, bin string) (host.Manifest, error) {
-			probed = true
-			return manifest("custom", "9.9.9", apiVersion), nil
+			switch filepath.Base(bin) {
+			case fileName("custom"):
+				probed = true
+				return manifest("custom", "9.9.9", apiVersion), nil
+			case fileName("echo"):
+				return manifest("echo", "0.2.0", apiVersion), nil
+			}
+			return host.Manifest{}, errors.New("不是插件")
 		},
 	})
 
 	if got := readFile(t, custom); got != "custom-bytes" {
 		t.Errorf("用户插件被改动了：%q", got)
 	}
-	if len(rep.Replaced) != 0 || len(rep.Skipped) != 0 {
+	if len(rep.Replaced) != 0 || len(rep.Skipped) != 0 || len(rep.Added) != 0 {
 		t.Errorf("用户插件不该进报告，实际 %+v", rep)
 	}
 	if probed {
 		t.Error("清单里没有的插件不该被探测：多起一次进程只是白等，还可能被卡死拖住")
+	}
+}
+
+// 出厂插件被改了名：认身份靠 Manifest.Name，不靠文件名。
+//
+// 只按文件名探测会判定 echo 缺失，于是补一份 echo.exe——两个文件自称同一个
+// 插件，每次启动刷一条「插件重名」Error。改名后的文件应当被当成 echo 本身。
+func TestAlignRecognizesRenamedPlugin(t *testing.T) {
+	dir := t.TempDir()
+	renamed := writeFile(t, dir, "myecho", "echo-user")
+	logs := &logSink{}
+
+	rep := Align(context.Background(), Options{
+		Dir:        dir,
+		Bundle:     bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
+		Versions:   map[string]string{"echo": "0.2.0"},
+		APIVersion: apiVersion,
+		Log:        logs.logger(),
+		Probe:      probeOf(map[string]host.Manifest{fileName("myecho"): manifest("echo", "0.3.0", apiVersion)}),
+	})
+
+	if names(rep.Added) != "" {
+		t.Fatalf("改名后的插件已被认出，不该补第二份，报告 %+v", rep)
+	}
+	if names(rep.Skipped) != "echo" {
+		t.Errorf("应把 myecho 当成 echo 并按只升不降跳过，报告 %+v", rep)
+	}
+	if got := readFile(t, renamed); got != "echo-user" {
+		t.Errorf("改名后的文件被改成了 %q", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		var got []string
+		for _, e := range entries {
+			got = append(got, e.Name())
+		}
+		t.Fatalf("目录里应只有改名后的那一份，实际 %v", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fileName("echo"))); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("不该补回 %s：两份文件自称同一个插件", fileName("echo"))
 	}
 }
 

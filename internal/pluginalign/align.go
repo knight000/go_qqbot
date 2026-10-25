@@ -164,6 +164,11 @@ type diskPlugin struct {
 // 只探测清单里有的名字：第三方插件不归对齐管，多起一次进程只是白等；而
 // 一个卡死的第三方插件会把整轮对齐拖到探测超时。点开头的文件一律不看：
 // 那是落位文件（.echo.exe.new）与编辑器临时文件，pluginproc.Load 也这么忽略。
+//
+// 文件名只是标签，认身份最终靠 Manifest.Name：用户把 echo.exe 改名成
+// myecho.exe 之后，按名字探测就找不到 echo、会补出第二份。所以有插件没对上
+// 时（探测到的清单内插件数 < len(expected)）再拿目录里剩下的普通文件探一遍，
+// 用自报的名字认领——这是兜底，全部对上时一个文件都不多探。
 func scanDisk(ctx context.Context, dir string, expected map[string]string, probe func(context.Context, string) (host.Manifest, error), log *slog.Logger) map[string]diskPlugin {
 	out := map[string]diskPlugin{}
 	entries, err := os.ReadDir(dir)
@@ -173,11 +178,13 @@ func scanDisk(ctx context.Context, dir string, expected map[string]string, probe
 		}
 		return out
 	}
+	var rest []fs.DirEntry
 	for _, e := range entries {
 		if !e.Type().IsRegular() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		if _, ok := expected[pluginName(e.Name())]; !ok {
+			rest = append(rest, e)
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
@@ -197,6 +204,28 @@ func scanDisk(ctx context.Context, dir string, expected map[string]string, probe
 				"plugin", m.Name, "kept", first.path, "ignored", path)
 			continue
 		}
+		out[m.Name] = diskPlugin{path: path, manifest: m}
+	}
+	if len(out) >= len(expected) {
+		return out
+	}
+	// 还有插件没对上：可能只是没装，也可能是被改了名。逐个探剩余文件，只认
+	// 清单里那些还没找到的名字。探测失败静默跳过——剩下的大多是第三方插件，
+	// 为它们各起一次进程已经是代价，不该再刷一串 warn。
+	for _, e := range rest {
+		path := filepath.Join(dir, e.Name())
+		m, err := probe(ctx, path)
+		if err != nil || m.Name == "" {
+			continue
+		}
+		if _, want := expected[m.Name]; !want {
+			continue
+		}
+		if _, dup := out[m.Name]; dup {
+			continue
+		}
+		log.Info("按插件自报的名字认出了改名后的出厂插件",
+			"plugin", m.Name, "path", path)
 		out[m.Name] = diskPlugin{path: path, manifest: m}
 	}
 	return out
