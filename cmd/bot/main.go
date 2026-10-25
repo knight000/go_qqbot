@@ -260,14 +260,13 @@ func run() (*core.RestartRequest, error) {
 		return nil, err
 	}
 	// 内嵌副本对齐必须在 Load 之前（#52）：这时插件进程还没起，文件可以
-	// 安全替换。判定矩阵在 internal/pluginalign：内嵌版本更高、或磁盘插件的
-	// api_version 与核心不一致就换；磁盘版本更高则保留（只升不降）。
+	// 安全替换。判定矩阵在 internal/pluginalign：磁盘插件被判拒载就无条件换，
+	// 判为兼容时按插件版本只升不降（内嵌更高才换）。
 	align := pluginalign.Align(ctx, pluginalign.Options{
-		Dir:        filepath.Join(datadir, "plugins", "bin"),
-		Bundle:     pluginbundle.Files(),
-		Versions:   pluginbundle.Versions(),
-		APIVersion: host.APIVersion,
-		Log:        log.With("component", "pluginalign"),
+		Dir:      filepath.Join(datadir, "plugins", "bin"),
+		Bundle:   pluginbundle.Files(),
+		Versions: pluginbundle.Versions(),
+		Log:      log.With("component", "pluginalign"),
 	})
 	if align.Changed() > 0 {
 		log.Info("出厂插件已对齐",

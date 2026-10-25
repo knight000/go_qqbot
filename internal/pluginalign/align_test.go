@@ -21,8 +21,6 @@ import (
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
-const apiVersion = "12"
-
 func testSuffix() string {
 	if runtime.GOOS == "windows" {
 		return ".exe"
@@ -68,8 +66,15 @@ func probeOf(manifests map[string]host.Manifest) func(context.Context, string) (
 	}
 }
 
-func manifest(name, version, api string) host.Manifest {
-	return host.Manifest{Name: name, Version: version, APIVersion: api}
+// manifest 造一条与核心同步的出厂插件清单：按当前契约编译、未声明使用面。
+func manifest(name, version string) host.Manifest {
+	return host.Manifest{Name: name, Version: version, APIVersion: host.APIVersion}
+}
+
+// oldManifest 造一条按旧契约编译的清单。被判兼容还是拒载由 api + uses 决定，
+// 与版本号无关——这正是 #57 要盯住的那个分叉。
+func oldManifest(name, version, api string, uses ...string) host.Manifest {
+	return host.Manifest{Name: name, Version: version, APIVersion: api, Uses: uses}
 }
 
 // —— 日志捕获 ——
@@ -151,12 +156,12 @@ func TestAlignReplacesWhenEmbeddedIsNewer(t *testing.T) {
 	logs := &logSink{}
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
-		Versions:   map[string]string{"echo": "0.2.0"},
-		APIVersion: apiVersion,
-		Log:        logs.logger(),
-		Probe:      probeOf(map[string]host.Manifest{fileName("echo"): manifest("echo", "0.1.0", apiVersion)}),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+
+		Log:   logs.logger(),
+		Probe: probeOf(map[string]host.Manifest{fileName("echo"): manifest("echo", "0.1.0")}),
 	})
 
 	if names(rep.Replaced) != "echo" {
@@ -187,12 +192,11 @@ func TestAlignSkipsWhenDiskIsNewer(t *testing.T) {
 	logs := &logSink{}
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "echo-bundled"}, map[string]string{"echo": "0.2.0"}),
-		Versions:   map[string]string{"echo": "0.2.0"},
-		APIVersion: apiVersion,
-		Log:        logs.logger(),
-		Probe:      probeOf(map[string]host.Manifest{fileName("echo"): manifest("echo", "0.3.0", apiVersion)}),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-bundled"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+		Log:      logs.logger(),
+		Probe:    probeOf(map[string]host.Manifest{fileName("echo"): manifest("echo", "0.3.0")}),
 	})
 
 	if len(rep.Replaced) != 0 || len(rep.Added) != 0 {
@@ -209,30 +213,127 @@ func TestAlignSkipsWhenDiskIsNewer(t *testing.T) {
 	}
 }
 
-// api_version 不匹配的插件根本加载不了，必须换——哪怕它的版本号更高。
-// 契约涨版本而插件版本号没动时，只看版本号会永远不换，然后握手处全崩。
-func TestAlignReplacesOnAPIVersionMismatch(t *testing.T) {
+// 判据不是「版本号相等」：按旧契约编译但没碰到变更的插件被判兼容，就照常
+// 走只升不降。磁盘那份更新，留着。
+func TestAlignKeepsCompatibleOlderPluginWhenDiskIsNewer(t *testing.T) {
 	dir := t.TempDir()
-	target := writeFile(t, dir, "echo", "echo-stale-api")
+	target := writeFile(t, dir, "echo", "echo-user")
 	logs := &logSink{}
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "echo-fresh"}, map[string]string{"echo": "0.2.0"}),
-		Versions:   map[string]string{"echo": "0.2.0"},
-		APIVersion: apiVersion,
-		Log:        logs.logger(),
-		Probe:      probeOf(map[string]host.Manifest{fileName("echo"): manifest("echo", "0.9.0", "11")}),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-bundled"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+		Log:      logs.logger(),
+		Probe: probeOf(map[string]host.Manifest{
+			fileName("echo"): oldManifest("echo", "0.3.0", "12", "Params.Str"),
+		}),
+	})
+
+	if n := len(rep.Replaced) + len(rep.Added); n != 0 {
+		t.Fatalf("判为兼容且磁盘版本更高时不该动文件，报告 %+v", rep)
+	}
+	if names(rep.Skipped) != "echo" {
+		t.Errorf("应记为跳过，报告 %+v", rep)
+	}
+	if got := readFile(t, target); got != "echo-user" {
+		t.Errorf("用户单独升过的插件被改成了 %q", got)
+	}
+	if logs.contains("拒载") {
+		t.Errorf("兼容的插件不该被判拒载，实际:\n%s", logs.text())
+	}
+}
+
+// 判为兼容、但内嵌版本更高：照常升级，理由只能写「内嵌版本更高」。
+func TestAlignReplacesCompatibleOlderPluginWhenEmbeddedIsNewer(t *testing.T) {
+	dir := t.TempDir()
+	target := writeFile(t, dir, "echo", "echo-old")
+	logs := &logSink{}
+
+	rep := Align(context.Background(), Options{
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+		Log:      logs.logger(),
+		Probe: probeOf(map[string]host.Manifest{
+			fileName("echo"): oldManifest("echo", "0.1.0", "12", "Params.Str"),
+		}),
 	})
 
 	if names(rep.Replaced) != "echo" {
-		t.Fatalf("api_version 不匹配时应替换，报告 %+v", rep)
+		t.Fatalf("内嵌版本更高时应替换，报告 %+v", rep)
+	}
+	if got := readFile(t, target); got != "echo-new" {
+		t.Errorf("替换后内容 = %q，期望 echo-new", got)
+	}
+	if !logs.contains("内嵌版本更高") {
+		t.Errorf("日志的 reason 应为「内嵌版本更高」，实际:\n%s", logs.text())
+	}
+	if logs.contains("拒载") {
+		t.Errorf("兼容的插件不该被判拒载，实际:\n%s", logs.text())
+	}
+}
+
+// 被判拒载的出厂插件必须无条件替换：它反正加载不了，替换是唯一自愈路径。
+//
+// 这条磁盘版本（0.9.0）比内嵌（0.2.0）高——只看版本号会留下一个装不上的
+// 插件，而且永远等不到"内嵌更高"那一天。
+func TestAlignReplacesRejectedPluginEvenIfDiskIsNewer(t *testing.T) {
+	dir := t.TempDir()
+	target := writeFile(t, dir, "echo", "echo-rejected")
+	logs := &logSink{}
+
+	rep := Align(context.Background(), Options{
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-fresh"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+		Log:      logs.logger(),
+		Probe: probeOf(map[string]host.Manifest{
+			fileName("echo"): oldManifest("echo", "0.9.0", "9", "Params.Str"),
+		}),
+	})
+
+	if names(rep.Replaced) != "echo" {
+		t.Fatalf("被判拒载时应替换，报告 %+v", rep)
 	}
 	if got := readFile(t, target); got != "echo-fresh" {
 		t.Errorf("替换后内容 = %q，期望 echo-fresh", got)
 	}
-	if !logs.contains("api_version") {
-		t.Errorf("日志应写明是因为契约版本不匹配，实际:\n%s", logs.text())
+	// 拒载的理由必须点名具体成员：照日志就能知道该改哪里。
+	if !logs.contains("拒载") || !logs.contains("Params.Str") {
+		t.Errorf("日志应写明拒载并点名成员，实际:\n%s", logs.text())
+	}
+	// "版本不一致"不再是判据：留着它会把排障引向版本号而非使用面。
+	if logs.contains("≠") {
+		t.Errorf("日志不该再出现「版本不一致」的说法，实际:\n%s", logs.text())
+	}
+}
+
+// 拒载优先于版本比较：版本号读不出来（dev、预发布）也不影响——反正装不上，
+// 换掉才是唯一出路。反过来，兼容 + 读不出才跳过。
+func TestAlignReplacesRejectedPluginEvenIfVersionUnparsable(t *testing.T) {
+	dir := t.TempDir()
+	target := writeFile(t, dir, "echo", "echo-rejected-dev")
+	logs := &logSink{}
+
+	rep := Align(context.Background(), Options{
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-fresh"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+		Log:      logs.logger(),
+		Probe: probeOf(map[string]host.Manifest{
+			fileName("echo"): oldManifest("echo", "dev", "9", "Params.Str"),
+		}),
+	})
+
+	if names(rep.Replaced) != "echo" {
+		t.Fatalf("被判拒载时应替换，不看版本号能否比较，报告 %+v", rep)
+	}
+	if got := readFile(t, target); got != "echo-fresh" {
+		t.Errorf("替换后内容 = %q，期望 echo-fresh", got)
+	}
+	if !logs.contains("拒载") {
+		t.Errorf("日志应写明拒载，实际:\n%s", logs.text())
 	}
 }
 
@@ -242,12 +343,12 @@ func TestAlignRestoresMissingFile(t *testing.T) {
 	kept := writeFile(t, dir, "md", "md-user")
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "echo-new", "md": "md-new"}, map[string]string{"echo": "0.2.0", "md": "0.3.0"}),
-		Versions:   map[string]string{"echo": "0.2.0", "md": "0.3.0"},
-		APIVersion: apiVersion,
-		Log:        (&logSink{}).logger(),
-		Probe:      probeOf(map[string]host.Manifest{fileName("md"): manifest("md", "0.3.0", apiVersion)}),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-new", "md": "md-new"}, map[string]string{"echo": "0.2.0", "md": "0.3.0"}),
+		Versions: map[string]string{"echo": "0.2.0", "md": "0.3.0"},
+
+		Log:   (&logSink{}).logger(),
+		Probe: probeOf(map[string]host.Manifest{fileName("md"): manifest("md", "0.3.0")}),
 	})
 
 	if names(rep.Added) != "echo" {
@@ -266,11 +367,11 @@ func TestAlignRestoresAllWhenDirMissing(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "plugins", "bin")
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "e", "md": "m"}, map[string]string{"echo": "0.1.0", "md": "0.1.0"}),
-		Versions:   map[string]string{"echo": "0.1.0", "md": "0.1.0"},
-		APIVersion: apiVersion,
-		Log:        (&logSink{}).logger(),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "e", "md": "m"}, map[string]string{"echo": "0.1.0", "md": "0.1.0"}),
+		Versions: map[string]string{"echo": "0.1.0", "md": "0.1.0"},
+
+		Log: (&logSink{}).logger(),
 	})
 
 	if names(rep.Added) != "echo,md" {
@@ -294,18 +395,18 @@ func TestAlignIgnoresUnknownPlugins(t *testing.T) {
 	probed := false
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
-		Versions:   map[string]string{"echo": "0.2.0"},
-		APIVersion: apiVersion,
-		Log:        (&logSink{}).logger(),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+
+		Log: (&logSink{}).logger(),
 		Probe: func(_ context.Context, bin string) (host.Manifest, error) {
 			switch filepath.Base(bin) {
 			case fileName("custom"):
 				probed = true
-				return manifest("custom", "9.9.9", apiVersion), nil
+				return manifest("custom", "9.9.9"), nil
 			case fileName("echo"):
-				return manifest("echo", "0.2.0", apiVersion), nil
+				return manifest("echo", "0.2.0"), nil
 			}
 			return host.Manifest{}, errors.New("不是插件")
 		},
@@ -332,12 +433,12 @@ func TestAlignRecognizesRenamedPlugin(t *testing.T) {
 	logs := &logSink{}
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
-		Versions:   map[string]string{"echo": "0.2.0"},
-		APIVersion: apiVersion,
-		Log:        logs.logger(),
-		Probe:      probeOf(map[string]host.Manifest{fileName("myecho"): manifest("echo", "0.3.0", apiVersion)}),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+
+		Log:   logs.logger(),
+		Probe: probeOf(map[string]host.Manifest{fileName("myecho"): manifest("echo", "0.3.0")}),
 	})
 
 	if names(rep.Added) != "" {
@@ -375,11 +476,11 @@ func TestAlignFailureOnlyWarnsAndContinues(t *testing.T) {
 	logs := &logSink{}
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "e", "md": "m"}, map[string]string{"echo": "0.1.0", "md": "0.1.0"}),
-		Versions:   map[string]string{"echo": "0.1.0", "md": "0.1.0"},
-		APIVersion: apiVersion,
-		Log:        logs.logger(),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "e", "md": "m"}, map[string]string{"echo": "0.1.0", "md": "0.1.0"}),
+		Versions: map[string]string{"echo": "0.1.0", "md": "0.1.0"},
+
+		Log: logs.logger(),
 	})
 
 	if names(rep.Failed) != "echo" {
@@ -403,12 +504,12 @@ func TestAlignSkipsUnparsableVersion(t *testing.T) {
 	logs := &logSink{}
 
 	rep := Align(context.Background(), Options{
-		Dir:        dir,
-		Bundle:     bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
-		Versions:   map[string]string{"echo": "0.2.0"},
-		APIVersion: apiVersion,
-		Log:        logs.logger(),
-		Probe:      probeOf(map[string]host.Manifest{fileName("echo"): manifest("echo", "dev", apiVersion)}),
+		Dir:      dir,
+		Bundle:   bundleOf(t, map[string]string{"echo": "echo-new"}, map[string]string{"echo": "0.2.0"}),
+		Versions: map[string]string{"echo": "0.2.0"},
+
+		Log:   logs.logger(),
+		Probe: probeOf(map[string]host.Manifest{fileName("echo"): manifest("echo", "dev")}),
 	})
 
 	if len(rep.Replaced) != 0 {
