@@ -154,6 +154,13 @@ func TestUpgradePluginsSkipsMissingFromIndex(t *testing.T) {
 	if a := rep.Results[0].Action; a != "跳过（没有声明发布来源）" {
 		t.Fatalf("应说明没有发布来源，实际 %q", a)
 	}
+	// 报告不能自相矛盾：说"没有声明发布来源"却又写"（来源 核心仓@tag）"。
+	if s := rep.Results[0].Source; s != "" {
+		t.Errorf("没有发布来源时不该写来源，实际 %q", s)
+	}
+	if strings.Contains(rep.Text(), "（来源") {
+		t.Errorf("报告不该出现来源：\n%s", rep.Text())
+	}
 	if len(r.calls) != 0 || f.assetHits.Load() != 0 {
 		t.Error("没有发布来源时既不该下载也不该替换")
 	}

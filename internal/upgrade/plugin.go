@@ -221,7 +221,6 @@ func (u *Upgrader) upgradePlugin(ctx context.Context, rel *Release, tgt PluginTa
 		d.Action = "跳过（没有声明发布来源）"
 		return d
 	}
-	d.Source = u.c.repo + "@" + rel.Tag
 	entry, ok := rel.Index.plugin(tgt.Name)
 	if !ok {
 		// 索引里没有它、自己也没声明上游：这个插件没有发布来源。说"发布里
@@ -229,6 +228,9 @@ func (u *Upgrader) upgradePlugin(ctx context.Context, rel *Release, tgt PluginTa
 		d.Action = "跳过（没有声明发布来源）"
 		return d
 	}
+	// 来源只在"确实能从这个发布里取"时才写：先写来源再说没声明来源，
+	// 报告会自相矛盾（"没有声明发布来源（来源 核心仓@tag）"）。
+	d.Source = u.c.repo + "@" + rel.Tag
 	d.To = entry.Version
 	asset, ok := entry.Assets[currentPlatform()]
 	if !ok {
@@ -237,25 +239,9 @@ func (u *Upgrader) upgradePlugin(ctx context.Context, rel *Release, tgt PluginTa
 	}
 	// 只升不降：同版本与本地更高都不动。措辞与预览里的 deltas 保持一致，
 	// 同一件事在预览与执行结果里必须说同一句话。
-	switch cmp, ok := Compare(tgt.Version, entry.Version); {
-	case !ok:
-		d.Action = "跳过（版本号无法比较）"
-		return d
-	case cmp > 0:
-		d.Action = "跳过（比发布版本新）"
-		return d
-	case cmp == 0:
-		d.Action = "跳过（已是最新）"
-		return d
-	}
-	if tgt.Replace == nil {
-		d.Action = "跳过（这个插件没有独立进程，不能热替换）"
-		return d
-	}
-	bin := strings.TrimSpace(tgt.Replace.BinPath())
-	if bin == "" {
-		// 猜一个路径去下载是最坏的选择：换上去的可能是另一份产物。
-		d.Action = "跳过（定位不到插件文件路径，无法落位）"
+	bin, action := pluginInstallable(tgt, entry.Version, "跳过（比发布版本新）")
+	if action != "" {
+		d.Action = action
 		return d
 	}
 
@@ -285,6 +271,9 @@ func (u *Upgrader) upgradePluginFromUpstream(ctx context.Context, tgt PluginTarg
 		d.Action = "跳过（上游声明无效）"
 		return d
 	}
+	// 先记仓、拿到 tag 再补 tag：不可达与"缺 tag"这两条结论也要能说清是
+	// 哪个仓——它们是 owner 唯一能拿去查的线索。
+	d.Source = up
 	// 上游是**另一个仓**：同一个 tag 名在两个仓含义不同，必须按上游仓构造
 	// client（自己的 repo、自己的 tag 缓存），不能复用核心仓那一个。
 	cl := u.c.forRepo(up)
@@ -308,15 +297,9 @@ func (u *Upgrader) upgradePluginFromUpstream(ctx context.Context, tgt PluginTarg
 	}
 	d.To = asset.version
 	// 与核心索引同一套口径：只升不降，同版本不动。
-	switch cmp, ok := Compare(tgt.Version, asset.version); {
-	case !ok:
-		d.Action = "跳过（版本号无法比较）"
-		return d
-	case cmp > 0:
-		d.Action = "跳过（比上游版本新）"
-		return d
-	case cmp == 0:
-		d.Action = "跳过（已是最新）"
+	bin, action := pluginInstallable(tgt, asset.version, "跳过（比上游版本新）")
+	if action != "" {
+		d.Action = action
 		return d
 	}
 	sha, ok := digestSHA256(asset.digest)
@@ -324,15 +307,6 @@ func (u *Upgrader) upgradePluginFromUpstream(ctx context.Context, tgt PluginTarg
 		// 没有校验和就没有可校验的哈希。stagePlugin 已经确立"没有 sha256 就
 		// 不装"，这里不开第二条路（"没校验也装"）。
 		d.Action = "跳过（上游没有校验和）"
-		return d
-	}
-	if tgt.Replace == nil {
-		d.Action = "跳过（这个插件没有独立进程，不能热替换）"
-		return d
-	}
-	bin := strings.TrimSpace(tgt.Replace.BinPath())
-	if bin == "" {
-		d.Action = "跳过（定位不到插件文件路径，无法落位）"
 		return d
 	}
 
@@ -349,6 +323,32 @@ func (u *Upgrader) upgradePluginFromUpstream(ctx context.Context, tgt PluginTarg
 		Name: tgt.Name, Bin: bin, Version: asset.version,
 		URL: url, SHA256: sha, VersionFrom: "文件名",
 	})
+}
+
+// pluginInstallable 判断一条候选产物"能不能装"，返回要落位的插件文件路径。
+//
+// 两条来源共用这一份判定：版本三分支（无法比较 / 本地更新 / 已是最新）、
+// 有没有独立进程、定位不到文件，结论与措辞都必须一致。newer 是"本地比来源
+// 更新"那一支的措辞——两条来源对"来源"的称呼不同（发布 / 上游），逐字沿用
+// 各自的说法。action 非空表示跳过，此时 bin 无意义。
+func pluginInstallable(tgt PluginTarget, to, newer string) (bin, action string) {
+	switch cmp, ok := Compare(tgt.Version, to); {
+	case !ok:
+		return "", "跳过（版本号无法比较）"
+	case cmp > 0:
+		return "", newer
+	case cmp == 0:
+		return "", "跳过（已是最新）"
+	}
+	if tgt.Replace == nil {
+		return "", "跳过（这个插件没有独立进程，不能热替换）"
+	}
+	bin = strings.TrimSpace(tgt.Replace.BinPath())
+	if bin == "" {
+		// 猜一个路径去下载是最坏的选择：换上去的可能是另一份产物。
+		return "", "跳过（定位不到插件文件路径，无法落位）"
+	}
+	return bin, ""
 }
 
 // replaceWith 落位 → 验明正身 → 换进程，把结论写回 delta。
@@ -391,6 +391,15 @@ func validUpstream(s string) bool {
 		}
 	}
 	return true
+}
+
+// validVersion 判断一个字符串是不是本仓认的版本号形状。
+//
+// 用它而不是 `Compare(s, s)`：拿比较器当校验器读起来像在比什么，实际只关心
+// "解析得出来吗"。
+func validVersion(s string) bool {
+	_, ok := parseVersion(s)
+	return ok
 }
 
 // digestSHA256 把 GitHub 资产的 digest（"sha256:<hex>"）拆成裸 hex。
@@ -440,7 +449,7 @@ func upstreamPluginAsset(rel *ghRelease, plugin string) (upstreamAsset, bool) {
 			continue
 		}
 		ver := strings.TrimSuffix(strings.TrimPrefix(a.Name, prefix), suffix)
-		if _, ok := Compare(ver, ver); !ok {
+		if !validVersion(ver) {
 			continue
 		}
 		if best.name != "" {
