@@ -88,14 +88,39 @@ func newClient(apiBase, assetBase, token, repo string) *client {
 	}
 }
 
+// ghAsset 是发布里的一个资产。
+//
+// Digest 是 GitHub 自己算的 "<algo>:<hex>"。核心仓的插件走 index.json 里的
+// sha256，用不到它；上游仓库没有 index.json，产物只能靠 digest 校验（#53）。
+type ghAsset struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	Digest string `json:"digest"`
+}
+
+// forRepo 是"同一个 api_base / asset_base / token，另一个仓"的 client（#53）。
+//
+// 为什么必须另起一个：repo 是构造期固定的，releases/latest 与资产地址都由它
+// 拼出；而 tags 缓存只按 tag 做键——同一个 tag 名在两个仓含义不同，复用核心
+// 仓的 client 会查到另一个仓的发布。http.Client 与 token 共用（连接池与凭据
+// 都是主机级的），tag 缓存各一份。
+func (c *client) forRepo(repo string) *client {
+	return &client{
+		apiBase:   c.apiBase,
+		assetBase: c.assetBase,
+		token:     c.token,
+		repo:      strings.Trim(repo, "/"),
+		meta:      c.meta,
+		body:      c.body,
+		tags:      map[string]*ghRelease{},
+	}
+}
+
 // ghRelease 是 GitHub「最新发布」接口里本包用到的字段。
 type ghRelease struct {
-	TagName string `json:"tag_name"`
-	Assets  []struct {
-		ID   int64  `json:"id"`
-		Name string `json:"name"`
-		Size int64  `json:"size"`
-	} `json:"assets"`
+	TagName string    `json:"tag_name"`
+	Assets  []ghAsset `json:"assets"`
 }
 
 func (r *ghRelease) asset(name string) (id, size int64, ok bool) {
@@ -245,9 +270,24 @@ func (c *client) get(ctx context.Context, hc *http.Client, rawURL, accept string
 	}
 	if resp.StatusCode/100 != 2 {
 		resp.Body.Close()
-		return nil, fmt.Errorf("请求 %s 返回 %s%s", rawURL, resp.Status, hintFor(resp.StatusCode))
+		return nil, &httpError{url: rawURL, status: resp.Status, hint: hintFor(resp.StatusCode)}
 	}
 	return resp.Body, nil
+}
+
+// httpError 是一次非 2xx 的响应。
+//
+// 独立成类型只为一件事：上游的失败要压成"无法访问：<一句话>"（#53），而
+// 状态码藏在错误串里。Error() 与拆出类型之前的文案逐字一致——核心升级的
+// 失败信息不因为这条改动而变化。
+type httpError struct {
+	url    string
+	status string
+	hint   string
+}
+
+func (e *httpError) Error() string {
+	return "请求 " + e.url + " 返回 " + e.status + e.hint
 }
 
 func (c *client) sameHost(rawURL, base string) bool {
