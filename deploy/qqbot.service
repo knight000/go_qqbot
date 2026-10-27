@@ -2,6 +2,12 @@
 Description=QQ Bot
 After=network-online.target
 Wants=network-online.target
+# 防止 session 配额（1000 天）被重启循环吃掉：配置错就停在 failed 等人看。
+# 这两个键自 v229 起归 [Unit]（[Service] 里只剩废弃别名）。写在 [Service] 时
+# StartLimitIntervalSec 会被忽略并告警，退回默认 10s——配合 RestartSec=10
+# 等于永不触发，防重启循环的闸门形同不存在。
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -38,9 +44,12 @@ Environment=QQBOT_LOCK_DIR=/run/qqbot
 # EnvironmentFile=-/etc/qqbot/env
 Restart=on-failure
 RestartSec=10
-# 防止 session 配额（1000 天）被重启循环吃掉：配置错就停在 failed 等人看
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# 默认 KillMode=control-group 会把 SIGTERM 同时发给插件子进程，核心的
+# 「RPC close → SIGTERM → Kill」三级关停根本没机会跑，于是每次 stop/restart
+# 都刷出三条「插件进程异常退出」的假 ERROR 并白记一次失败计数。
+# mixed 只给主进程发 SIGTERM，等它把插件收干净；超时才对整棵 cgroup 补 SIGKILL。
+KillMode=mixed
+TimeoutStopSec=30
 MemoryMax=256M
 NoNewPrivileges=true
 PrivateTmp=true
