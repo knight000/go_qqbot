@@ -161,6 +161,11 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		upgrade = c.o.UpgradeFor(b, db, plugins)
 	}
 
+	// 主动消息软预算按 Bot 解析（#67）：档名在 config 层翻译成三个数字，
+	// core 只认数字。放在装配层而不是 core 里，是因为"哪个 Bot 用哪一档"
+	// 是配置知识，而 core 一份代码同时服务 N 个租户。
+	quota := c.cfg.QuotaFor(b)
+
 	coreImpl, err := core.New(core.Options{
 		Store: db,
 		API:   apiClient,
@@ -177,7 +182,8 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		Upgrade:  upgrade,
 		// c.jobs 为 nil 时 Scheduler 自建一份容量 4 的池（单 Bot 行为不变）；
 		// 非 nil 时所有 Bot 共享它，并因此各自同时只跑 1 个桶。
-		Jobs: c.jobs,
+		Jobs:  c.jobs,
+		Quota: &quota,
 	})
 	if err != nil {
 		rt.err = err
