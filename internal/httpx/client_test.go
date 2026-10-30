@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -405,5 +406,55 @@ func TestRateLimitCooldownCoversBucketAndResponder(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&srcHits); got != 1 {
 		t.Fatalf("冷却期内不得再出网，源站收到 %d 次", got)
+	}
+}
+
+// 429 冷却桶必须按 Bot 分区：同一个域名，一个 Bot 被罚下不该把另一个 Bot
+// 也一起禁言——那是跨租户污染，它不报错，只让所有人变慢（ADR-0008 决策 14）。
+func TestPartitionKeepsCooldownSeparate(t *testing.T) {
+	var hits int32
+	srv := statusServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "2"}, &hits)
+	root := New(Options{Timeout: time.Second, RatePerMin: 6000, HTTPClient: srv.Client()})
+	a := root.Partition(nil)
+	b := root.Partition(nil)
+
+	if err := a.GetJSON(context.Background(), srv.URL, nil); !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("A 的首个请求应拿到 429，实际 %v", err)
+	}
+	// A 的桶已进入冷却：第二次不出网。
+	if err := a.GetJSON(context.Background(), srv.URL, nil); !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("A 的桶应处于冷却，实际 %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("A 冷却期内不得再出网，平台被打了 %d 次", got)
+	}
+
+	// B 是另一个 Bot：它的桶没被罚过，请求必须真的出网。
+	if err := b.GetJSON(context.Background(), srv.URL, nil); !IsStatus(err, http.StatusTooManyRequests) {
+		t.Fatalf("B 的请求应出网并拿到服务器自己的 429，实际 %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("B 的请求被另一个 Bot 的冷却挡住了：平台只收到 %d 次，应为 2", got)
+	}
+}
+
+// 冷却日志必须点名到 Bot：排障时"谁被罚了、罚多久"只能从这一行看出来。
+func TestCooldownLogNamesTheBot(t *testing.T) {
+	var hits int32
+	srv := statusServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "2"}, &hits)
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, nil)).With("bot", "102000001")
+	c := New(Options{Timeout: time.Second, RatePerMin: 6000, HTTPClient: srv.Client(), Log: log})
+
+	_ = c.GetJSON(context.Background(), srv.URL, nil)
+
+	out := buf.String()
+	for _, want := range []string{"bot=102000001", "冷却", "retry_after"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("冷却日志缺少 %q，实际:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "secret") {
+		t.Fatalf("冷却日志不该出现凭据，实际:\n%s", out)
 	}
 }

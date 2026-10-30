@@ -191,8 +191,10 @@ func run() (*core.RestartRequest, error) {
 	}
 	renderer := render.New(fonts, log.With("component", "render"))
 
-	// 出站客户端进程级共享一份：全局限流与域名桶都挂在这一个实例上，
-	// 每个 Bot 各建一个等于把"每分钟 100 次"放大成 N 倍。
+	// 这是**根**出站客户端：容器按 Bot 从它派生各自的一份
+	// （httpx.Client.Partition）。配置里的额度因此是「每 Bot」的额度——平台
+	// 按 Bot 计额，N 个 Bot 各拿一份不是把 100 次放大成 N 倍，而是把"一个人的
+	// 429"关在它自己的桶里（ADR-0008 决策 14）。根客户端本身不承载请求。
 	hc := httpx.New(httpx.Options{
 		Timeout:          cfg.HTTP.Timeout.Duration,
 		Retries:          cfg.HTTP.Retries,

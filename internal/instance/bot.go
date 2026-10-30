@@ -131,8 +131,13 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		return rt
 	}
 
+	// 每个 Bot 一份出站客户端：429 冷却桶是按域名记的，共享一份等于让一个
+	// 租户的 429 把同进程里所有租户一起禁言（ADR-0008 决策 14）。代价是
+	// 放弃跨 Bot 的连接池复用——隔离正确性优先。
+	outbound := c.outbound.Partition(rt.log.With("component", "httpx"))
+
 	apiClient := api.New(api.Options{
-		HTTP:     c.outbound,
+		HTTP:     outbound,
 		BaseURL:  c.cfg.Core.APIBase,
 		TokenURL: c.cfg.Core.TokenURL,
 		AppID:    b.AppID,
@@ -157,14 +162,22 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 	}
 
 	coreImpl, err := core.New(core.Options{
-		Store:    db,
-		API:      apiClient,
-		HTTP:     c.outbound,
-		Log:      rt.log,
-		Config:   c.cfg,
-		Plugins:  plugins,
-		Renderer: c.o.Renderer,
+		Store: db,
+		API:   apiClient,
+		// 插件出站也走这个 Bot 自己的客户端：域名额度与冷却桶因此按 Bot 分区，
+		// 与核心自身的调用同一份额度（不是两份额度）。
+		HTTP:    outbound,
+		Log:     rt.log,
+		Config:  c.cfg,
+		Plugins: plugins,
+		// 渲染器是进程级共享的一份（字体与内存上限都是全局的），但每个 Bot
+		// 各包一层"同时最多 1 个渲染任务"的闸门：单租户连续提交渲染不该
+		// 把全局那 2 格吃满，让别的租户只能排队。
+		Renderer: renderGateFor(c.o.Renderer),
 		Upgrade:  upgrade,
+		// c.jobs 为 nil 时 Scheduler 自建一份容量 4 的池（单 Bot 行为不变）；
+		// 非 nil 时所有 Bot 共享它，并因此各自同时只跑 1 个桶。
+		Jobs: c.jobs,
 	})
 	if err != nil {
 		rt.err = err

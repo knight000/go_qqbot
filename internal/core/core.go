@@ -35,6 +35,11 @@ type Options struct {
 	// Upgrade 是 /upgrade 依赖的升级能力。nil 表示本进程没有装配自更新
 	// （单测、或未来某个只要网关的精简构建）。
 	Upgrade UpgradeService
+	// Jobs 是本 Core 的调度器要用的并行额度池。多 Bot 装配时由调用方建
+	// **一份**注入所有 Core：全局并行 4 不随 Bot 数增长，每个 Bot 同时只跑
+	// 1 个桶（ADR-0008 决策 13）。nil 表示自建一份容量 4 的池、不按 Bot 串行
+	// ——单 Bot 与测试保持原行为。
+	Jobs *JobPool
 }
 
 type Core struct {
@@ -128,7 +133,7 @@ func New(o Options) (*Core, error) {
 		session = sessionBackend{db: o.Store, router: router, log: logger.With("component", "session")}
 		sessionRowsSrc = sessionRows{o.Store}
 	}
-	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
+	sched := newScheduler(o.Store, logger.With("component", "scheduler"), o.Jobs)
 	// 日预算的切日与 cron 必须同源：都由调度器的 location 决定。
 	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage, sched.Location())
 	sender.trace = trace
