@@ -68,6 +68,9 @@ type Options struct {
 	UpgradeFor func(bot config.Bot, db *store.DB, plugins []host.Plugin) core.UpgradeService
 	// LockWait 是每个 Bot 等单实例锁的上限：/reload 交接给 15s，普通启动 0。
 	LockWait time.Duration
+	// ReconnectBackoff 覆盖 failing 态的重连退避序列，末项即上限。nil 用默认的
+	// 1/2/4/8/16 分钟；测试注入毫秒级，否则一个用例要跑十几分钟。
+	ReconnectBackoff []time.Duration
 }
 
 // Container 是进程级容器：持有共享资源，按配置顺序逐个装配 Bot。
@@ -166,6 +169,9 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 	for _, b := range cfg.Bots {
 		if !b.IsEnabled() {
 			log.Info("Bot 已停用，不连接", "appid", b.AppID)
+			// 停用也要落一行状态：库里留着的 failing/active 会让第二天排障的人
+			// 误判成"它自己挂的"，而实际上是人工关的。
+			c.markSuspended(runCtx, b)
 			continue
 		}
 		// 关停期间不产生新的 Bot 启动：信号可能正好落在两个 Bot 之间。
@@ -349,6 +355,29 @@ func (c *Container) Statuses() []Status {
 		out = append(out, b.status(c.cfg))
 	}
 	return out
+}
+
+// markSuspended 把配置里停用的 Bot 标成 suspended。
+//
+// 只开库写一行就关：不取锁、不装插件、不起核心。状态必须落库——这是"这个
+// Bot 为什么没连"的唯一持久答案，重启之后仍然成立，而日志会被轮转掉。
+func (c *Container) markSuspended(ctx context.Context, b config.Bot) {
+	db, err := store.Open(c.cfg.BotStorePath(b))
+	if err != nil {
+		c.log.Error("停用 Bot 的状态未落库（打开库失败）", "appid", b.AppID, "err", err)
+		return
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.Migrate(ctx); err != nil {
+		c.log.Error("停用 Bot 的状态未落库（迁移失败）", "appid", b.AppID, "err", err)
+		return
+	}
+	st, err := core.ReconcileBotState(ctx, db, false)
+	if err != nil {
+		c.log.Error("停用 Bot 的状态未落库", "appid", b.AppID, "err", err)
+		return
+	}
+	c.log.Info("Bot 状态标记为 suspended", "appid", b.AppID, "state", string(st))
 }
 
 // noteGatewayStart 记一条活着的网关。启动循环用它判断"启动期就全退了"。

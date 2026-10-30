@@ -19,6 +19,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/knight000/go_qqbot/internal/config"
+	"github.com/knight000/go_qqbot/internal/core"
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/store"
 	"github.com/knight000/go_qqbot/pkg/host"
@@ -434,7 +435,7 @@ func testConfig(t *testing.T, p *fakePlatform, appIDs ...string) *config.Config 
 		bots = append(bots, config.Bot{AppID: id, Secret: "secret-" + id, CertType: config.CertPersonal})
 	}
 	stagger := config.Duration{}
-	return &config.Config{
+	cfg := &config.Config{
 		Core: config.Core{
 			APIBase:  p.srv.URL,
 			TokenURL: p.srv.URL + "/token",
@@ -463,6 +464,36 @@ func testConfig(t *testing.T, p *fakePlatform, appIDs ...string) *config.Config 
 			JobRuns:  config.Duration{Duration: 168 * time.Hour},
 		},
 		Log: config.Log{Level: "error", Format: "text"},
+	}
+	return cfg
+}
+
+// seedActiveBots 把每个 Bot 的库预置成 active。
+//
+// 闸门按"admins 为空 → pending_claim"推导（ADR-0008 决策 8），而需要断言
+// "发了消息、回了什么"的用例验的是**已认领**之后的行为：没有这一步，每条
+// 消息都会在第一道闸门被丢掉，容器看起来"连上了但什么都不回"。
+//
+// 只在需要它的用例里调，不放进 testConfig：预置会提前落库文件，而
+// TestShutdownDuringStartupLaunchesNoMoreBots 断言的是"关停之后根本没开库"。
+func seedActiveBots(t *testing.T, cfg *config.Config) {
+	t.Helper()
+	for _, b := range cfg.Bots {
+		db, err := store.Open(cfg.BotStorePath(b))
+		if err != nil {
+			t.Fatalf("预置 %s 的库: %v", b.AppID, err)
+		}
+		if err := db.Migrate(context.Background()); err != nil {
+			_ = db.Close()
+			t.Fatalf("预置 %s 迁移: %v", b.AppID, err)
+		}
+		if err := core.SaveBotState(context.Background(), db, core.BotStateActive); err != nil {
+			_ = db.Close()
+			t.Fatalf("预置 %s 状态: %v", b.AppID, err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("关闭 %s 的库: %v", b.AppID, err)
+		}
 	}
 }
 
