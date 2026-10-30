@@ -35,6 +35,9 @@ type Options struct {
 	// Upgrade 是 /upgrade 依赖的升级能力。nil 表示本进程没有装配自更新
 	// （单测、或未来某个只要网关的精简构建）。
 	Upgrade UpgradeService
+	// BotID 是平台侧的 AppID。它只用于日志与状态（"哪个 Bot 变了状态"），
+	// 不参与鉴权、不落业务表——数据隔离靠一 Bot 一库，不靠这个字段。
+	BotID string
 }
 
 type Core struct {
@@ -82,6 +85,17 @@ type Core struct {
 	// upgrade 是 /upgrade 的升级能力（见 UpgradeService）。nil 时命令仍然
 	// 被核心消费（否则会落到插件路由），回复"未装配"。
 	upgrade UpgradeService
+
+	// botID 是平台侧 AppID，只用于日志与状态变更。
+	botID string
+
+	// stateMu 保护 Bot 状态机的全部可变部分：缓存状态、连续鉴权失败计数、
+	// 按状态的丢弃计数。它们都在 Handle 的热路径上，必须一把锁、不能查库。
+	stateMu    sync.Mutex
+	state      BotState
+	stateKnown bool
+	authFails  int
+	dropped    map[BotState]int64
 }
 
 func New(o Options) (*Core, error) {
@@ -144,7 +158,7 @@ func New(o Options) (*Core, error) {
 		info = o.API
 	}
 
-	return &Core{
+	c := &Core{
 		store:     o.Store,
 		cfg:       o.Config,
 		api:       info,
@@ -162,7 +176,16 @@ func New(o Options) (*Core, error) {
 		restart:   make(chan RestartRequest, 1),
 		gcDone:    make(chan struct{}),
 		upgrade:   o.Upgrade,
-	}, nil
+		botID:     o.BotID,
+		dropped:   make(map[BotState]int64, 4),
+	}
+	// 出站成败必须回灌到状态机：连续鉴权类失败是"这个 Bot 的身份已不可用"的
+	// 唯一信号（平台没有状态查询接口）。包一层而不是在三个发送出口各写一次，
+	// 否则漏掉一条通道就等于漏掉那条通道的鉴权失败。
+	if o.API != nil {
+		sender.api = stateTrackingAPI{inner: o.API, notify: c.noteSendResult}
+	}
+	return c, nil
 }
 
 // 插件装配阶段的期限。Init 与 Start 都是一次请求-应答握手，插件不回帧时
@@ -352,7 +375,13 @@ func (c *Core) waitGCLoop(ctx context.Context) error {
 	}
 }
 
-// Handle 是接入层唯一入口：群准入 → 去重 → 落库 → 核心保留指令 → 路由。
+// Handle 是接入层唯一入口，顺序固定为：
+//
+//	Bot 闸门 → 去重 → 群准入 → 生命周期 → 权限 → 路由
+//
+// 顺序本身就是需求（ADR-0008 决策 7）：闸门在去重之前，才能保证非 active 的
+// 事件**连幂等表都不进**——pending_claim 的 Bot 收到多少条消息，库里都该是
+// 零行，否则一次认领之前的推送会在表里留下永久噪音。
 func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	if ev == nil {
 		c.log.Warn("丢弃空事件")
@@ -378,23 +407,10 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		return
 	}
 
-	// 群准入：在去重与落库之前判定，未授权的群不会留下任何业务数据。
-	// 两个例外：
-	//   - Bot 管理员的 /group 指令，否则新群无法在群内自助接入；
-	//   - 群生命周期通知（入群/退群），见下。
-	//
-	// 生命周期通知不走闸门：它们描述的是机器人自身的状态变化，不是群里的消息。
-	// 新群此刻必然还没被放行，走闸门就会被丢掉，结果是"被谁拉进了哪个群"
-	// 永远没人知道。它们照样参与后面的去重。
-	if ev.Notice == host.NoticeNone {
-		if allowed, g, reason := c.groupAccess(ctx, ev); !allowed {
-			if !c.groupControlExempt(ctx, ev, g) {
-				c.trace.GroupDropped(ev, reason)
-				c.log.Debug("群未放行，丢弃事件",
-					"peer", ev.PeerID, "mode", g.Mode, "reason", reason)
-				return
-			}
-		}
+	// 第一道闸门只判 Bot 状态。非 active 的事件在这里终止：不落库、不进幂等表、
+	// 不进权限判定、不到插件。
+	if !c.botGate(ctx, ev) {
+		return
 	}
 
 	seen, err := c.store.MarkEventSeen(ctx, ev.ID)
@@ -407,6 +423,26 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		c.trace.Duplicate(ev)
 		c.log.Debug("重复事件，忽略", "event", ev.ID)
 		return
+	}
+
+	// 群准入：排在去重之后、落库之前。未授权的群不会留下任何业务数据；
+	// 它们会进幂等表，这是刻意的——平台重投同一条未放行事件时不该重复判定。
+	// 两个例外：
+	//   - Bot 管理员的 /group 指令，否则新群无法在群内自助接入；
+	//   - 群生命周期通知（入群/退群），见下。
+	//
+	// 生命周期通知不走群准入：它们描述的是机器人自身的状态变化，不是群里的消息。
+	// 新群此刻必然还没被放行，走准入就会被丢掉，结果是"被谁拉进了哪个群"
+	// 永远没人知道。它们照样受 Bot 闸门约束——Bot 停摆时连"被拉群"都不该记账。
+	if ev.Notice == host.NoticeNone {
+		if allowed, g, reason := c.groupAccess(ctx, ev); !allowed {
+			if !c.groupControlExempt(ctx, ev, g) {
+				c.trace.GroupDropped(ev, reason)
+				c.log.Debug("群未放行，丢弃事件",
+					"peer", ev.PeerID, "mode", g.Mode, "reason", reason)
+				return
+			}
+		}
 	}
 
 	// 生命周期处理必须排在去重之后：平台重投同一条入群事件时，
