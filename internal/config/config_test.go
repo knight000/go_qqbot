@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -464,6 +465,96 @@ data_dir = "/var/lib/qqbot/manual"
 	}
 	if got, want := cfg.BotDataDir(cfg.Bots[1]), "/var/lib/qqbot/manual"; got != want {
 		t.Errorf("data_dir 覆盖未生效: %q", got)
+	}
+}
+
+// 一 Bot 一库：库文件必须落在该 Bot 自己的数据目录里，且与日志、单实例锁
+// 用同一处推导。两个 appid 的库路径不能相同——那正是物理隔离要保证的事。
+func TestBotStorePathFollowsDataDir(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[store]
+path = "./srv/qqbot.db"
+
+[[bots]]
+appid = "102000001"
+secret = "s"
+
+[[bots]]
+appid = "102000002"
+secret = "s"
+data_dir = "/var/lib/qqbot/manual"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := cfg.BotStorePath(cfg.Bots[0]), cfg.BotStorePath(cfg.Bots[1])
+	if want := filepath.Join("srv", "bots", "102000001", "qqbot.db"); first != want {
+		t.Errorf("推导的库路径 = %q，期望 %q", first, want)
+	}
+	if want := filepath.Join("/var/lib/qqbot/manual", "qqbot.db"); second != want {
+		t.Errorf("data_dir 覆盖后的库路径 = %q，期望 %q", second, want)
+	}
+	if first == second {
+		t.Fatalf("两个 Bot 的库路径不能相同: %q", first)
+	}
+}
+
+// 启动错峰的默认值必须自己生效：写 [[bots]] 的人不该为了"别撞 2 QPM"
+// 去翻文档发现还得配一个键。显式 0s 是"不错峰"，与"没写"必须分得开。
+func TestGatewayStaggerDefaultsAndCanBeDisabled(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	cases := []struct {
+		name string
+		body string
+		want time.Duration
+	}{
+		{"没写用默认", "", DefaultGatewayStagger},
+		{"显式 0s 不错峰", "gateway_stagger = \"0s\"", 0},
+		{"可配置", "gateway_stagger = \"2s\"", 2 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := writeConfig(t, `
+[bot]
+`+c.body+`
+
+[[bots]]
+appid = "102000001"
+secret = "s"
+`)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("加载配置: %v", err)
+			}
+			if got := cfg.Bot.GatewayStaggerInterval(); got != c.want {
+				t.Fatalf("gateway_stagger 生效值 = %s，期望 %s", got, c.want)
+			}
+		})
+	}
+}
+
+// 负间隔是笔误，不是"更快的错峰"：串行加间隔只能变慢。写 0s 才是关掉。
+func TestNegativeGatewayStaggerRejected(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[bot]
+gateway_stagger = "-1s"
+
+[[bots]]
+appid = "102000001"
+secret = "s"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("负的 gateway_stagger 应当被拒绝")
+	}
+	if !strings.Contains(err.Error(), "gateway_stagger") {
+		t.Fatalf("错误应点名 gateway_stagger，实际: %v", err)
 	}
 }
 

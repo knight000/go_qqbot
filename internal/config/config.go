@@ -245,6 +245,15 @@ func (c *Config) BotDataDir(b Bot) string {
 	return filepath.Join(filepath.Dir(c.Store.Path), "bots", b.AppID)
 }
 
+// BotStorePath 返回这个 Bot 的 SQLite 路径：<BotDataDir>/qqbot.db。
+//
+// 一 Bot 一库（ADR-0008 决策 1）：库文件落在该 Bot 自己的数据目录里，
+// 备份、迁移、清理某一户时不会碰到别人。启动期开库、单实例锁与启动日志
+// 都必须用这一处推导，否则"日志说在 A、实际打开 B"这类问题无从排查。
+func (c *Config) BotStorePath(b Bot) string {
+	return filepath.Join(c.BotDataDir(b), "qqbot.db")
+}
+
 // LegacyApp 是旧形态的单个 `[app]` 段。
 //
 // 它只在 Load 期间被翻译成 Bots[0] 与 [core] 的平台端点，翻译之后运行期不再
@@ -262,14 +271,38 @@ type LegacyApp struct {
 //
 // 它至今仍是进程级的一份（全部 Bot 共用），与 `[[bots]]` 只差一个 s——这两个
 // 名字挨得太近，注释在这里写明：`[bot]` 是连接参数，`[[bots]]` 是 Bot 列表。
-// 每 Bot 独立的连接参数（intents 与分片）属于启动编排那一票的事，本包不动。
+// 每 Bot 独立的连接参数（intents 与分片）属于后续票的事，本包不动。
 type BotOptions struct {
 	Intents    uint64 `toml:"intents"`
 	ShardTotal int    `toml:"shard_total"`
 	ShardID    int    `toml:"shard_id"`
 	Resume     bool   `toml:"resume"`
+	// GatewayStagger 是相邻两个 Bot 取 GET /gateway/bot 之间的最小间隔。
+	//
+	// 该接口限 2 QPM，而"按 AppID 还是按 IP 计量"平台没有说明。按 IP 的话
+	// N 个 Bot 同时启动会互相挤配额，所以默认串行并留 30s 间隔。
+	// 用指针区分"没写"（默认 30s）与显式 `0s`（不错峰，只在确认按 AppID
+	// 计量之后才该这么配）。
+	GatewayStagger *Duration `toml:"gateway_stagger"`
 }
 
+// DefaultGatewayStagger 是启动错峰的默认间隔（对齐 GET /gateway 的 2 QPM）。
+const DefaultGatewayStagger = 30 * time.Second
+
+// GatewayStaggerInterval 返回启动错峰的实际间隔；0 表示不错峰。
+func (o BotOptions) GatewayStaggerInterval() time.Duration {
+	if o.GatewayStagger == nil {
+		return DefaultGatewayStagger
+	}
+	return o.GatewayStagger.Duration
+}
+
+// Store 是数据目录的定位锚点。
+//
+// 一 Bot 一库之后 Path 指向的文件本身不再被打开：它的**目录**是 datadir
+// （升级标记、插件产物都在这一层），每个 Bot 的库在
+// <datadir>/bots/<appid>/qqbot.db（见 BotStorePath）。保留这个键是为了
+// 不破坏既有配置——"数据放哪一层"仍然由它决定。
 type Store struct {
 	Path string `toml:"path"`
 }
@@ -735,6 +768,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Bot.ShardID < 0 || c.Bot.ShardID >= c.Bot.ShardTotal {
 		problems = append(problems, fmt.Sprintf("[bot].shard_id=%d 超出 [0,%d)", c.Bot.ShardID, c.Bot.ShardTotal))
+	}
+	// 负间隔没有意义：串行与间隔只能加长启动，不能倒着来。显式 0 合法
+	// （关掉错峰），所以要按指针判而不是按值判。
+	if c.Bot.GatewayStagger != nil && c.Bot.GatewayStagger.Duration < 0 {
+		problems = append(problems, fmt.Sprintf(
+			"[bot].gateway_stagger=%s 不能为负（写 \"0s\" 表示不错峰）", c.Bot.GatewayStagger.Duration))
 	}
 	if strings.TrimSpace(c.Store.Path) == "" {
 		problems = append(problems, "store.path 为空")

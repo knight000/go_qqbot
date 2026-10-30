@@ -75,6 +75,13 @@ type Options struct {
 	Plugins []LoadedPlugin
 	// Snapshots 提供库快照；nil 表示这次装配没有数据库。
 	Snapshots Snapshotter
+	// SnapshotRoot 决定快照落在哪个 snapshots/ 子目录；空表示与标记同一个
+	// 目录（<DataDir>/upgrade）。
+	//
+	// 多 Bot 时必须按 Bot 传：快照按"保留最近 2 份"裁剪，共用目录会让两个租户
+	// 互相删备份——而 state.json 是**进程级**的 pending 标记（回滚要重新 exec
+	// 整个二进制），绝不能跟着按 Bot 分。
+	SnapshotRoot string
 	// ProbeTimeout 覆盖"验明正身"那次 `--manifest` 的期限（测试用）。
 	ProbeTimeout time.Duration
 	Log          *slog.Logger
@@ -333,7 +340,11 @@ func (u *Upgrader) apply(ctx context.Context) (*Plan, error) {
 	}
 
 	// 1. 快照。必须早于任何落位动作：回滚二进制不等于回滚 schema。
-	snap, err := TakeSnapshot(ctx, p.StateDir, u.opt.Snapshots, u.now())
+	snapRoot := u.opt.SnapshotRoot
+	if snapRoot == "" {
+		snapRoot = p.StateDir
+	}
+	snap, err := TakeSnapshot(ctx, snapRoot, u.opt.Snapshots, u.now())
 	if err != nil {
 		return nil, err
 	}
