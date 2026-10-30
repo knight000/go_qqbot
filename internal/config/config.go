@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -47,19 +48,22 @@ type Config struct {
 	Bots []Bot `toml:"bots"`
 	// App 是旧形态的单 Bot 段，只为"老配置不改也能起"存在：Load 会把它
 	// 翻译成 Bots[0] 与 Core 的平台端点，之后运行期一律看 Bots。
-	App        LegacyApp  `toml:"app"`
-	Bot        BotOptions `toml:"bot"`
-	Store      Store      `toml:"store"`
-	Retention  Retention  `toml:"retention"`
-	Media      Media      `toml:"media"`
-	HTTP       HTTP       `toml:"http"`
-	Active     Active     `toml:"active"`
-	Permission Permission `toml:"permission"`
-	Group      Group      `toml:"group"`
-	Log        Log        `toml:"log"`
-	Debug      Debug      `toml:"debug"`
-	Plugins    Plugins    `toml:"plugins"`
-	Upgrade    Upgrade    `toml:"upgrade"`
+	App       LegacyApp  `toml:"app"`
+	Bot       BotOptions `toml:"bot"`
+	Store     Store      `toml:"store"`
+	Retention Retention  `toml:"retention"`
+	Media     Media      `toml:"media"`
+	HTTP      HTTP       `toml:"http"`
+	Active    Active     `toml:"active"`
+	// Quota 是 `[quota.<档名>]` 软预算表，[[bots]].quota_profile 指向它的键。
+	// 用 map 而不是几个固定字段：加一档是运维动作，不该改代码。
+	Quota      map[string]QuotaProfile `toml:"quota"`
+	Permission Permission              `toml:"permission"`
+	Group      Group                   `toml:"group"`
+	Log        Log                     `toml:"log"`
+	Debug      Debug                   `toml:"debug"`
+	Plugins    Plugins                 `toml:"plugins"`
+	Upgrade    Upgrade                 `toml:"upgrade"`
 	// Warnings 是 Load 收集的"这份配置能用，但有一处写法必须让人知道"的提示。
 	// 启动期原样打 warn（见 cmd/bot/main.go）。它不进 TOML、不参与校验：
 	// 一旦变成错误，用户会在升级机器人的路上被一条风格问题拦住。
@@ -194,8 +198,74 @@ const (
 	CertEnterprise = "enterprise"
 )
 
-// DefaultQuotaProfile 是配额档名的缺省值。配额表在 T7 落地，本版本只承载档名。
+// DefaultQuotaProfile 是配额档名的缺省值。
 const DefaultQuotaProfile = "default"
+
+// 平台真相（#67 查证，ADR-0008 决策 12）：频控只有两条维度——
+//   - Bot 维度：群聊 60 qpm；单聊 10 qps（未认证更低，但企业/个人认证相同）；
+//   - 每关系（群/用户）每天 1000 条。
+//
+// 平台**没有** Bot 级日总量，所以档位也只照抄这两条，不造总量。
+const (
+	platformGroupQPM     = 60
+	platformSingleQPS    = 10
+	platformDailyPerPeer = 1000
+)
+
+// 默认档取平台值的 50%，留突发余量（ADR-0008 决策 12）。
+//
+// 单聊那一档要做一次量纲换算：平台给的是 10 qps，而我们的桶是分钟桶。
+// 直接把 10 当"每分钟 10 条"是**过量收紧**（等于平台值的 1/60），一秒
+// 10 条的突发会被整分钟卡死；直接把 10 qps 当"每分钟 600 条"又丢掉了
+// 秒级突发约束。取 600 的一半（300/min）是用 50% 吸收换量纲带来的偏差：
+// 长期均值远低于平台，突发仍可能撞平台 qps 上限——那时 429 会按冷却处理，
+// 本地预算本来就不承担"精确复刻平台"的职责。
+const (
+	DefaultGroupQPM     = platformGroupQPM / 2       // 30/min
+	DefaultSingleQPM    = platformSingleQPS * 60 / 2 // 300/min
+	DefaultDailyPerPeer = platformDailyPerPeer / 2   // 500/天
+)
+
+// QuotaProfile 是 `[quota.<档名>]` 一档主动消息软预算。
+//
+// 三个维度都对应平台的真实量纲（见上），字段缺省（0）取默认档的值：
+// 少写一项不该意味着"这一维不限"——静默不限正是软预算最不该出现的形态。
+type QuotaProfile struct {
+	// SingleQPM 是单聊每分钟上限（Bot 级，跨所有单聊会话合计）。
+	SingleQPM int `toml:"single_qpm"`
+	// GroupQPM 是群聊每分钟上限（Bot 级，跨所有群合计）。
+	GroupQPM int `toml:"group_qpm"`
+	// DailyPerPeer 是每个（场景, 收件人）每天的上限。
+	DailyPerPeer int `toml:"daily_per_peer"`
+}
+
+// withQuotaDefaults 把 0 字段补成默认档的值；负值原样保留，交给 Validate
+// 报错（0 是"没写"，负数一定是笔误）。
+func withQuotaDefaults(p QuotaProfile) QuotaProfile {
+	if p.SingleQPM == 0 {
+		p.SingleQPM = DefaultSingleQPM
+	}
+	if p.GroupQPM == 0 {
+		p.GroupQPM = DefaultGroupQPM
+	}
+	if p.DailyPerPeer == 0 {
+		p.DailyPerPeer = DefaultDailyPerPeer
+	}
+	return p
+}
+
+// QuotaFor 返回这个 Bot 解析后的额度——**纯数字**，核心不认档名。
+//
+// 档名不存在时回退默认档：Load 会同时记一条 warn（不静默），运行期则保持
+// "有一份保守预算"而不是"这一维不限"。改名/删档的中间态因此不会把某个
+// 租户变成不限量。
+func (c *Config) QuotaFor(b Bot) QuotaProfile {
+	p, ok := c.Quota[b.QuotaProfile]
+	if !ok {
+		p = c.Quota[DefaultQuotaProfile]
+	}
+	return withQuotaDefaults(p)
+}
 
 // Bot 是 `[[bots]]` 的一项：一个平台 Bot 的凭据与身份声明。
 //
@@ -341,9 +411,16 @@ type HTTP struct {
 // Active 是主动消息策略。Enabled 用指针区分"未配置"与"显式关闭"：
 // 未配置时按开启处理（启动通知依赖它），显式写 false 才真正关掉。
 type Active struct {
-	Enabled      *bool    `toml:"enabled"`
-	Plugins      []string `toml:"plugins"`
-	DailyPerPeer int      `toml:"daily_per_peer"`
+	Enabled *bool    `toml:"enabled"`
+	Plugins []string `toml:"plugins"`
+	// DailyPerPeer 是每个收件人每日上限的可用全局覆盖，0 表示跟随
+	// `[quota.<档名>].daily_per_peer`。
+	//
+	// 保留它是为了"临时全开/收紧"这一个运维动作：档位是每 Bot 的长期策略，
+	// 而偶尔需要一次全局收紧时不该去改每一条 [[bots]]。默认值改成了 0（跟随
+	// 档位）——#67 之前这里硬编码 5，与平台 1000/天 相差 200 倍，档位一落地
+	// 就不该再有两份互不相干的事实。
+	DailyPerPeer int `toml:"daily_per_peer"`
 }
 
 // ActiveEnabled 返回主动消息总开关的最终值。
@@ -639,6 +716,7 @@ func (c *Config) applyDefaults() {
 			b.QuotaProfile = DefaultQuotaProfile
 		}
 	}
+	c.applyQuotaDefaults()
 	// Core 所有者的 openid 只做 Trim 与去空：空串永远匹配不上任何发送者
 	// （平台的 openid 非空），留在列表里只会让"我明明写了 owner"更难排查。
 	if len(c.Core.Owners) > 0 {
@@ -696,9 +774,8 @@ func (c *Config) applyDefaults() {
 	if len(c.Active.Plugins) == 0 {
 		c.Active.Plugins = []string{"bootnotice"}
 	}
-	if c.Active.DailyPerPeer <= 0 {
-		c.Active.DailyPerPeer = 5
-	}
+	// DailyPerPeer 的 0 保留下来表示"跟随配额档"，不再在这里拍一个 5：
+	// 那个数只是 #67 之前的占位值，与平台 1000/天 没有任何关系。
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
@@ -717,6 +794,71 @@ func (c *Config) applyDefaults() {
 	if c.Upgrade.AssetBase == "" {
 		c.Upgrade.AssetBase = "https://github.com"
 	}
+}
+
+// applyQuotaDefaults 保证默认档一定存在，并给每一条 [[bots]] 检查档名。
+//
+// 档名不存在只 warn 不报错：一个笔误不该让整台机器上的所有 Bot 都起不来，
+// 但也绝不能静默变成"不限量"——QuotaFor 会回退默认档，这条 warn 说明回退
+// 发生了、以及可用的档位有哪些。
+func (c *Config) applyQuotaDefaults() {
+	if c.Quota == nil {
+		c.Quota = make(map[string]QuotaProfile)
+	}
+	c.Quota[DefaultQuotaProfile] = withQuotaDefaults(c.Quota[DefaultQuotaProfile])
+
+	names := make([]string, 0, len(c.Quota))
+	for name := range c.Quota {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for i, b := range c.Bots {
+		if _, ok := c.Quota[b.QuotaProfile]; ok {
+			continue
+		}
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"%s.quota_profile=%q 不存在，已回退到 %q 档（可用档位：%s）",
+			botLabel(i, b), b.QuotaProfile, DefaultQuotaProfile, strings.Join(names, " / ")))
+	}
+}
+
+// quotaProblems 校验配额表本身。名字里带上**用到这一档的 Bot**：
+// 一份多租户配置里 quota.tight 写错时，运维需要知道谁在受这条错误影响。
+func (c *Config) quotaProblems() []string {
+	usedBy := make(map[string][]string, len(c.Quota))
+	for i, b := range c.Bots {
+		usedBy[b.QuotaProfile] = append(usedBy[b.QuotaProfile], botLabel(i, b))
+	}
+	names := make([]string, 0, len(c.Quota))
+	for name := range c.Quota {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var problems []string
+	for _, name := range names {
+		p := c.Quota[name]
+		who := "未被任何 Bot 使用"
+		if users := usedBy[name]; len(users) > 0 {
+			who = "被 " + strings.Join(users, "、") + " 使用"
+		}
+		for _, f := range []struct {
+			key string
+			val int
+		}{
+			{"single_qpm", p.SingleQPM},
+			{"group_qpm", p.GroupQPM},
+			{"daily_per_peer", p.DailyPerPeer},
+		} {
+			if f.val < 0 {
+				problems = append(problems, fmt.Sprintf(
+					"[quota.%s].%s=%d 非法（不能为负；0 表示取默认档值；%s）",
+					name, f.key, f.val, who))
+			}
+		}
+	}
+	return problems
 }
 
 func (c *Config) Validate() error {
@@ -766,6 +908,7 @@ func (c *Config) Validate() error {
 				"%s.quota_profile=%q 非法（只允许字母、数字、下划线与连字符）", label, b.QuotaProfile))
 		}
 	}
+	problems = append(problems, c.quotaProblems()...)
 	if c.Bot.ShardID < 0 || c.Bot.ShardID >= c.Bot.ShardTotal {
 		problems = append(problems, fmt.Sprintf("[bot].shard_id=%d 超出 [0,%d)", c.Bot.ShardID, c.Bot.ShardTotal))
 	}

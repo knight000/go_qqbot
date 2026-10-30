@@ -38,7 +38,7 @@ enabled = true
 # 认证类型：unverified | personal | enterprise，缺省 personal。
 # 它决定平台把这个 Bot 的事件推给谁（见 GLOSSARY「认证类型」），核心不做来源判定。
 cert_type = "personal"
-# 配额档：指向全局配额表，缺省 default（配额表尚未落地，当前只做承载与校验）。
+# 配额档：指向下面的 [quota.<档名>]，缺省 default。
 quota_profile = "default"
 # 数据目录，缺省为 [store].path 所在目录下的 bots/<appid>/
 # data_dir = "./data/bots/102xxxxx"
@@ -91,12 +91,33 @@ rate_per_min = 100
 # "api.torn.com" = 800
 
 [active]
-# 主动消息总开关。平台每日额度约 1000 条/用户，本地另设更严的每日预算。
-# 只有下面白名单里的插件能发；其余插件调用 SendActive 直接返回"未开启"。
+# 主动消息总开关。只有下面白名单里的插件能发；其余插件调用 SendActive 直接
+# 返回"未开启"。被动回复不受这两道闸门影响。
 enabled = true
 plugins = ["bootnotice"]
-# 每 (场景, 收件人) 每日上限。启动通知每次进程启动才发 1 条。
-daily_per_peer = 5
+# 每个 (场景, 收件人) 每日上限的全局覆盖。0（默认）= 跟随该 Bot 的配额档
+# [quota.<档名>].daily_per_peer。留着这个键只是为了"临时全局收紧"这一个动作。
+# daily_per_peer = 5
+
+# 软预算档位（ADR-0008 决策 12）。超限拒发且返回可判定的错误；被动回复不受限；
+# 不排队到次日（零点尖峰正撞平台频控与 429）。优先级：429 冷却 > 软预算。
+#
+# 量纲照抄平台，不设 Bot 级日总量：
+#   群聊 60 qpm（Bot 级）、单聊 10 qps（Bot 级）、每关系每天 1000 条。
+# default 档取平台值的 50%，留突发余量；单聊那一维把 10 qps 按 ×60 折成
+# 600/min 再取一半 = 300/min（分钟桶装不下 qps，50% 就是给这个换算留的余量）。
+# 三项写 0 或整段省略都等于取默认档的值——不允许"某一维不限"。
+[quota.default]
+single_qpm = 300       # 单聊每分钟（全部单聊会话合计）
+group_qpm = 30         # 群聊每分钟（全部群合计）
+daily_per_peer = 500   # 每个（群/用户）每天
+
+# 需要更紧的一档时，加一个 [quota.<档名>]，再把 [[bots]].quota_profile 指过去。
+# 档名不存在会回退 default 并在启动日志里 warn（不静默变成不限量）。
+# [quota.tight]
+# single_qpm = 60
+# group_qpm = 10
+# daily_per_peer = 50
 
 [log]
 level = "info"    # debug | info | warn | error
