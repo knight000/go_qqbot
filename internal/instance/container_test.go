@@ -399,3 +399,26 @@ func TestRateLimitOnOneBotDoesNotSilenceTheOther(t *testing.T) {
 		t.Fatalf("A 应有过 1 次发消息尝试（被平台 429），实际 %d", n)
 	}
 }
+
+// 多 Bot 时装配层要建一份共享的任务额度池，只有一个启用的 Bot 时不建。
+//
+// 这条看的是装配事实（容器字段）而不是外部行为：并行度的效果已在 core 侧
+// 按"全局 4 / 每 Bot 1"有用例，这里只防一个不会报错的疏漏——忘了建池或忘了
+// 注入时，功能会静默退回 4×N，没有任何日志能看出来。
+func TestJobPoolIsSharedOnlyWhenMultipleBots(t *testing.T) {
+	t.Run("两个 Bot 共享一份池", func(t *testing.T) {
+		p := newFakePlatform(t)
+		c := startContainer(t, testConfig(t, p, "102000001", "102000002"), p)
+		if c.jobs == nil {
+			t.Fatal("多 Bot 时必须建进程级共享池（否则并行度是 4×N）")
+		}
+	})
+
+	t.Run("单个 Bot 保持自建", func(t *testing.T) {
+		p := newFakePlatform(t)
+		c := startContainer(t, testConfig(t, p, "102000001"), p)
+		if c.jobs != nil {
+			t.Fatal("只有唯一租户时不该注入共享池（并行度会被砍到 1）")
+		}
+	})
+}

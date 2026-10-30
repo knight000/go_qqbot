@@ -175,6 +175,9 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		// 把全局那 2 格吃满，让别的租户只能排队。
 		Renderer: renderGateFor(c.o.Renderer),
 		Upgrade:  upgrade,
+		// c.jobs 为 nil 时 Scheduler 自建一份容量 4 的池（单 Bot 行为不变）；
+		// 非 nil 时所有 Bot 共享它，并因此各自同时只跑 1 个桶。
+		Jobs: c.jobs,
 	})
 	if err != nil {
 		rt.err = err

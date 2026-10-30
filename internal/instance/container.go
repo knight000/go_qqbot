@@ -84,6 +84,9 @@ type Container struct {
 
 	outbound *httpx.Client // 根客户端，只供 Partition 派生（见 Options.Outbound）
 	stagger  *Stagger
+	// jobs 是多 Bot 时的共享任务桶额度池；nil 表示每个 Core 自建一份容量 4
+	// 的池（单 Bot 与"只有一个启用的 Bot"时都是这个形态，行为与旧版一致）。
+	jobs *core.JobPool
 	ctx      context.Context
 	cancel   context.CancelFunc
 
@@ -163,6 +166,14 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 	log.Info("开始启动 Bot",
 		"bots", len(cfg.Bots), "enabled", enabled,
 		"stagger", c.stagger.Interval().String())
+
+	// 多 Bot 时任务桶共享一份池：调度桶并行 4 是按进程内存实测调的，每个
+	// Core 各持一份等于 4×N，且一个租户能占满自己那 4 格（ADR-0008 决策 13）。
+	// 只有一个启用的 Bot 时不注入：那时它就是唯一租户，凭空把并行砍到 1
+	// 只是让慢任务更慢。
+	if enabled > 1 {
+		c.jobs = core.NewJobPool()
+	}
 
 	startedAt := time.Now()
 	started := 0
