@@ -39,6 +39,23 @@ const activeUsageTableDDL = `CREATE TABLE IF NOT EXISTS active_usage (
 		PRIMARY KEY (day, scene, peer)
 	)`
 
+// activeRateTableDDL 是主动消息的**每分钟**账本（#67 软预算）。
+//
+// 与 active_usage 分开两张表，不往它里面塞分钟键：
+//   - 两者的主键维度不同——日额度按 (天, 场景, 收件人)，分钟额度按
+//     (分钟, 场景)（平台频控是 Bot 级，不是按会话）；
+//   - 生命周期不同——日行要留一整天，分钟行一小时后就该清掉。混在一张表里
+//     要么把分钟行留一天（无谓膨胀），要么给日行加过期列（多一套判据）。
+//
+// minute 取调度时区（Asia/Shanghai，与 cron、日额度同源）的
+// YYYY-MM-DDTHH:MM，跨分钟就是新主键，换桶不需要任何重置动作。
+const activeRateTableDDL = `CREATE TABLE IF NOT EXISTS active_rate (
+		minute TEXT NOT NULL,
+		scene  TEXT NOT NULL,
+		used   INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (minute, scene)
+	)`
+
 // sessionTableDDL 单独提出来只为读得清楚：它是"隐式路由"的唯一事实源，
 // 主键选择本身就是 ADR-0004 决策 1 的落地。
 //
@@ -107,6 +124,11 @@ var schema = []string{
 	// 与 cron 同源，由核心注入）的 YYYY-MM-DD，跨日就是新主键，
 	// 换桶不需要任何重置动作。
 	activeUsageTableDDL,
+
+	// active_rate 是同一套账的分钟维度（#67）。同样是"发送前一条 upsert
+	// 原子地检查 + 自增"：重启不清零、并发与多进程都不会超发。
+	// 旧库升级不需要迁移，幂等 DDL 直接建出来。
+	activeRateTableDDL,
 
 	adminTableDDL,
 

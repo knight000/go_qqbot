@@ -36,6 +36,14 @@ func (f quotaUsageStore) TakeActiveBudget(context.Context, store.ActiveUsageKey,
 
 func (f quotaUsageStore) RefundActiveBudget(context.Context, store.ActiveUsageKey) error { return nil }
 
+// 分钟额度：本文件里的策略都没设 GroupPerMin/SinglePerMin（0 = 不限），
+// 所以这两个方法不会被调用；实现出来只为满足接口。
+func (f quotaUsageStore) TakeActiveRate(context.Context, store.ActiveRateKey, int) (bool, error) {
+	return true, nil
+}
+
+func (f quotaUsageStore) RefundActiveRate(context.Context, store.ActiveRateKey) error { return nil }
+
 // hostSentinel 是一个待验收的哨兵；name 只用于报错信息。
 type hostSentinel struct {
 	name string

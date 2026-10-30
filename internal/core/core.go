@@ -43,6 +43,10 @@ type Options struct {
 	// 1 个桶（ADR-0008 决策 13）。nil 表示自建一份容量 4 的池、不按 Bot 串行
 	// ——单 Bot 与测试保持原行为。
 	Jobs *JobPool
+	// Quota 是这个 Bot 解析后的主动消息软预算（纯数字，档名在 config 层
+	// 就解析掉了）。nil 表示按 [quota.default] / [active].daily_per_peer
+	// 推导——单 Bot 与测试走这条路。
+	Quota *config.QuotaProfile
 }
 
 type Core struct {
@@ -149,7 +153,13 @@ func New(o Options) (*Core, error) {
 	}
 	sched := newScheduler(o.Store, logger.With("component", "scheduler"), o.Jobs)
 	// 日预算的切日与 cron 必须同源：都由调度器的 location 决定。
-	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage, sched.Location())
+	policy := activePolicy(o.Config, o.Quota)
+	sender := NewSender(o.API, logger.With("component", "sender"), policy, usage, sched.Location())
+	// 超限通知要读"谁是 Bot 所有者"与"今天通知过没有"；nil 的 *store.DB
+	// 装进接口会是个非 nil 接口，所以显式判空。
+	if o.Store != nil {
+		sender.notices = o.Store
+	}
 	sender.trace = trace
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
 	dispatch.trace = trace
@@ -500,16 +510,31 @@ func (c *Core) replyText(ctx context.Context, ev *host.Event, text string) {
 func (c *Core) PrintRaw(typ string, raw []byte) { c.trace.Raw(typ, raw) }
 
 // activePolicy 把配置转成 Sender 用的闸门。白名单为空表示谁都不能发主动消息。
-func activePolicy(cfg *config.Config) ActivePolicy {
+//
+// quota 为 nil 时按默认档推导（单 Bot 与测试）；非 nil 时用装配层解析好的
+// 那几个数字，core 因此不需要认识档名。
+func activePolicy(cfg *config.Config, quota *config.QuotaProfile) ActivePolicy {
 	allowed := make(map[string]bool, len(cfg.Active.Plugins))
 	for _, name := range cfg.Active.Plugins {
 		allowed[name] = true
 	}
-	return ActivePolicy{
+	q := cfg.QuotaFor(config.Bot{})
+	if quota != nil {
+		q = *quota
+	}
+	p := ActivePolicy{
 		Enabled:      cfg.ActiveEnabled(),
 		Plugins:      allowed,
-		DailyPerPeer: cfg.Active.DailyPerPeer,
+		DailyPerPeer: q.DailyPerPeer,
+		GroupPerMin:  q.GroupQPM,
+		SinglePerMin: q.SingleQPM,
 	}
+	// [active].daily_per_peer 是全局的临时覆盖（0 = 跟随档位）。它排在档位
+	// 之后：档位是每 Bot 的长期策略，这个键是"今天全局收紧一点"的运维动作。
+	if cfg.Active.DailyPerPeer > 0 {
+		p.DailyPerPeer = cfg.Active.DailyPerPeer
+	}
+	return p
 }
 
 // peerScope 决定一条授权的有效范围：群内授权只在那个群生效，单聊授权全局（仅单聊）。

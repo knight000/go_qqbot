@@ -97,8 +97,10 @@ secret = "s"
 	if len(cfg.Active.Plugins) != 1 || cfg.Active.Plugins[0] != "bootnotice" {
 		t.Fatalf("默认白名单应只有 bootnotice，实际 %v", cfg.Active.Plugins)
 	}
-	if cfg.Active.DailyPerPeer != 5 {
-		t.Fatalf("默认日预算应为 5，实际 %d", cfg.Active.DailyPerPeer)
+	// 0 = 跟随 [quota.<档名>].daily_per_peer（#67）。这里不再有独立默认值：
+	// 同一个维度两份默认值，运维永远说不清哪一个是生效的那个。
+	if cfg.Active.DailyPerPeer != 0 {
+		t.Fatalf("未显式配置时 daily_per_peer 应为 0（跟随配额档），实际 %d", cfg.Active.DailyPerPeer)
 	}
 }
 
@@ -395,6 +397,11 @@ secret = "s2"
 enabled = false
 cert_type = "ENTERPRISE"
 quota_profile = " tight "
+
+# 档位必须真实存在，否则启动期会 warn「已回退 default」——那条告警本身有
+# 自己的用例，这里只想证明档名被归一化。
+[quota.tight]
+group_qpm = 10
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -798,6 +805,106 @@ path = "./data/qqbot.db"
 		t.Fatal("没有 Bot 时应当报错")
 	}
 	for _, want := range []string{"qqbot init", "[app].id", "[[bots]].appid"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误串 %q 缺少 %q", err, want)
+		}
+	}
+}
+
+// ---- 软预算档位（#67）----
+
+// 默认档取平台值的 50%：群 60 qpm→30、单聊 10 qps→300/min、每关系 1000/天→500。
+// 三个数都必须是数字常量而不是"未配置"：软预算静默变成不限量是最坏的形态。
+func TestQuotaDefaultsAreHalfOfPlatform(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[[bots]]
+appid = "102000001"
+secret = "s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("未写 [quota] 时应能加载: %v", err)
+	}
+	got := cfg.QuotaFor(cfg.Bots[0])
+	want := QuotaProfile{SingleQPM: 300, GroupQPM: 30, DailyPerPeer: 500}
+	if got != want {
+		t.Fatalf("默认档应为 %+v（平台值的 50%%），实际 %+v", want, got)
+	}
+}
+
+// 档位里的 0 字段要补默认值：少写一项不是"这一维不限"。
+func TestQuotaProfilePartialFieldsTakeDefaults(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[[bots]]
+appid = "102000001"
+secret = "s"
+quota_profile = "tight"
+
+[quota.tight]
+group_qpm = 10
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("应能加载: %v", err)
+	}
+	got := cfg.QuotaFor(cfg.Bots[0])
+	if got.GroupQPM != 10 {
+		t.Errorf("显式配置的 group_qpm 应生效，实际 %d", got.GroupQPM)
+	}
+	if got.SingleQPM != DefaultSingleQPM || got.DailyPerPeer != DefaultDailyPerPeer {
+		t.Errorf("未写的字段应取默认档值，实际 %+v", got)
+	}
+}
+
+// 档名写错必须 warn 且回退默认档——"不静默不限"是这条的验收原文。
+func TestUnknownQuotaProfileFallsBackWithWarning(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[[bots]]
+appid = "102000001"
+secret = "s"
+quota_profile = "tihgt"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("档名笔误不该让进程起不来: %v", err)
+	}
+	if got := cfg.QuotaFor(cfg.Bots[0]); got.SingleQPM != DefaultSingleQPM {
+		t.Errorf("未知档应回退默认档，实际 %+v", got)
+	}
+	if len(cfg.Warnings) != 1 {
+		t.Fatalf("应有一条告警，实际 %v", cfg.Warnings)
+	}
+	for _, want := range []string{"tihgt", "appid=102000001", DefaultQuotaProfile} {
+		if !strings.Contains(cfg.Warnings[0], want) {
+			t.Errorf("告警 %q 缺少 %q（要指名 Bot 与回退目标）", cfg.Warnings[0], want)
+		}
+	}
+}
+
+// 负数一定是笔误：报错要点名档位与正在使用它的 Bot，别让人去猜是哪一条。
+func TestNegativeQuotaRejectedAndNamesBot(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[[bots]]
+appid = "102000001"
+secret = "s"
+quota_profile = "tight"
+
+[quota.tight]
+group_qpm = -1
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("负数配额应被拒绝")
+	}
+	for _, want := range []string{"quota.tight", "group_qpm", "appid=102000001"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("错误串 %q 缺少 %q", err, want)
 		}
