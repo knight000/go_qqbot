@@ -80,6 +80,9 @@ type fakePlatform struct {
 	// 下架/封禁）。用来验证"一个 Bot 死了、别的还活着"，closeFirstWS 做不到
 	// 这件事——它是全体的。
 	fatalFor map[string]int
+	// throttled429 按 appid 注入 429：值为"还要拒绝几次发消息"。
+	// 用来验证 429 冷却桶按 Bot 分区（#66）。
+	throttled429 map[string]int
 
 	mu     sync.Mutex
 	conns  map[string]*wsConn
@@ -90,7 +93,10 @@ type fakePlatform struct {
 	gatewayBusy    int
 	gatewayOverlap bool
 	sends          []sendRecord
-	seq            map[string]int
+	// attemptsByApp 按 appid 记"发消息"到达平台的总次数（含被 429 的那些）。
+	// 只有它才能区分"本地没出网"与"出网了被平台拒"，sends 记的是成功的那些。
+	attemptsByApp map[string]int
+	seq             map[string]int
 }
 
 func newFakePlatform(t *testing.T) *fakePlatform {
@@ -156,6 +162,19 @@ func (p *fakePlatform) handle(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/ws":
 		p.serveWS(w, r)
 	case strings.HasSuffix(r.URL.Path, "/messages"):
+		appID := appIDFromAuth(r)
+		p.mu.Lock()
+		if p.attemptsByApp == nil {
+			p.attemptsByApp = map[string]int{}
+		}
+		p.attemptsByApp[appID]++
+		p.mu.Unlock()
+		if p.take429(appID) {
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":22009,"message":"hit rate limit"}`))
+			return
+		}
 		var body struct {
 			Content string `json:"content"`
 			MsgID   string `json:"msg_id"`
@@ -163,7 +182,7 @@ func (p *fakePlatform) handle(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		p.mu.Lock()
 		p.sends = append(p.sends, sendRecord{
-			appID:   appIDFromAuth(r),
+			appID:   appID,
 			path:    r.URL.Path,
 			content: body.Content,
 		})
@@ -172,6 +191,35 @@ func (p *fakePlatform) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// throttle429 让某个 Bot 的下 n 次"发消息"直接吃 429（模拟平台限流）。
+// 只影响发消息：token、取地址照常，否则这个 Bot 连启动都过不去。
+func (p *fakePlatform) throttle429(appID string, n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.throttled429 == nil {
+		p.throttled429 = map[string]int{}
+	}
+	p.throttled429[appID] = n
+}
+
+// take429 消耗一次注入的 429。
+func (p *fakePlatform) take429(appID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.throttled429[appID] <= 0 {
+		return false
+	}
+	p.throttled429[appID]--
+	return true
+}
+
+// messageAttempts 返回某个 Bot 的发消息请求到达平台的次数（含被 429 的）。
+func (p *fakePlatform) messageAttempts(appID string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.attemptsByApp[appID]
 }
 
 func (p *fakePlatform) gatewayEnter(appID string) {

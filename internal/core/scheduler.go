@@ -27,7 +27,16 @@ type Scheduler struct {
 	parser cron.Parser
 
 	// slots 是并行度信号量，桶启动前占用、结束后释放；容量即并行度。
+	//
+	// 多 Bot 时它指向进程级共享池（见 JobPool），单 Bot 与测试里是本 Core
+	// 自己的一份容量 jobParallel 的池。
 	slots chan struct{}
+	// serial 非 nil 时，本 Scheduler 还要先过一道容量为 1 的闸门。
+	//
+	// 共享池必须配它：没有它，一个 Bot 能同时占满整个池（桶间并行 4），
+	// 别的租户的桶只能排队——与"每 Bot 同时最多 1 个桶"不符（决策 13）。
+	// 单 Bot 时保持 nil：那时它就是唯一的租户，不该凭空砍掉自己的并行度。
+	serial chan struct{}
 	// idle 在 running 从 0 变 1 时重建、归零时关闭，供 Wait 使用。
 	idle    chan struct{}
 	running int
@@ -67,14 +76,37 @@ const (
 	jobParallel = 4
 )
 
+// JobPool 是进程级共享的任务桶并行额度。
+//
+// 为什么要共享：jobParallel=4 是按内存实测调出来的**进程级**上限。每个 Core
+// （= 每个 Bot）各持一个容量 4 的池时，N 个 Bot 的真实并行度是 4×N，而内存
+// 上限是按 cgroup 整体算的。共享一份池之后，全局并行仍是 4，并因此每个 Bot
+// 同时只跑 1 个桶（见 Scheduler.serial）。
+//
+// 由装配层创建并注入所有 Scheduler；不注入时各 Scheduler 自建一份，行为与
+// 单 Bot 时代完全一致（测试与单 Bot 部署不受影响）。
+type JobPool struct {
+	slots chan struct{}
+}
+
+// NewJobPool 按默认并行度（jobParallel）造一份池。
+func NewJobPool() *JobPool {
+	return &JobPool{slots: make(chan struct{}, jobParallel)}
+}
+
 func NewScheduler(db *store.DB, log *slog.Logger) *Scheduler {
+	return newScheduler(db, log, nil)
+}
+
+// newScheduler 是带共享池的构造器；pool 为 nil 表示自建一份容量 jobParallel 的池。
+func newScheduler(db *store.DB, log *slog.Logger, pool *JobPool) *Scheduler {
 	tz, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
 		log.Warn("加载时区失败，回退 UTC", "err", err)
 		tz = time.UTC
 	}
 	runCtx, stopRun := context.WithCancel(context.Background())
-	return &Scheduler{
+	s := &Scheduler{
 		db:      db,
 		log:     log,
 		tz:      tz,
@@ -86,6 +118,11 @@ func NewScheduler(db *store.DB, log *slog.Logger) *Scheduler {
 		runners: make(map[string]host.JobRunner),
 		busy:    make(map[string]bool),
 	}
+	if pool != nil {
+		s.slots = pool.slots
+		s.serial = make(chan struct{}, 1)
+	}
+	return s
 }
 
 // Location 是"一天/一个 cron 时刻"的唯一时区来源。
@@ -371,6 +408,17 @@ func (s *Scheduler) launch(jobs jobBucket, now time.Time) {
 
 	go func() {
 		defer s.finish(plugin)
+
+		// 先取本 Bot 的闸门（若有），再取全局槽位：反过来的话，一个在等
+		// 全局槽位的桶会一直占着全局额度，池子会被慢慢耗死。
+		if s.serial != nil {
+			select {
+			case s.serial <- struct{}{}:
+				defer func() { <-s.serial }()
+			case <-ctx.Done():
+				return
+			}
+		}
 
 		// 拿不到槽位就等着：桶已经被标记为忙，这一轮不执行的话下一轮也不会
 		// 重复领它，等槽位比丢弃更划算。

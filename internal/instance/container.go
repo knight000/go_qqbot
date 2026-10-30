@@ -51,9 +51,12 @@ type Options struct {
 	// 见 ADR-0002）。由调用方在启动期同步解析字体后注入：那是进程级的一次性
 	// 工作，容器不该自己重做 N 遍。
 	Renderer host.Renderer
-	// Outbound 是共享的出站客户端（全局限流与域名桶都在它里面）。必须由调用方
-	// 传：它同时也是启动期那行"域名独立额度已启用"的日志源，容器再造一份就会
-	// 出现两个限流器。
+	// Outbound 是**根**出站客户端：容器按 Bot 从它派生各自的一份（见
+	// httpx.Client.Partition）。必须由调用方传——它同时也是启动期那行
+	// "域名独立额度已启用"的日志源，容器再造一份就会出现两个根限流器。
+	//
+	// 根客户端自己只服务"派生"：它不承载任何 Bot 的请求，所以它的桶
+	// 永远不会被冷却，也就不存在跨租户污染。
 	Outbound *httpx.Client
 	// Handshake 只用于 WSS 握手（测试注入信任自签证书的客户端，生产留 nil
 	// 走默认）。它与 Outbound 是两个东西：前者是"连得上"，后者是"发得出去"。
@@ -82,8 +85,11 @@ type Container struct {
 	log *slog.Logger
 	o   Options
 
-	outbound *httpx.Client
+	outbound *httpx.Client // 根客户端，只供 Partition 派生（见 Options.Outbound）
 	stagger  *Stagger
+	// jobs 是多 Bot 时的共享任务桶额度池；nil 表示每个 Core 自建一份容量 4
+	// 的池（单 Bot 与"只有一个启用的 Bot"时都是这个形态，行为与旧版一致）。
+	jobs *core.JobPool
 	ctx      context.Context
 	cancel   context.CancelFunc
 
@@ -163,6 +169,14 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 	log.Info("开始启动 Bot",
 		"bots", len(cfg.Bots), "enabled", enabled,
 		"stagger", c.stagger.Interval().String())
+
+	// 多 Bot 时任务桶共享一份池：调度桶并行 4 是按进程内存实测调的，每个
+	// Core 各持一份等于 4×N，且一个租户能占满自己那 4 格（ADR-0008 决策 13）。
+	// 只有一个启用的 Bot 时不注入：那时它就是唯一租户，凭空把并行砍到 1
+	// 只是让慢任务更慢。
+	if enabled > 1 {
+		c.jobs = core.NewJobPool()
+	}
 
 	startedAt := time.Now()
 	started := 0
