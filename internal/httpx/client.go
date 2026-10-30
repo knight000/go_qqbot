@@ -80,6 +80,12 @@ type Client struct {
 	allowed    []string // 仅在 restricted=true 时生效
 	restricted bool     // true = 该客户端属于插件，未声明域名一律拒绝
 	disableTPS bool
+	// log 用于 429 冷却与限流告警；nil 时静默（测试与单次调用不必造 logger）。
+	// 多 Bot 下它已经带上 "bot" 字段（由容器在 Partition 时接上），否则排障
+	// 时看不出是谁被罚。
+	log *slog.Logger
+	// opts 是构造这个客户端的原始输入，Partition 用它派生互不共享桶的副本。
+	opts Options
 
 	// nextRedirect 是注入 client 自带的 CheckRedirect（通常为 nil）。
 	//
@@ -89,10 +95,12 @@ type Client struct {
 	nextRedirect func(*http.Request, []*http.Request) error
 }
 
-// New 构造核心客户端（进程内唯一的根客户端）。
+// New 构造核心客户端。
 //
-// 插件客户端都由它派生（WithDomains / WithTimeout），因此连接池与桶天然共享。
-// 不要为业务再 New 一个根客户端：那是第二份额度。
+// 单 Bot 部署下它就是进程内唯一的根客户端，插件客户端都由它派生
+// （WithDomains / WithTimeout），因此连接池与桶天然共享。多 Bot 时由装配层
+// 为每个 Bot 调一次 Partition 派生：那是**另外**一份桶（ADR-0008 决策 14），
+// 不是第二份额度的意外。
 func New(o Options) *Client {
 	o = o.withDefaults()
 	hc := o.HTTPClient
@@ -108,11 +116,32 @@ func New(o Options) *Client {
 	c := &Client{
 		retries:      o.Retries,
 		buckets:      newBucketSet(o.RatePerMin, o.DomainRatePerMin, o.Log),
+		log:          o.Log,
+		opts:         o,
 		nextRedirect: hc.CheckRedirect,
 	}
 	c.hc = c.newRequestClient(hc)
 	return c
 }
+
+// Partition 派生一份「独立限流桶」的客户端，供多 Bot 装配时按 Bot 各用一份。
+//
+// 为什么需要它：桶是进程级按域名分的，所有 Bot 都打 api.bot.qq.com，一个租户
+// 触发 429 会把整个域名桶冷却，等于把同进程里所有租户一起禁言 60 秒——不报错，
+// 只让所有人变慢（ADR-0008 决策 14）。按 Bot 分桶的唯一干净做法是每 Bot 一个
+// 客户端实例。
+//
+// 代价要认：不再跨 Bot 复用连接池（每个分区各自一份 Transport）。这是刻意的
+// 取舍——隔离正确性优先于几十个空闲连接的复用。
+//
+// log 通常是 rt.log.With("component", "httpx")，已带 "bot" 字段；nil 表示静默。
+// 不要拿它替代单 Bot 的根客户端：装配层只在这里派生，别在业务里再造客户端。
+func (c *Client) Partition(log *slog.Logger) *Client {
+	o := c.opts
+	o.Log = log
+	return New(o)
+}
+
 
 // newRequestClient 复用 hc 的连接池与超时设置，但把重定向策略绑到**当前**
 // Client 上。
@@ -338,10 +367,21 @@ func (c *Client) doWithRetries(ctx context.Context, method, rawURL string, heade
 			//   - 真正答复的域名：重定向后的 429 属于终点站，以后直连它
 			//     同样不该出网（两个域名相同时只冷却一次）。
 			c.buckets.cooldown(host, retryAfter)
+			responder := ""
 			if resp.Request != nil && resp.Request.URL != nil {
 				if h := strings.ToLower(resp.Request.URL.Hostname()); h != host {
+					responder = h
 					c.buckets.cooldown(h, retryAfter)
 				}
+			}
+			// 这一行是"谁被罚、罚多久"的唯一证据：冷却期内的后续请求在本地
+			// 就被挡下、根本不出网，平台侧看不到它们。
+			if c.log != nil {
+				attrs := []any{"domain", host, "retry_after", retryAfter.String()}
+				if responder != "" {
+					attrs = append(attrs, "responder", responder)
+				}
+				c.log.Warn("出站 429：域名桶进入冷却", attrs...)
 			}
 			return &HTTPError{Status: resp.StatusCode, Body: truncate(data), RetryAfter: retryAfter}
 		}
