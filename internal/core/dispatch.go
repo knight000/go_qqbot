@@ -21,6 +21,8 @@ type Dispatcher struct {
 	log     *slog.Logger
 	handler time.Duration
 	trace   *Trace
+	// bot 是本 Core 服务的 Bot，随每次 Handle 进 ctx（见 invoke）。
+	bot host.BotInfo
 	// denyReply 为 false 时，权限不足一律静默（默认）。
 	// 拒绝语由插件 Manifest/Command 提供，是否发出由全局配置决定。
 	denyReply bool
@@ -478,7 +480,11 @@ func (d *Dispatcher) invoke(ctx context.Context, m Match, ev *host.Event) (reply
 				"panic", rec, "stack", string(debug.Stack()))
 		}
 	}()
-	return m.Plugin.Handle(ctx, ev)
+	// 这一次 Handle 属于哪个 Bot。共享插件进程下一套句柄服务 N 个 Bot，
+	// 而 host.Plugin.Handle 的签名里没有 bot 参数，所以只能随 ctx 走
+	// （ADR-0008 决策 11）。放在 invoke 而不是 Dispatch：这里才是真正调插件
+	// 的那一帧，ctx 的其它用途不受影响。
+	return m.Plugin.Handle(host.WithBot(ctx, d.bot), ev)
 }
 
 type panicError struct{ value any }

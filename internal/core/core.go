@@ -20,11 +20,18 @@ import (
 )
 
 type Options struct {
-	Store   *store.DB
-	API     *api.Client
-	HTTP    *httpx.Client
-	Log     *slog.Logger
-	Config  *config.Config
+	Store  *store.DB
+	API    *api.Client
+	HTTP   *httpx.Client
+	Log    *slog.Logger
+	Config *config.Config
+	// Bot 是本 Core 服务的那个 Bot。多 Bot 之后一个进程里有 N 个 Core，
+	// 而插件进程只有一套——这个标识是「这次调用属于谁」的唯一来源
+	// （ADR-0008 决策 11）。
+	Bot host.BotInfo
+	// Plugins 是**进程级共享**的插件句柄，不在本 Core 的生命周期里：
+	// 它们由装配层（internal/instance 的容器）加载一次、最后统一关闭。
+	// 本 Core 只按 Bot 调用它们的 Init / Start / Handle / RunJob。
 	Plugins []host.Plugin
 	// Renderer 是插件可见的渲染能力。Core 只认 host.Renderer 接口，
 	// 不 import 任何渲染实现，测试才能注入 fake、不依赖真字体。
@@ -38,11 +45,14 @@ type Options struct {
 }
 
 type Core struct {
-	store   *store.DB
-	cfg     *config.Config
-	api     groupInfoSource
-	http    *httpx.Client
-	log     *slog.Logger
+	store *store.DB
+	cfg   *config.Config
+	api   groupInfoSource
+	http  *httpx.Client
+	log   *slog.Logger
+	// bot 是本 Core 服务的那个 Bot，会随每次插件调用进 ctx。
+	bot host.BotInfo
+	// plugins 是共享句柄：Core 不拥有它们的生命周期（见 Options.Plugins）。
 	plugins []host.Plugin
 	trace   *Trace
 	render  host.Renderer
@@ -134,8 +144,10 @@ func New(o Options) (*Core, error) {
 	sender.trace = trace
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
 	dispatch.trace = trace
+	dispatch.bot = o.Bot
 	dispatch.denyReply = o.Config.Permission.DenyReply
 	dispatch.sessions = sessionRowsSrc
+	sched.bot = o.Bot
 
 	// 显式判空再赋给接口：把 nil 的 *api.Client 存进接口会得到一个
 	// 非 nil 接口，后续 `c.api == nil` 就永远不成立。
@@ -150,6 +162,7 @@ func New(o Options) (*Core, error) {
 		api:       info,
 		http:      o.HTTP,
 		log:       logger,
+		bot:       o.Bot,
 		plugins:   o.Plugins,
 		trace:     trace,
 		render:    o.Renderer,
@@ -208,6 +221,7 @@ func (c *Core) Start(ctx context.Context) error {
 		m := p.Manifest()
 		svc := host.NewService(host.Options{
 			Name:     m.Name,
+			Bot:      c.bot,
 			Config:   host.NewParams(m.Name, c.cfg.Plugin(m.Name)),
 			Sender:   c.sender.ForPlugin(m.Name),
 			KV:       c.store,
@@ -219,8 +233,10 @@ func (c *Core) Start(ctx context.Context) error {
 			Renderer: c.render,
 			Session:  c.session,
 		})
-		if err := withPluginTimeout(ctx, pluginInitTimeout, "初始化", m.Name, func(c context.Context) error {
-			return p.Init(c, svc)
+		// Init 带着 Bot 上下文：共享句柄（一个进程服务 N 个 Bot）靠它知道
+		// 这次初始化属于谁。ctx 里的 Bot 与 svc.Bot() 是同一个值，两条路都通。
+		if err := withPluginTimeout(ctx, pluginInitTimeout, "初始化", m.Name, func(pctx context.Context) error {
+			return p.Init(host.WithBot(pctx, c.bot), svc)
 		}); err != nil {
 			return err
 		}
@@ -232,7 +248,9 @@ func (c *Core) Start(ctx context.Context) error {
 
 	for _, p := range c.plugins {
 		if st, ok := p.(host.Starter); ok {
-			if err := withPluginTimeout(ctx, pluginStartTimeout, "启动", p.Manifest().Name, st.Start); err != nil {
+			if err := withPluginTimeout(ctx, pluginStartTimeout, "启动", p.Manifest().Name, func(pctx context.Context) error {
+				return st.Start(host.WithBot(pctx, c.bot))
+			}); err != nil {
 				return err
 			}
 		}
@@ -284,7 +302,11 @@ func (c *Core) hostHTTPBackend(domains []string) host.HTTPBackend {
 }
 
 // Shutdown 按固定顺序收尾：停调度 → 等调度收尾 → 等 Dispatcher 排空 →
-// 等 GC 退出 → 关插件。
+// 等 GC 退出。
+//
+// **不关插件**：插件进程是进程级共享的（一套服务 N 个 Bot），一个 Bot 退出
+// 就关掉它等于把别人正在用的插件带走。关闭由装配层在所有 Core 收完之后、
+// 关库之前统一做（internal/instance 的容器，ADR-0008 决策 11）。
 //
 // 返回非 nil 表示有一步没在期限内退出：此时调用方**不能**当成优雅关闭——
 // 关库很可能与在途写并发，必须以非 0 退出，让 systemd 的 Restart=on-failure
@@ -293,9 +315,10 @@ func (c *Core) hostHTTPBackend(domains []string) host.HTTPBackend {
 func (c *Core) Shutdown(ctx context.Context) error {
 	var errs []error
 
-	// 先停调度并等任务收尾，再关插件：任务运行在插件的 JobRunner 里，先 Close
-	// 插件等于让任务往已经关掉的东西里写。Stop 是必需的——/reload 路径下 main
-	// 不会取消 Start 收到的 ctx，只停信号监听；不主动 Stop 就会在关库之后继续起新桶。
+	// 先停调度并等任务收尾，再让装配层关插件：任务运行在插件的 JobRunner 里，
+	// 先 Close 插件等于让任务往已经关掉的东西里写。Stop 是必需的——/reload
+	// 路径下 main 不会取消 Start 收到的 ctx，只停信号监听；不主动 Stop 就会在
+	// 关库之后继续起新桶。
 	if c.sched != nil {
 		c.sched.Stop()
 		if !c.sched.Wait(ctx) {
@@ -315,15 +338,14 @@ func (c *Core) Shutdown(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
-	ClosePlugins(ctx, c.log, c.plugins)
 	return errors.Join(errs...)
 }
 
 // ClosePlugins 逆序关闭一组插件：后启动的先关，失败只 Warn 不中断。
 //
-// 导出给装配层用：`internal/instance` 在 core.New 之前就装好了插件，所以
-// 装配中途失败时插件已经活着而 Core 还不存在，那条路径必须自己收尾。
-// 两处共用一份实现，避免"核心关了插件但它没关"这类只在异常路径出现的分叉。
+// 由**装配层**调用（internal/instance 的容器在关停最后一步统一关）：插件进程
+// 是进程级共享的，任何单个 Core 都没有资格关它。这里集中一份实现，避免
+// "关了两遍"或"谁都没关"这类只在异常路径出现的分叉。
 func ClosePlugins(ctx context.Context, log *slog.Logger, plugins []host.Plugin) {
 	for i := len(plugins) - 1; i >= 0; i-- {
 		p := plugins[i]

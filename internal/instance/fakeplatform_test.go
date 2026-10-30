@@ -491,7 +491,7 @@ func startContainer(t *testing.T, cfg *config.Config, p *fakePlatform, opts ...f
 		Log:       testLogOrDiscard(),
 		Outbound:  p.httpx(),
 		Handshake: p.srv.Client(),
-		LoadPlugins: func(context.Context, config.Bot, *slog.Logger) ([]host.Plugin, error) {
+		LoadPlugins: func(context.Context, *slog.Logger) ([]host.Plugin, error) {
 			return []host.Plugin{&stubPlugin{name: "echo"}}, nil
 		},
 	}

@@ -451,6 +451,16 @@ type Host interface {
 	Config() Params
 	Sender() Sender
 	KV() KV
+	// Bot 返回**本次调用所属的 Bot**（appid + 认证类型）。
+	//
+	// 共享插件进程之后（ADR-0008 决策 11），同一个插件实例会服务多个 Bot：
+	// 这个方法存在的意义就是让插件能区分"这次是谁的事件"。它读的是
+	// 调用参数里的 ctx（`host.From(ctx).Bot()`），不是某个可变的"当前 Bot"
+	// 字段——并发下没有"当前"，只有每个调用自己的 ctx。
+	//
+	// 进程级路径（没有 Bot 上下文）返回零值并记一条 warn，不 panic；
+	// 用 IsZero 判断即可。
+	Bot() BotInfo
 	// PeerKV 返回该会话私有的 KV 命名空间。会话状态写这里，
 	// `/reset session`（R1）才清得掉；写在 KV() 里等于宣布"重置永远清不掉它"。
 	PeerKV(peer string) KV

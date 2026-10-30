@@ -445,22 +445,31 @@ func normalizeRows(rows []host.Row) []host.Row {
 //
 // TTL / Timeout 一律是 int64 纳秒：`time.Duration` 的 JSON 形态本来就是
 // 整数纳秒，但把单位写进字段名才不会被当成秒。
+//
+// 每个 host.* 与每个 per-Bot 的 plugin.* 入参都带 Bot：共享插件进程之后
+// 一个插件实例服务 N 个 Bot，核心侧的 resolver 靠它选「这一条该落到哪个
+// 库/哪个 Bot 的 Host 上」。Bot 为空 = 进程级调用（manifest / close），
+// 其余一律非空——空着来就是个缺陷，ServeHost 会直接报错而不是挑一个默认值。
 type (
 	replyParams struct {
+		Bot   string
 		Event eventDTO
 		Msg   replyDTO
 	}
 	sendActiveParams struct {
+		Bot   string
 		Scene string
 		Peer  string
 		Msg   replyDTO
 	}
 	// kvParams 被 get / delete 共用；peer 为空即插件级全局键空间。
 	kvParams struct {
+		Bot  string
 		Peer string
 		Key  string
 	}
 	kvSetParams struct {
+		Bot   string
 		Peer  string
 		Key   string
 		Value []byte
@@ -471,6 +480,7 @@ type (
 		Found bool
 	}
 	queryParams struct {
+		Bot   string
 		Query string
 		Args  []any
 	}
@@ -480,6 +490,7 @@ type (
 	// httpParams 是四个 HTTP 方法的公共入参：字段互有冗余，但一个结构体
 	// 比四个只在两三个字段上有差别的结构体好维护。
 	httpParams struct {
+		Bot     string
 		URL     string
 		In      json.RawMessage
 		Header  map[string]string
@@ -492,10 +503,12 @@ type (
 		Out json.RawMessage
 	}
 	scheduleParams struct {
+		Bot  string
 		Spec jobSpecDTO
 	}
 	isAdminParams struct {
-		ID identityDTO
+		Bot string
+		ID  identityDTO
 	}
 	isAdminResult struct {
 		Admin bool
@@ -504,29 +517,43 @@ type (
 		Targets []adminTargetDTO
 	}
 	renderParams struct {
+		Bot string
 		Src string
 	}
 	renderResult struct {
 		Image imageDTO
 	}
 	sessionAwaitParams struct {
+		Bot   string
 		Event eventDTO
 		State []byte
 		TTL   int64
 	}
+	// botParams 是没有其它参数的 per-Bot 方法（plugin.start）的入参。
+	botParams struct {
+		Bot      string
+		CertType string
+	}
 
 	// —— plugin.* ——
+	// initParams 的 CertType 随 Bot 一起来：Host.Bot() 要返回它，而它在
+	// handle 里也有——插件侧不必为一次 Bot() 再发一轮 RPC。
 	initParams struct {
-		Name   string
-		Config map[string]any
+		Bot      string
+		CertType string
+		Name     string
+		Config   map[string]any
 	}
 	handleParams struct {
-		Event eventDTO
+		Bot      string
+		CertType string
+		Event    eventDTO
 	}
 	handleResult struct {
 		Reply *replyDTO
 	}
 	runJobParams struct {
+		Bot  string
 		Spec jobSpecDTO
 	}
 )

@@ -18,7 +18,10 @@ type fakeHost struct {
 	last string // 渲染器收到的最后一次源码
 }
 
-func (f *fakeHost) Plugin() string              { return "md" }
+func (f *fakeHost) Plugin() string { return "md" }
+
+// Bot 返回零值：这些用例是单 Bot 的，没有共享进程上下文。
+func (f *fakeHost) Bot() host.BotInfo           { return host.BotInfo{} }
 func (f *fakeHost) Config() host.Params         { return host.Params{} }
 func (f *fakeHost) Sender() host.Sender         { return nil }
 func (f *fakeHost) KV() host.KV                 { return nil }

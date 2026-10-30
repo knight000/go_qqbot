@@ -245,9 +245,9 @@ func run() (*core.RestartRequest, error) {
 		Renderer: renderer,
 		Outbound: hc,
 		LockWait: lockWait(buildinfo.RestartedByReload()),
-		LoadPlugins: func(ctx context.Context, b config.Bot, blog *slog.Logger) ([]host.Plugin, error) {
-			// 每 Bot 一套插件进程是 #62 的过渡形态：#65 会把它们合成一套、
-			// 由核心按 Bot 给独立 Host 实例（ADR-0008 决策 11）。
+		LoadPlugins: func(ctx context.Context, blog *slog.Logger) ([]host.Plugin, error) {
+			// 一套插件进程服务所有 Bot（ADR-0008 决策 11）：加载只做一次，
+			// 之后每个 Bot 只是把自己注册进这些句柄（按 bot_id 各 init 一次）。
 			plugins, err := pluginproc.Load(ctx, pluginproc.Options{
 				Dir:       pluginDir,
 				ConfigFor: cfg.Plugin,

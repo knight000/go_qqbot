@@ -35,6 +35,9 @@ type Scheduler struct {
 	mu      sync.Mutex
 	specs   map[string]host.JobSpec
 	runners map[string]host.JobRunner
+	// bot 是本 Core 服务的 Bot，随每次 RunJob 进 ctx（见 call）：共享插件
+	// 进程下一套句柄服务 N 个 Bot，任务也必须落到自己的那个库上。
+	bot     host.BotInfo
 	busy    map[string]bool // plugin -> 该插件的桶已被领走（含还在等槽的）
 	started bool
 	stopped bool
@@ -533,13 +536,15 @@ func (s *Scheduler) saveJob(ctx context.Context, j store.Job) {
 	}
 }
 
+// call 是唯一真正调插件 RunJob 的地方，因此也是唯一需要标注 Bot 的地方
+// （host.Plugin.RunJob 的签名里没有 bot 参数，共享句柄只能从 ctx 读）。
 func (s *Scheduler) call(ctx context.Context, runner host.JobRunner, spec host.JobSpec) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("job panic: %v", rec)
 		}
 	}()
-	return runner.RunJob(ctx, spec)
+	return runner.RunJob(host.WithBot(ctx, s.bot), spec)
 }
 
 func (s *Scheduler) spec(id string) (host.JobSpec, bool) {
