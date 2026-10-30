@@ -375,6 +375,7 @@ func TestStartupSummaryIsVisible(t *testing.T) {
 func TestRateLimitOnOneBotDoesNotSilenceTheOther(t *testing.T) {
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	logs, readLogs := testLogger()
 	startContainer(t, cfg, p, func(o *Options) { o.Log = logs })
 
