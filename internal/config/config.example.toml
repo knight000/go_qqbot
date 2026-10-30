@@ -3,23 +3,47 @@
 # 这份文件是 `qqbot init` 写出去的模板（内嵌在二进制里），不需要手工复制。
 #   本地开发：qqbot init          → 写 config/config.local.toml（已在 .gitignore 中）
 #   生产环境：qqbot init -c /etc/qqbot/config.toml（权限 600，属主 qqbot）
-# 生成后把 [app] 的 id/secret 填进去即可启动。
+# 生成后把 [[bots]] 的 appid 与 secret 填进去即可启动。
 #
-# 认证（认证存本地 config，按你的要求）：
-#   [app] id / secret 直接写本文件，不再依赖 EnvironmentFile。
-#   仍支持 QQ_APP_ID / QQ_APP_SECRET 环境变量覆盖，便于容器或临时调试。
+# 结构分两层（ADR-0008）：[core] 与其余顶层段是进程级基础设施，只有 Core 所有者
+# 能改；每个 Bot 的业务面（启用哪些插件、人设、开关默认值）存在它自己的库里。
+# 一台机器托管多个 Bot 时只加 [[bots]] 段，不必为每个号维护一份配置与 unit。
+#
+# 旧的单个 [app] 段仍然可用（按一个 Bot 解析），但不要与 [[bots]] 同时出现：
+# 两处都写等于两个来源，校验会直接拒绝。
+#
+# 认证：[core] 里的端点与 [[bots]] 里的 secret 都直接写本文件，不再依赖
+# EnvironmentFile。QQ_APP_ID / QQ_APP_SECRET 仍可用于覆盖，但只在「恰好一个
+# Bot」时能表达——多 Bot 时它只覆盖第一个，并在启动日志里告警。
 
-[app]
-# 机器人 AppID
-id = ""
-# 机器人 AppSecret（敏感，勿入 git）
-secret = ""
+[core]
+# Core 所有者：进程级命令（/reload /restart /upgrade /reset all /bot 系列）的
+# 唯一授权来源，与某个 Bot 自己库里的 admins 表无关——后者只够管那一个 Bot。
+# 填 openid 列表；留空表示这些命令谁都执行不了。
+owners = []
 # true → sandbox.api.sgroup.qq.com；false → api.sgroup.qq.com
+# 进程级：同一台机器上的所有 Bot 连同一套平台环境。
 sandbox = true
-# 以下留空即用平台默认值
+# 以下留空即用平台默认值（api_base 会按 sandbox 推导）
 # api_base   = "https://sandbox.api.sgroup.qq.com"
 # token_url  = "https://bots.qq.com/app/getAppAccessToken"
 
+[[bots]]
+# 机器人 AppID（QQ 开放平台 → 机器人 → 开发设置）
+appid = ""
+# 机器人 AppSecret（敏感，勿入 git）
+secret = ""
+# 缺省 true。false 表示这个 Bot 不连接（状态 suspended）。
+enabled = true
+# 认证类型：unverified | personal | enterprise，缺省 personal。
+# 它决定平台把这个 Bot 的事件推给谁（见 GLOSSARY「认证类型」），核心不做来源判定。
+cert_type = "personal"
+# 配额档：指向全局配额表，缺省 default（配额表尚未落地，当前只做承载与校验）。
+quota_profile = "default"
+# 数据目录，缺省为 [store].path 所在目录下的 bots/<appid>/
+# data_dir = "./data/bots/102xxxxx"
+
+# 注意这里是单数的 [bot]：网关连接参数，与上面的 [[bots]] 列表无关。
 [bot]
 # 1<<25 = 33554432，群与单聊（GROUP_AND_C2C_EVENT）
 intents = 33554432
@@ -30,6 +54,7 @@ resume = true
 
 [store]
 # 数据库与 WAL 必须在本地盘，禁止 tmpfs / 网络盘
+# 这里写的是「库文件」路径；每个 Bot 的库落在它所在目录下的 bots/<appid>/ 里
 path = "./data/qqbot.db"
 
 [retention]

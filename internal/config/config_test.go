@@ -66,8 +66,13 @@ secret = ""
 	if err == nil {
 		t.Fatal("app.secret 为空时应当报错")
 	}
-	if !strings.Contains(err.Error(), "app.secret") {
-		t.Fatalf("错误串应指到 app.secret，实际 %q", err)
+	if !strings.Contains(err.Error(), ".secret 为空") {
+		t.Fatalf("错误串应指到 secret 为空，实际 %q", err)
+	}
+	// 旧形态要能被认出来：用户写的明明是 [app]，报错却只说 bots[0] 会让人
+	// 在一份没有 [[bots]] 的配置里找不到北。
+	if !strings.Contains(err.Error(), "[app] 段") {
+		t.Errorf("旧形态的错误应注明来自 [app] 段，实际 %q", err)
 	}
 	if strings.Contains(err.Error(), "qqbot init") {
 		t.Errorf("secret 为空不该把用户推去跑 init，实际 %q", err)
@@ -366,6 +371,344 @@ func TestGroupNotifyMode(t *testing.T) {
 		cfg.Group.Notify = raw
 		if got := cfg.GroupNotifyMode(); got != want {
 			t.Errorf("notify=%q 应归一化为 %q，实际 %q", raw, want, got)
+		}
+	}
+}
+
+// 新形态是数组：[core] 管进程，[[bots]] 一 Bot 一条。顺序必须是配置里的顺序
+// ——启动错峰、日志与错误定位都按它来。
+func TestBotsArrayParses(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[core]
+owners = [" 10001 ", "", "10002"]
+
+[[bots]]
+appid = "102000001"
+secret = "s1"
+
+[[bots]]
+appid = "102000002"
+secret = "s2"
+enabled = false
+cert_type = "ENTERPRISE"
+quota_profile = " tight "
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("多 Bot 配置应能加载: %v", err)
+	}
+	if len(cfg.Bots) != 2 {
+		t.Fatalf("应解析出 2 个 Bot，实际 %d: %+v", len(cfg.Bots), cfg.Bots)
+	}
+	first, second := cfg.Bots[0], cfg.Bots[1]
+	if first.AppID != "102000001" || first.Secret != "s1" {
+		t.Errorf("第一个 Bot 的凭据不对: %+v", first)
+	}
+	// 缺省：enabled=true、cert_type=personal、quota_profile=default。
+	if !first.IsEnabled() {
+		t.Error("enabled 缺省必须是 true")
+	}
+	if first.CertType != CertPersonal {
+		t.Errorf("cert_type 缺省应为 %q，实际 %q", CertPersonal, first.CertType)
+	}
+	if first.QuotaProfile != DefaultQuotaProfile {
+		t.Errorf("quota_profile 缺省应为 %q，实际 %q", DefaultQuotaProfile, first.QuotaProfile)
+	}
+	if second.IsEnabled() {
+		t.Error("显式 enabled=false 应生效")
+	}
+	// 认证类型与配额档都要归一化（大小写与首尾空格），否则校验会为一个
+	// 手写的 "ENTERPRISE" 判非法。
+	if second.CertType != CertEnterprise {
+		t.Errorf("cert_type 应归一为 %q，实际 %q", CertEnterprise, second.CertType)
+	}
+	if second.QuotaProfile != "tight" {
+		t.Errorf("quota_profile 应去空格，实际 %q", second.QuotaProfile)
+	}
+	// Core 所有者只做 Trim 与去空：空串永远匹配不上任何 openid。
+	if got := strings.Join(cfg.Core.Owners, ","); got != "10001,10002" {
+		t.Errorf("owners = %q，期望 10001,10002", got)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("单值配置不该有告警: %v", cfg.Warnings)
+	}
+}
+
+// 数据目录按 appid 推导：<store.path 所在目录>/bots/<appid>/，可由 data_dir 覆盖。
+// 推导而不是编号：运维看到 appid 就知道该备份哪个目录，删掉一个 Bot 也不会让
+// 别人的目录整体挪位。
+func TestBotDataDirDerivedAndOverridable(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[store]
+path = "./srv/qqbot.db"
+
+[[bots]]
+appid = "102000001"
+secret = "s"
+
+[[bots]]
+appid = "102000002"
+secret = "s"
+data_dir = "/var/lib/qqbot/manual"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.BotDataDir(cfg.Bots[0]), filepath.Join("srv", "bots", "102000001"); got != want {
+		t.Errorf("推导的数据目录 = %q，期望 %q", got, want)
+	}
+	if got, want := cfg.BotDataDir(cfg.Bots[1]), "/var/lib/qqbot/manual"; got != want {
+		t.Errorf("data_dir 覆盖未生效: %q", got)
+	}
+}
+
+// 旧配置不改也能起：单个 [app] 段按一个 Bot 解析，认证类型取 personal，
+// sandbox / api_base / token_url 这些进程级端点搬到 [core]。
+func TestLegacyAppBecomesSingleBot(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[app]
+id = "102000009"
+secret = "legacy-secret"
+sandbox = true
+api_base = "https://example.test/api"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("旧配置应能加载: %v", err)
+	}
+	if len(cfg.Bots) != 1 {
+		t.Fatalf("旧 [app] 应翻译成一个 Bot，实际 %d 个", len(cfg.Bots))
+	}
+	if b := cfg.Bots[0]; b.AppID != "102000009" || b.Secret != "legacy-secret" {
+		t.Errorf("旧凭据未翻译: %+v", b)
+	}
+	if cfg.Bots[0].CertType != CertPersonal {
+		t.Errorf("旧形态的认证类型应为 %q，实际 %q", CertPersonal, cfg.Bots[0].CertType)
+	}
+	if !cfg.SandboxEnabled() {
+		t.Error("旧 [app].sandbox=true 必须继续生效")
+	}
+	if cfg.Core.APIBase != "https://example.test/api" {
+		t.Errorf("旧 [app].api_base 应搬到 [core]，实际 %q", cfg.Core.APIBase)
+	}
+	if cfg.Core.TokenURL == "" {
+		t.Error("token_url 应取到默认值")
+	}
+}
+
+// 两种形态同时出现是二义：静默择一会让用户以为登记的 Bot 生效了，
+// 实际跑到另一个号上。必须拒绝，且说清删哪一边。
+func TestAppAndBotsBothPresentRejected(t *testing.T) {
+	path := writeConfig(t, `
+[app]
+id = "102000009"
+secret = "s"
+
+[[bots]]
+appid = "102000010"
+secret = "s"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("[app] 与 [[bots]] 同时出现必须报错")
+	}
+	for _, want := range []string{"[app]", "[[bots]]", "不能同时出现"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误串 %q 缺少 %q", err, want)
+		}
+	}
+}
+
+// 单 Bot 时环境变量照旧生效，且不该产生任何告警。
+func TestEnvOverridesSingleBot(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "102999999")
+	t.Setenv("QQ_APP_SECRET", "from-env")
+	path := writeConfig(t, `
+[[bots]]
+appid = "102000001"
+secret = "from-file"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Bots[0].AppID != "102999999" || cfg.Bots[0].Secret != "from-env" {
+		t.Fatalf("单 Bot 的环境变量覆盖未生效: %+v", cfg.Bots[0])
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("单 Bot 覆盖不该告警: %v", cfg.Warnings)
+	}
+}
+
+// 多 Bot 时环境变量只覆盖第一个并 warn：多值环境变量没有可用的表达形式，
+// 宁可吵不要静默——用户会以为所有 Bot 都换成了环境里的凭据。
+func TestEnvMultiBotWarnsAndOverridesFirst(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "102999999")
+	t.Setenv("QQ_APP_SECRET", "from-env")
+	path := writeConfig(t, `
+[[bots]]
+appid = "102000001"
+secret = "s1"
+
+[[bots]]
+appid = "102000002"
+secret = "s2"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Bots[0].AppID != "102999999" || cfg.Bots[0].Secret != "from-env" {
+		t.Errorf("第一个 Bot 应被环境变量覆盖: %+v", cfg.Bots[0])
+	}
+	if cfg.Bots[1].AppID != "102000002" || cfg.Bots[1].Secret != "s2" {
+		t.Errorf("其余 Bot 不该被动: %+v", cfg.Bots[1])
+	}
+	warn := strings.Join(cfg.Warnings, "\n")
+	for _, want := range []string{"只覆盖了", "多值环境变量没有可用的表达形式", "102999999"} {
+		if !strings.Contains(warn, want) {
+			t.Errorf("多 Bot 环境变量覆盖必须告警并写明原因，告警 %q 缺少 %q", warn, want)
+		}
+	}
+}
+
+// 一份只写了骨架、凭据全走环境变量的配置（容器里的既有用法）不能因为
+// 改成数组就断掉：没有 [[bots]] 也没有 [app] 时，环境变量自己构成一个 Bot。
+func TestEnvOnlyCredentialsBuildOneBot(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "102000777")
+	t.Setenv("QQ_APP_SECRET", "env-secret")
+	path := writeConfig(t, `
+[store]
+path = "./data/qqbot.db"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("纯环境变量凭据应能启动: %v", err)
+	}
+	if len(cfg.Bots) != 1 || cfg.Bots[0].AppID != "102000777" {
+		t.Fatalf("应由环境变量构成一个 Bot，实际 %+v", cfg.Bots)
+	}
+}
+
+// 校验错误必须指名是哪个 Bot（appid 或数组下标），否则多 Bot 现场只能逐个试。
+func TestValidationNamesTheOffendingBot(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "认证类型非法",
+			body: `
+[[bots]]
+appid = "102000001"
+secret = "s"
+
+[[bots]]
+appid = "102000002"
+secret = "s"
+cert_type = "company"
+`,
+			want: []string{"bots[1]", "102000002", "cert_type"},
+		},
+		{
+			name: "配额档含非法字符",
+			body: `
+[[bots]]
+appid = "102000001"
+secret = "s"
+quota_profile = "wide open"
+`,
+			want: []string{"bots[0]", "102000001", "quota_profile"},
+		},
+		{
+			name: "appid 重复",
+			body: `
+[[bots]]
+appid = "102000001"
+secret = "s"
+
+[[bots]]
+appid = "102000001"
+secret = "s"
+`,
+			want: []string{"重复", "bots[1]", "102000001"},
+		},
+		{
+			name: "appid 会被拼进数据目录，不能带路径",
+			body: `
+[[bots]]
+appid = "../../etc"
+secret = "s"
+`,
+			want: []string{"非法字符", "bots[0]"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.body))
+			if err == nil {
+				t.Fatal("应当报错")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("错误串 %q 缺少 %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// 文件里手抄的 appid/secret 可能带首尾空格。appid 会被拼进数据目录与锁文件名，
+// secret 会进 Authorization 请求头，所以归一化必须写回配置，而不是只在比较时 Trim
+// ——否则校验通过、运行时带着空格去连，报错点离病因很远。
+func TestBotFieldsAreTrimmed(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[[bots]]
+appid = " 102000001 "
+secret = " s "
+data_dir = " /srv/qqbot/manual "
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := cfg.Bots[0]
+	if b.AppID != "102000001" || b.Secret != "s" {
+		t.Errorf("凭据未归一化: appid=%q secret=%q", b.AppID, b.Secret)
+	}
+	if got := cfg.BotDataDir(b); got != "/srv/qqbot/manual" {
+		t.Errorf("data_dir 未归一化: %q", got)
+	}
+}
+
+// 一个 Bot 都没登记时，错误仍要指向 init 与字段名（#42 的验收语义）：
+// 这是新用户看到的第一条错误，不能只说"配置不完整"。
+func TestNoBotsPointsToInit(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[store]
+path = "./data/qqbot.db"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("没有 Bot 时应当报错")
+	}
+	for _, want := range []string{"qqbot init", "[app].id", "[[bots]].appid"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误串 %q 缺少 %q", err, want)
 		}
 	}
 }

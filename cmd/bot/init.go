@@ -25,7 +25,7 @@ const initUsageText = `用法：qqbot init [-c 配置文件] [--plugins] [--forc
   --force    覆盖已存在的配置文件（默认存在即报错）
 
 默认行为：写配置 → 建数据目录 → 释放出厂插件到 <datadir>/plugins/bin/。
-配置里的 [app].id 与 [app].secret 留空，需要手工填入。
+配置里的 [[bots]].appid 与 secret 留空，需要手工填入。
 `
 
 // runInit 实现 `qqbot init`，返回进程退出码：成功 0，失败非 0。
@@ -90,7 +90,7 @@ func initAll(path string, force bool, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "数据目录：%s\n", datadir)
 	fmt.Fprintf(stdout, "出厂插件：%s → %s\n", strings.Join(pluginbundle.Names(), ", "), binDir)
 	fmt.Fprintf(stdout, "\n下一步：\n")
-	fmt.Fprintf(stdout, "  1. 编辑 %s，填入 [app].id 与 [app].secret"+
+	fmt.Fprintf(stdout, "  1. 编辑 %s，填入 [[bots]].appid 与 secret"+
 		"（QQ 开放平台 → 机器人 → 开发设置）\n", path)
 	fmt.Fprintf(stdout, "  2. 启动：qqbot -c %s\n", path)
 	fmt.Fprintf(stdout, "\n以后要补回误删的插件，运行：qqbot init --plugins -c %s\n", path)

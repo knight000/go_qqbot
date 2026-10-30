@@ -245,7 +245,7 @@ func (c *Core) Start(ctx context.Context) error {
 	c.gcStarted = true
 	go c.gcLoop(ctx)
 
-	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.App.Sandbox)
+	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.SandboxEnabled())
 	return nil
 }
 
