@@ -70,6 +70,7 @@ func TestTraceEndToEnd(t *testing.T) {
 	disp.trace = tr
 
 	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
+	markActive(t, db)
 	c.Handle(context.Background(), &host.Event{
 		ID:       "e1",
 		Kind:     host.KindMessage,
@@ -132,6 +133,7 @@ func TestTracePluginLevel(t *testing.T) {
 	disp.trace = tr
 
 	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
+	markActive(t, db)
 	c.Handle(context.Background(), &host.Event{
 		ID:       "EVENT-ID-123",
 		Kind:     host.KindMessage,
@@ -390,6 +392,7 @@ func TestTraceReceivedShowsBotRole(t *testing.T) {
 	sender := NewSender(&fakeAPI{}, log, ActivePolicy{}, nil, time.Local)
 	disp := NewDispatcher(router, sender, log, time.Second)
 	c := &Core{store: db, log: log, trace: tr, sender: sender, router: router, dispatch: disp}
+	markActive(t, db)
 
 	c.Handle(context.Background(), &host.Event{
 		ID:       "E-ROLE",

@@ -172,6 +172,17 @@ func (t *Trace) GroupDropped(ev *host.Event, reason string) {
 	t.emit(fmt.Sprintf("%s 群未放行，已丢弃（%s）：%s\n", t.stamp(), reason, dash(ev.PeerID)))
 }
 
+// StateDropped 打印因 Bot 状态被闸门丢弃的事件。
+//
+// 与 GroupDropped 同一条口径：只在 full 级别输出且不进幂等表，pending_claim
+// 期间平台推来的每条消息都会出现一行——这正是排障时要看到的证据。
+func (t *Trace) StateDropped(ev *host.Event, state BotState) {
+	if !t.full() {
+		return
+	}
+	t.emit(fmt.Sprintf("%s Bot 状态为 %s，已丢弃：%s\n", t.stamp(), state, dash(ev.ID)))
+}
+
 // GroupLifecycle 打印改变本地群状态的入群/退群通知。
 func (t *Trace) GroupLifecycle(action, groupID string) {
 	if !t.full() {

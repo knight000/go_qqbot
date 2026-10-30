@@ -132,6 +132,8 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 
 	c.claimToken = ""
 	c.claimExp = time.Time{}
+	// 认领是 pending_claim → active 的唯一迁移点：从这一刻起闸门才放行普通事件。
+	c.transition(ctx, BotStateActive, "认领成功")
 	c.log.Info("管理员认领成功", "openid", ev.SenderID, "union", ev.UnionID, "scene", ev.Scene)
 	c.replyText(ctx, ev, "认领成功，你已成为 owner。\n"+
 		"用 /admin add <openid> [备注] 添加辅助管理员，/admin list 查看，/admin whoami 查自己的身份。\n"+

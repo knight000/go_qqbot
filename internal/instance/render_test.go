@@ -127,6 +127,7 @@ func (p *renderPlugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply,
 func TestRenderIsSerializedPerBot(t *testing.T) {
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	block := newBlockingRenderer()
 	startContainer(t, cfg, p, func(o *Options) {
 		o.Renderer = block

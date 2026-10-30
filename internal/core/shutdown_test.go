@@ -295,6 +295,7 @@ func TestShutdownDrainLeavesNoClosedDatabaseErrors(t *testing.T) {
 	}
 	// dispatch 里的 sender 必须与 Core 的同一个（关停断言靠它看调用次数）。
 	c.dispatch.sender = c.sender
+	markActive(t, db)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

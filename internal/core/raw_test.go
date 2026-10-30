@@ -62,8 +62,12 @@ func TestRawIsNotPersisted(t *testing.T) {
 	}
 }
 
-// 群准入丢弃路径走的是同一份事件对象：它不落库、不占去重表，
-// 也不应顺手把 Raw 清掉"省内存"——生命周期由 dispatch 决定。
+// 群准入丢弃路径走的是同一份事件对象：它不落库，也不应顺手把 Raw 清掉
+// "省内存"——生命周期由 dispatch 决定。
+//
+// #63 之后群准入排在去重之后（顺序固定为闸门 → 去重 → 群准入），所以未放行
+// 的事件会**占一行去重记录**：平台重投同一条时不该重复判定准入。业务表仍然
+// 零行，这才是这条用例要守的东西。
 func TestRawSurvivesDroppedPaths(t *testing.T) {
 	c, _, _, ctx := newGateCore(t)
 
@@ -73,12 +77,12 @@ func TestRawSurvivesDroppedPaths(t *testing.T) {
 		Scene: host.SceneGroup, PeerID: "g-unauthorized", SenderID: "u1",
 		MsgID: "m-x", Content: "hi", Timestamp: time.Now(), Raw: raw,
 	}
-	c.Handle(ctx, ev) // 未放行的群 → 在去重之前就被丢弃
+	c.Handle(ctx, ev) // 未放行的群 → 去重之后被丢弃
 	if string(ev.Raw) != string(raw) {
 		t.Fatalf("丢弃路径不应改写 Raw，实际 %s", ev.Raw)
 	}
-	if n := countRows(t, c.store, "processed_events"); n != 0 {
-		t.Fatalf("被丢弃的事件不应占去重表，实际 %d", n)
+	if n := countRows(t, c.store, "processed_events"); n != 1 {
+		t.Fatalf("去重排在群准入之前，未放行的事件应占一行，实际 %d", n)
 	}
 	if n := countRows(t, c.store, "messages"); n != 0 {
 		t.Fatalf("被丢弃的事件不应落库，实际 %d 行", n)
