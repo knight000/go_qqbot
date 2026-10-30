@@ -51,6 +51,11 @@ shard_total = 1
 shard_id = 0
 # true → 优先 Resume，省 session 配额
 resume = true
+# 启动错峰：相邻两个 Bot 取 GET /gateway/bot 之间的最小间隔。
+# 该接口限 2 QPM，而「按 AppID 还是按 IP 计量」平台没有说明；按 IP 的话
+# N 个 Bot 同时启动会互相挤配额，所以默认串行并留 30s。显式写 "0s" 才是
+# 不错峰——只在确认计量口径之后才该这么配。
+# gateway_stagger = "30s"
 
 [store]
 # 数据库与 WAL 必须在本地盘，禁止 tmpfs / 网络盘

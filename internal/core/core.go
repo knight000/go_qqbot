@@ -315,15 +315,26 @@ func (c *Core) Shutdown(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
-	for i := len(c.plugins) - 1; i >= 0; i-- {
-		p := c.plugins[i]
-		if cl, ok := p.(host.Closer); ok {
-			if err := cl.Close(ctx); err != nil {
-				c.log.Warn("关闭插件失败", "plugin", p.Manifest().Name, "err", err)
-			}
+	ClosePlugins(ctx, c.log, c.plugins)
+	return errors.Join(errs...)
+}
+
+// ClosePlugins 逆序关闭一组插件：后启动的先关，失败只 Warn 不中断。
+//
+// 导出给装配层用：`internal/instance` 在 core.New 之前就装好了插件，所以
+// 装配中途失败时插件已经活着而 Core 还不存在，那条路径必须自己收尾。
+// 两处共用一份实现，避免"核心关了插件但它没关"这类只在异常路径出现的分叉。
+func ClosePlugins(ctx context.Context, log *slog.Logger, plugins []host.Plugin) {
+	for i := len(plugins) - 1; i >= 0; i-- {
+		p := plugins[i]
+		cl, ok := p.(host.Closer)
+		if !ok {
+			continue
+		}
+		if err := cl.Close(ctx); err != nil {
+			log.Warn("关闭插件失败", "plugin", p.Manifest().Name, "err", err)
 		}
 	}
-	return errors.Join(errs...)
 }
 
 // waitGCLoop 等 GC 协程真正退出。它每 10 分钟才醒一次，ctx 取消后能立刻

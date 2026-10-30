@@ -45,7 +45,7 @@ func dataLockPath(t *testing.T) string {
 
 func acquire(t *testing.T, appID, path string, wait time.Duration) *Lock {
 	t.Helper()
-	lock, err := Acquire(Options{AppID: appID, DataPath: path, Wait: wait})
+	lock, err := Acquire(LockOptions{AppID: appID, DataPath: path, Wait: wait})
 	if err != nil {
 		t.Fatalf("加锁失败（appID=%s path=%s）: %v", appID, path, err)
 	}
@@ -95,7 +95,7 @@ func TestAppLockFileNameDerivesFromAppID(t *testing.T) {
 func TestAcquireRejectsEmptyAppID(t *testing.T) {
 	isolateTemp(t, t.TempDir())
 	// 空 appID 不能静默退化成"只锁数据目录"——那正是这条缺陷本身。
-	if _, err := Acquire(Options{DataPath: dataLockPath(t)}); err == nil {
+	if _, err := Acquire(LockOptions{DataPath: dataLockPath(t)}); err == nil {
 		t.Fatal("空 appID 应当拒绝加锁")
 	}
 }
@@ -109,7 +109,7 @@ func TestSameAppIDDifferentDataDirIsRejected(t *testing.T) {
 	defer first.Release()
 
 	secondPath := dataLockPath(t)
-	second, err := Acquire(Options{AppID: testAppID, DataPath: secondPath, Wait: 0})
+	second, err := Acquire(LockOptions{AppID: testAppID, DataPath: secondPath, Wait: 0})
 	if err == nil {
 		_ = second.Release()
 		t.Fatal("同一 appID 换一个数据目录也不应能二次加锁")
@@ -145,7 +145,7 @@ func TestSecondAcquireIsRejected(t *testing.T) {
 	defer first.Release()
 
 	start := time.Now()
-	second, err := Acquire(Options{AppID: testAppID, DataPath: path, Wait: 0})
+	second, err := Acquire(LockOptions{AppID: testAppID, DataPath: path, Wait: 0})
 	if err == nil {
 		_ = second.Release()
 		t.Fatal("同一 appID + 同一数据目录不应能二次加锁")
@@ -194,7 +194,7 @@ func TestDifferentAppIDSameDataDirBlockedByDataLock(t *testing.T) {
 	first := acquire(t, testAppID, path, 0)
 	defer first.Release()
 
-	second, err := Acquire(Options{AppID: otherAppID, DataPath: path, Wait: 0})
+	second, err := Acquire(LockOptions{AppID: otherAppID, DataPath: path, Wait: 0})
 	if err == nil {
 		_ = second.Release()
 		t.Fatal("同一数据目录不应能跑两个进程")
@@ -229,7 +229,7 @@ func TestRejectedAcquireReleasesAppLock(t *testing.T) {
 	first := acquire(t, testAppID, shared, 0)
 	defer first.Release()
 
-	if second, err := Acquire(Options{AppID: otherAppID, DataPath: shared, Wait: 0}); err == nil {
+	if second, err := Acquire(LockOptions{AppID: otherAppID, DataPath: shared, Wait: 0}); err == nil {
 		_ = second.Release()
 		t.Fatal("同一数据目录不应能跑两个进程")
 	}
@@ -266,13 +266,13 @@ func TestAppIDHashCollisionFallsBackToFullHash(t *testing.T) {
 	}
 
 	// 各自的第二份仍然要被挡住。
-	if l, err := Acquire(Options{AppID: firstID, DataPath: dataLockPath(t)}); !errors.Is(err, ErrLocked) {
+	if l, err := Acquire(LockOptions{AppID: firstID, DataPath: dataLockPath(t)}); !errors.Is(err, ErrLocked) {
 		if err == nil {
 			_ = l.Release()
 		}
 		t.Fatalf("撞车后同一 appID 仍不应能双开（前缀文件），实际: %v", err)
 	}
-	if l, err := Acquire(Options{AppID: secondID, DataPath: dataLockPath(t)}); !errors.Is(err, ErrLocked) {
+	if l, err := Acquire(LockOptions{AppID: secondID, DataPath: dataLockPath(t)}); !errors.Is(err, ErrLocked) {
 		if err == nil {
 			_ = l.Release()
 		}
@@ -284,7 +284,7 @@ func TestAppIDHashCollisionFallsBackToFullHash(t *testing.T) {
 	if err := first.Release(); err != nil {
 		t.Fatalf("释放失败: %v", err)
 	}
-	if l, err := Acquire(Options{AppID: secondID, DataPath: dataLockPath(t)}); !errors.Is(err, ErrLocked) {
+	if l, err := Acquire(LockOptions{AppID: secondID, DataPath: dataLockPath(t)}); !errors.Is(err, ErrLocked) {
 		if err == nil {
 			_ = l.Release()
 		}
@@ -355,7 +355,7 @@ func TestAcquireTimesOutWhileHeld(t *testing.T) {
 	defer first.Release()
 
 	start := time.Now()
-	_, err := Acquire(Options{AppID: testAppID, DataPath: path, Wait: 300 * time.Millisecond})
+	_, err := Acquire(LockOptions{AppID: testAppID, DataPath: path, Wait: 300 * time.Millisecond})
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("超时后应返回 ErrLocked，实际: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestHelperHoldsLock(t *testing.T) {
 	if dir := os.Getenv(helperTmpEnv); dir != "" {
 		tempDir = func() string { return dir }
 	}
-	lock, err := Acquire(Options{AppID: testAppID, DataPath: path})
+	lock, err := Acquire(LockOptions{AppID: testAppID, DataPath: path})
 	if err != nil {
 		t.Fatalf("子进程加锁失败: %v", err)
 	}
@@ -444,7 +444,7 @@ func TestCrossProcessLock(t *testing.T) {
 	}
 
 	// 子进程持锁期间，本进程必须被挡住——这是 4902 的唯一防线。
-	if l, err := Acquire(Options{AppID: testAppID, DataPath: path, Wait: 200 * time.Millisecond}); !errors.Is(err, ErrLocked) {
+	if l, err := Acquire(LockOptions{AppID: testAppID, DataPath: path, Wait: 200 * time.Millisecond}); !errors.Is(err, ErrLocked) {
 		if err == nil {
 			_ = l.Release()
 		}
@@ -479,7 +479,7 @@ func TestLockDirEnvOverridesTempDir(t *testing.T) {
 		t.Fatalf("appID 锁应落在 %s，实际 %s", shared, lock.AppPath())
 	}
 	// 共享目录里的锁仍然必须互斥：换目录不是绕过单实例的理由。
-	if l, err := Acquire(Options{AppID: testAppID, DataPath: dataLockPath(t), Wait: 0}); !errors.Is(err, ErrLocked) {
+	if l, err := Acquire(LockOptions{AppID: testAppID, DataPath: dataLockPath(t), Wait: 0}); !errors.Is(err, ErrLocked) {
 		if err == nil {
 			_ = l.Release()
 		}

@@ -65,11 +65,17 @@ $EDITOR config/config.local.toml
 
 ```text
 [INFO] 发现插件 component=pluginproc plugin=echo version=0.1.0 api_version=12 commands=2 optional=0
-[INFO] 核心已启动 plugins=4 sandbox=true
-[INFO] qqbot 启动完成 config=config/config.local.toml ... version="dev 4a19ec1e" platform=windows/amd64 plugins=4 plugin_names=adminping,bootnotice,echo,md
+[INFO] 核心已启动 bot=102xxxxx plugins=4 sandbox=true
+[INFO] Bot 已启动 bot=102xxxxx appid=102xxxxx db=...\bots\102xxxxx\qqbot.db plugins=4 plugin_names=adminping,bootnotice,echo,md
+[INFO] Bot 启动完成 bots=2 enabled=2 started=2 failed=0 plugins_total=8 elapsed=30.4s
+[INFO] qqbot 启动完成 config=config/config.local.toml ... version="dev 4a19ec1e" platform=windows/amd64 bots=2 started=2
 ```
 
-`plugin_names` 是"哪些插件真的装上了"的唯一权威来源：`bootnotice` 不再报插件清单（插件进程看不到别的插件，契约里也没有这个访问器），启动日志这一行才是事实。
+`plugin_names` 是"哪些插件真的装上了"的唯一权威来源（**每个 Bot 一行**：插件按 Bot 各装
+一套，两个 Bot 的清单可以不一样）：`bootnotice` 不再报插件清单（插件进程看不到别的插件，
+契约里也没有这个访问器）。`Bot 启动完成` 那一行的 `elapsed` 就是启动错峰的代价——
+`GET /gateway/bot` 限 2 QPM，N 个 Bot 默认串行 + 30s 间隔（`[bot].gateway_stagger`）。
+`plugins_total` 是**插件进程总数**：过渡形态下每 Bot 一套，多租户前先按它核 `MemoryMax`。
 
 `init` 的两个开关：
 
@@ -110,7 +116,7 @@ sudo systemctl enable --now qqbot
 | `/etc/qqbot/config.toml` | `init` | 0600，属主 qqbot（含 AppSecret） |
 | `/var/lib/qqbot` | 第 1 步 `install -d` | 0750，属主 qqbot |
 | `/var/lib/qqbot/bin/qqbot` | 第 1 步 `install` | 0755（`/upgrade` 会在同目录换盘） |
-| `/var/lib/qqbot/qqbot.db` | 首次启动 `store.Open` | 属主 qqbot |
+| `/var/lib/qqbot/bots/<appid>/qqbot.db` | 首次启动 `store.Open`（每个 Bot 一份） | 属主 qqbot |
 | `/var/lib/qqbot/plugins/bin/*` | `init` | 0755（要能 exec） |
 | `/var/lib/qqbot/upgrade/` | 首次 `/upgrade apply` 或启动时回滚判定 | 属主 qqbot |
 | `/run/qqbot` | systemd `RuntimeDirectory` | 0700 |
@@ -219,12 +225,16 @@ sudo systemctl start qqbot
 
 ```bash
 sudo systemctl stop qqbot
-sudo cp /var/lib/qqbot/upgrade/snapshots/qqbot-20261023-151230.000.db /var/lib/qqbot/qqbot.db
-sudo rm -f /var/lib/qqbot/qqbot.db-wal /var/lib/qqbot/qqbot.db-shm
+sudo cp /var/lib/qqbot/bots/<appid>/snapshots/qqbot-20261023-151230.000.db \
+        /var/lib/qqbot/bots/<appid>/qqbot.db
+sudo rm -f /var/lib/qqbot/bots/<appid>/qqbot.db-wal /var/lib/qqbot/bots/<appid>/qqbot.db-shm
 sudo systemctl start qqbot
 ```
 
-快照是 `VACUUM INTO` 出来的完整库文件，不是日志；拷回去就等于回到那一刻。
+快照是 `VACUUM INTO` 出来的完整库文件，不是日志；拷回去就等于回到那一刻。**快照按 Bot
+分目录**（`bots/<appid>/snapshots/`，保留 2 份），因为裁剪会让共用目录里的租户互相删备份。
+注意 `/upgrade apply` 只给**发起升级的那个 Bot**拍快照——其余 Bot 的库要还原，得用你自己
+的备份（迁移是逐库跑的，别的库可能已经被新版本改过）。
 
 ## 离线恢复
 
@@ -245,7 +255,7 @@ sudo -u qqbot /var/lib/qqbot/bin/qqbot init --plugins -c /etc/qqbot/config.toml
 
 # 5. 起来，用启动日志确认插件数量
 sudo systemctl start qqbot
-journalctl -u qqbot -n 30 --no-pager | grep '启动完成'
+journalctl -u qqbot -n 40 --no-pager | grep -E 'Bot 已启动|Bot 启动完成'
 ```
 
 第 4 步的语义是「只补缺失」：`plugins/bin/` 里已有的文件一律不动，所以你单独升过的插件不会被降级。删除的后果分两类：**出厂插件**（四个示例）有内嵌副本，启动期会把缺失的文件补回来，所以删掉它们不等于卸载——要停用请写进 `[plugins].disabled`（#52）；**第三方插件**没有副本可补，删掉文件就是卸载，启动期不会自愈。
@@ -451,7 +461,7 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 上次启动 10-17 12:51（2小时5分前）
 ```
 
-正文里**不再有"启用插件 N 个"那份清单**：插件已经是独立进程（ADR-0005），本插件拿不到"核心装了哪些插件"——契约里没有这个访问器，为一行日志加一个访问器要动 `api_version`。要确认装了哪些插件，看核心启动日志的 `plugin_names`（那才是权威来源），或者看 `/ping` 的版本行与插件报错。
+正文里**不再有"启用插件 N 个"那份清单**：插件已经是独立进程（ADR-0005），本插件拿不到"核心装了哪些插件"——契约里没有这个访问器，为一行日志加一个访问器要动 `api_version`。要确认装了哪些插件，看核心启动日志里该 Bot 那行 `Bot 已启动` 的 `plugin_names`（那才是权威来源），或者看 `/ping` 的版本行与插件报错。
 
 主动消息在本项目里是**受控通道**，而不是默认放开的能力：
 
@@ -637,22 +647,25 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 | 4009 | 保留 session，下一轮 Resume |
 | 4004 | 作废 access_token 后重连 |
 | 4008 | 至少等 60s，抖动只加长不缩短 |
-| 4001 / 4002 / 4010–4014 / 4914 / 4915 | 永久错误：停止重连，进程以退出码 1 退出，由 systemd `StartLimit` 收敛 |
+| 4001 / 4002 / 4010–4014 / 4914 / 4915 | 永久错误：**只**停这一个 Bot 的重连（日志里点名它的 appid），其余 Bot 不受影响。全部 Bot 都停了才让进程以退出码 1 退出，由 systemd `StartLimit` 收敛 |
 
 表外的关闭码按退避重连、不动 session。握手（Identify/Resume 到 READY/RESUMED）有 30s 截止，等不到就断开重连——否则平台"收下 WS、心跳也 ACK、就是不回 READY"会让读循环永久阻塞。退避只在连接真正稳定后复位：READY 后活过 30s 才回到 1s 起；「连上就断」（READY 后不足 30s）不复位，连续三次寿命 <5s 的连接直接进 60s 冷却。
 
-## 单实例：同一台机器上的同一 bot 只能跑一个进程
+## 单实例：同一台机器上的同一个 bot 只能跑一个进程
 
-启动时按「先 appID、后数据目录」的顺序取两把**操作系统级**文件锁，拿不到就直接退出，不连网关、不开库：
+一个进程托管多少个 Bot 都行（`[[bots]]`），但**每个 Bot 各自**按「先 appID、后数据目录」
+的顺序取两把**操作系统级**文件锁：拿不到的那一个不连网关、不开库，其余 Bot 照常启动，
+进程也不退出（日志里点名是哪个 appid）：
 
 - **appID 维度**：`%TMP%/qqbot-<sha256(appID) 前 16 位>.lock`（可用 `QQBOT_LOCK_DIR` 换目录，见下），约束"这台机器上的这个 bot"——换个数据目录也躲不掉；
-- **数据目录维度**：`<store.path>.lock`，约束"这份 SQLite 只被一个进程打开"。
+- **数据目录维度**：`<datadir>/bots/<appid>/qqbot.db.lock`，约束"这份 SQLite 只被一个进程打开"。
 
 ```
-启动失败: 另一个实例正在运行：appID 102xxxxx 已被占用——pid 20384（D:\vscode\go\qqbot\bot.exe，启动于 2026-10-18 11:52:07，主机 DESKTOP-8H2K）持有锁 C:\Users\knight\AppData\Local\Temp\qqbot-3f2a1c9d4b7e0a15.lock
+[ERROR] Bot 未启动，其余 Bot 继续 appid=102xxxxx db=.../bots/102xxxxx/qqbot.db err=启动失败: 另一个实例正在运行：appID 102xxxxx 已被占用——pid 20384（D:\vscode\go\qqbot\bot.exe，启动于 2026-10-18 11:52:07，主机 DESKTOP-8H2K）持有锁 C:\Users\knight\AppData\Local\Temp\qqbot-3f2a1c9d4b7e0a15.lock
 ```
 
-数据目录冲突的文案会额外点出占用者的 appID，并提示改 `[store].path`——两种冲突该做的事完全不同（去结束那个进程 vs 换一份库），所以错误必须能区分。
+数据目录冲突的文案会额外点出占用者的 appID，并提示改 `[store].path` 或 `[[bots]].data_dir`
+——两种冲突该做的事完全不同（去结束那个进程 vs 换一份库），所以错误必须能区分。
 
 这不是保守限制。两个进程连同一个 appID 会抢同一个网关 session —— 日志里反复出现 `4902 reset by resume`，两边轮流被踢下线；若还共用一份库，同一个 `msg_id` 会被两边各当成一条事件，用户看到重复回复，被动额度翻倍扣。
 
@@ -831,7 +844,7 @@ internal/pluginbundle/ 内嵌的出厂插件副本（dist/<os>_<arch>/），只�
 internal/upgrade/ 自更新：检查、下载、校验、落位、pending 标记与快照
 internal/sysinfo/ 跨平台资源采集（build tag 分 windows / linux）
 internal/store/   schema、迁移、分批 GC、管理员与身份映射
-internal/instance/ 单实例文件锁（flock / CreateFile 独占共享）
+internal/instance/ 进程级容器：按 [[bots]] 逐个取锁、开库、装配插件、起连接；单实例文件锁也在这里（flock / CreateFile 独占共享）
 internal/httpx/   统一出站客户端
 internal/api/     QQ 开放平台 REST 封装
 internal/config/  配置结构、默认值、校验；示例配置 config.example.toml（init 写出的是它的内嵌副本）
@@ -847,9 +860,12 @@ deploy/           systemd 单元
 运行期数据（`<datadir>` = `[store].path` 的目录）：
 
 ```
-<datadir>/qqbot.db                  SQLite（含 -wal / -shm）
-<datadir>/qqbot.db.lock             数据目录维度的单实例锁
+<datadir>/bots/<appid>/qqbot.db      该 Bot 的 SQLite（含 -wal / -shm），一 Bot 一库
+<datadir>/bots/<appid>/qqbot.db.lock 这份库维度的单实例锁
 <datadir>/plugins/bin/<name>        已安装的插件产物（在就是装着，删掉就是卸载）
 <datadir>/upgrade/state.json        pending 升级标记
 <datadir>/upgrade/snapshots/        VACUUM INTO 快照（保留 2 份）
 ```
+
+`[store].path` 现在只提供目录（它指向的那个文件本身不再被打开），每个 Bot 的库在这一层
+之下的 `bots/<appid>/`。备份、迁移、清理单个租户都只碰一个子目录。

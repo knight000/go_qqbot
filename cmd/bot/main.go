@@ -1,4 +1,8 @@
-// Command bot 是唯一装配点：加载配置 → 打开存储 → 构造核心 → 连接网关。
+// Command bot 是唯一装配点：加载配置 → 准备进程级共享资源（日志、字体、
+// 出站客户端、插件产物）→ 交给 internal/instance 按 [[bots]] 逐个开库、起连接。
+//
+// 一 Bot 一库（ADR-0008）：每个 Bot 的库在 <datadir>/bots/<appid>/qqbot.db，
+// 由 instance 打开并在关停时逐个关闭。main 不碰任何单 Bot 的资源。
 //
 // 插件不在这个二进制里（ADR-0005 决策 10）：它们是 <datadir>/plugins/bin/
 // 下的独立可执行文件，由 internal/pluginproc 在装配期扫描、探测、spawn。
@@ -26,11 +30,9 @@ import (
 	// 不嵌的话 time.LoadLocation("Asia/Shanghai") 会失败并回退 UTC，cron 时间整体偏移 8 小时。
 	_ "time/tzdata"
 
-	"github.com/knight000/go_qqbot/internal/api"
 	"github.com/knight000/go_qqbot/internal/buildinfo"
 	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/core"
-	"github.com/knight000/go_qqbot/internal/gateway"
 	"github.com/knight000/go_qqbot/internal/httpx"
 	"github.com/knight000/go_qqbot/internal/instance"
 	"github.com/knight000/go_qqbot/internal/logx"
@@ -50,14 +52,9 @@ import (
 // Restart=on-failure 都应该看见（P3-23）。
 var errShutdown = errors.New("关停未在期限内完成")
 
-const (
-	// gatewayStopTimeout 是等网关读循环退出的上限。它退出前会把
-	// session_id / seq 落盘（connectOnce 的 defer），所以这个等待就是
-	// "等状态落盘完成"——必须早于 db.Close。
-	gatewayStopTimeout = 5 * time.Second
-	// shutdownTimeout 覆盖调度收尾、派发排空、GC 退出与插件关闭。
-	shutdownTimeout = 10 * time.Second
-)
+// shutdownTimeout 覆盖全部 Bot 的关停预算：等每条网关落盘、调度收尾、派发
+// 排空、GC 退出与插件关闭。每个 Bot 的网关等待另有一份 5s 的内部上限。
+const shutdownTimeout = 10 * time.Second
 
 func main() {
 	// 子命令在 flag.Parse 之前分派：`qqbot init -c x` 的 -c 属于 init，
@@ -68,10 +65,7 @@ func main() {
 
 	req, err := run()
 	if err != nil {
-		var fatal *gateway.FatalError
 		switch {
-		case errors.As(err, &fatal):
-			fmt.Fprintln(os.Stderr, "网关永久性错误，已停止重连:", fatal.Reason)
 		case errors.Is(err, errShutdown):
 			fmt.Fprintln(os.Stderr, "关停失败:", err)
 		default:
@@ -141,21 +135,9 @@ func run() (*core.RestartRequest, error) {
 		log.Warn(w)
 	}
 
-	// 本票只装配一个 Bot：把进程拆成「进程级容器 + 每 Bot 编排器」是 #62。
-	// 取第一个"启用的"，而不是无脑取第一个：enabled=false 已经是配置层的事实，
-	// 只打日志不执行会让运维以为停用了、实际还在连。真正连不上时（全部停用）
-	// 直接失败，而不是带着一个不该上线的 Bot 起来。
-	bot, ok := firstEnabledBot(cfg.Bots)
-	if !ok {
-		return nil, errors.New("没有启用的 Bot：所有 [[bots]] 都是 enabled = false，进程无事可做")
-	}
+	// 逐个打印 Bot 的生效配置：数据目录与库路径由 appid 推导，备份、迁移与
+	// 排障都靠这几行确认东西落在哪（secret 永不出现）。
 	logBots(log, cfg)
-	if len(cfg.Bots) > 1 {
-		// 配置已经能表达多个 Bot，但编排还没落地：静默只跑一个是这里最坏的
-		// 处置——用户会以为其余的 Bot 也在线。这条 warn 随 #62 一起删。
-		log.Warn("本版本只连接第一个启用的 Bot，其余 Bot 尚未编排",
-			"configured", len(cfg.Bots), "appid", bot.AppID)
-	}
 
 	// 信号注册必须在这里——配置刚读完，后面还要解析字体（约 300ms）、拿单实例锁、
 	// 开库、跑迁移。放在它们之后，这段窗口里收到的 Ctrl-C/SIGTERM 会走 Go 的
@@ -200,51 +182,17 @@ func run() (*core.RestartRequest, error) {
 	// 渲染器在启动期同步解析字体（约 300 ms，全部花在 20 MB 字体的字节码扫描上）。
 	// 字体是 go:embed 进来的，解析失败只可能是二进制本身有问题——带病运行会在
 	// 第一次出图时把错误抛给插件，不如现在直接启动失败。
+	//
+	// 容器把它原样分给每个 Bot：渲染并发上限是全局的（ADR-0002），每个 Bot
+	// 各解析一遍 20 MB 字体既慢又白占内存。
 	fonts, err := render.LoadFonts()
 	if err != nil {
 		return nil, err
 	}
 	renderer := render.New(fonts, log.With("component", "render"))
 
-	// 单实例锁：必须在打开数据库、连网关之前拿到。
-	//
-	// 两个进程跑同一个 bot 会互相顶掉网关 session（日志里是 4902 reset by
-	// resume），并且各自回复一遍消息、各记一遍幂等表——不是"慢一点"，是明确错误。
-	// 锁分两把：appID 维度挡"同一 bot 换了个数据目录"，数据目录维度挡"两个 bot
-	// 共用一份库"。只按数据目录划分是上一版的缺陷：换个 [store].path 就能双开。
-	//
-	// 注意锁的 defer 注册在 db.Close 之前，所以退出时的顺序是"先关库再放手"，
-	// 不会给下一个实例留下一个刚拿到锁但库还开着的窗口。
-	//
-	// 只有 /reload 需要等：那是交接而不是竞争（旧进程在 exec 前已经放手），
-	// 多等一会儿只是保险。普通启动必须 wait=0——双开时等下去没有任何意义，
-	// 只会让用户误以为进程还在启动中。
-	lock, err := instance.Acquire(instance.Options{
-		AppID:    bot.AppID,
-		DataPath: cfg.Store.Path + ".lock",
-		Wait:     lockWait(buildinfo.RestartedByReload()),
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err := lock.Release(); err != nil {
-			log.Warn("释放单实例锁失败", "lock", lock.Path(), "err", err)
-		}
-	}()
-
-	db, err := store.Open(cfg.Store.Path)
-	if err != nil {
-		return nil, err
-	}
-	// 关库是关停序列的最后一步：网关落盘（等 gwDone）→ core.Shutdown
-	// （调度收尾 → 派发排空 → GC 退出 → 插件关闭）→ 这里。
-	defer db.Close()
-
-	if err := db.Migrate(context.Background()); err != nil {
-		return nil, err
-	}
-
+	// 出站客户端进程级共享一份：全局限流与域名桶都挂在这一个实例上，
+	// 每个 Bot 各建一个等于把"每分钟 100 次"放大成 N 倍。
 	hc := httpx.New(httpx.Options{
 		Timeout:          cfg.HTTP.Timeout.Duration,
 		Retries:          cfg.HTTP.Retries,
@@ -258,15 +206,6 @@ func run() (*core.RestartRequest, error) {
 		log.Info("出站限流：域名独立额度已启用",
 			"default_per_min", cfg.HTTP.RatePerMin, "domains", formatDomainLimits(limits))
 	}
-	apiClient := api.New(api.Options{
-		HTTP:     hc,
-		BaseURL:  cfg.Core.APIBase,
-		TokenURL: cfg.Core.TokenURL,
-		AppID:    bot.AppID,
-		Secret:   bot.Secret,
-		State:    db,
-		Log:      log.With("component", "api"),
-	})
 
 	// 插件是 plugins/bin/ 下的独立可执行文件，核心只看见 []host.Plugin
 	// （ADR-0005 决策 3）。装配期全部工作收在 pluginproc.Load：扫目录 →
@@ -284,8 +223,11 @@ func run() (*core.RestartRequest, error) {
 	// 内嵌副本对齐必须在 Load 之前（#52）：这时插件进程还没起，文件可以
 	// 安全替换。判定矩阵在 internal/pluginalign：磁盘插件被判拒载就无条件换，
 	// 判为兼容时按插件版本只升不降（内嵌更高才换）。
+	//
+	// 它是进程级的一次性动作：插件产物目录对所有 Bot 是同一份。
+	pluginDir := filepath.Join(datadir, "plugins", "bin")
 	align := pluginalign.Align(ctx, pluginalign.Options{
-		Dir:      filepath.Join(datadir, "plugins", "bin"),
+		Dir:      pluginDir,
 		Bundle:   pluginbundle.Files(),
 		Versions: pluginbundle.Versions(),
 		Log:      log.With("component", "pluginalign"),
@@ -295,90 +237,74 @@ func run() (*core.RestartRequest, error) {
 			"added", len(align.Added), "replaced", len(align.Replaced))
 	}
 
-	procPlugins, err := pluginproc.Load(ctx, pluginproc.Options{
-		Dir:       filepath.Join(datadir, "plugins", "bin"),
-		ConfigFor: cfg.Plugin,
-		Disabled:  cfg.Plugins.Disabled,
-		Registry:  registry,
-		Log:       log.With("component", "pluginproc"),
-	})
-	if err != nil {
-		return nil, err
-	}
-	plugins := procPlugins
-
-	coreImpl, err := core.New(core.Options{
-		Store:   db,
-		API:     apiClient,
-		HTTP:    hc,
-		Log:     log,
-		Config:  cfg,
-		Plugins: plugins,
-		// 核心只认 host.Renderer 接口，不 import 渲染实现包。
+	// 从这里开始交给容器：按 [[bots]] 逐个拿锁、开库、装插件、起连接。
+	// main 只保留进程级的三件事——读配置、准备共享资源、决定何时退出。
+	c, err := instance.Start(ctx, instance.Options{
+		Config:   cfg,
+		Log:      log,
 		Renderer: renderer,
-		Upgrade: upgrade.New(upgrade.Options{
-			Enabled:   cfg.UpgradeEnabled(),
-			APIBase:   cfg.Upgrade.APIBase,
-			AssetBase: cfg.Upgrade.AssetBase,
-			Token:     cfg.Upgrade.Token,
-			Exe:       exePath,
-			DataDir:   datadir,
-			Current:   buildinfo.Get().Version,
-			Plugins:   loadedPlugins(plugins),
-			Snapshots: db,
-			Log:       log.With("component", "upgrade"),
-		}),
+		Outbound: hc,
+		LockWait: lockWait(buildinfo.RestartedByReload()),
+		LoadPlugins: func(ctx context.Context, b config.Bot, blog *slog.Logger) ([]host.Plugin, error) {
+			// 每 Bot 一套插件进程是 #62 的过渡形态：#65 会把它们合成一套、
+			// 由核心按 Bot 给独立 Host 实例（ADR-0008 决策 11）。
+			plugins, err := pluginproc.Load(ctx, pluginproc.Options{
+				Dir:       pluginDir,
+				ConfigFor: cfg.Plugin,
+				Disabled:  cfg.Plugins.Disabled,
+				Registry:  registry,
+				Log:       blog.With("component", "pluginproc"),
+			})
+			if err != nil {
+				return nil, err
+			}
+			return plugins, nil
+		},
+		UpgradeFor: func(b config.Bot, db *store.DB, plugins []host.Plugin) core.UpgradeService {
+			// 升级是进程级的（换的是这个二进制），但快照落在该 Bot 自己的库上。
+			return upgrade.New(upgrade.Options{
+				Enabled:   cfg.UpgradeEnabled(),
+				APIBase:   cfg.Upgrade.APIBase,
+				AssetBase: cfg.Upgrade.AssetBase,
+				Token:     cfg.Upgrade.Token,
+				Exe:       exePath,
+				DataDir:   datadir,
+				Current:   buildinfo.Get().Version,
+				Plugins:   loadedPlugins(plugins),
+				Snapshots: db,
+				// 快照按 Bot 分开：裁剪只留 2 份，共用目录等于让两个租户
+				// 互相删备份。state.json 仍在 <datadir>/upgrade（进程级标记）。
+				SnapshotRoot: cfg.BotDataDir(b),
+				Log:          log.With("component", "upgrade", "bot", b.AppID),
+			})
+		},
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := coreImpl.Start(ctx); err != nil {
-		return nil, err
-	}
-
-	gw := gateway.New(gateway.Options{
-		API:        apiClient,
-		Store:      db,
-		Log:        log,
-		Intents:    cfg.Bot.Intents,
-		ShardTotal: cfg.Bot.ShardTotal,
-		ShardID:    cfg.Bot.ShardID,
-		Resume:     cfg.Bot.Resume,
-		Handler:    coreImpl.Handle,
-		RawDump:    rawDumpFunc(cfg, coreImpl),
-	})
-	// 先接线再起协程：Handle 里读这个字段与这里写它之间靠 goroutine 启动建立顺序，
-	// 反过来（先起 gw.Run 再 SetReconnector）就是数据竞争。
-	coreImpl.SetReconnector(gw)
-
-	// gwRes 收 Run 的返回值：正常退出（ctx 取消）是 nil，永久性错误
-	// （下架/封禁/intents 无权限）是一个可判定的 *gateway.FatalError。
-	gwDone := make(chan struct{})
-	gwRes := make(chan error, 1)
-	go func() {
-		defer close(gwDone)
-		gwRes <- gw.Run(ctx)
-	}()
-
-	// 升级后的观察窗：core.Start 已经完成、网关协程已经起来，从这里开始
-	// 计时 30 秒。能活过去就删掉 pending 标记（ADR-0006 决策 6）。
+	// 升级后的观察窗：容器已经把全部 Bot 的网关协程起来，从这里开始计时
+	// 30 秒。能活过去就删掉 pending 标记（ADR-0006 决策 6）。
 	go clearPendingAfter(ctx, upgrade.StateDir(datadir), upgradeHealthyWindow, log)
 
 	bi := buildinfo.Get()
+	started := 0
+	for _, st := range c.Statuses() {
+		if st.Err == nil {
+			started++
+		}
+	}
 	logStartup(log, startupInfo{
-		ConfigPath:  *cfgPath,
-		DBPath:      db.Path(),
-		LockPath:    lock.Path(),
-		AppLockPath: lock.AppPath(),
-		Sandbox:     cfg.SandboxEnabled(),
-		Bots:        len(cfg.Bots),
-		Debug:       cfg.Debug.Enabled,
-		Version:     bi.String(),
-		Platform:    bi.Platform,
-		GoVersion:   bi.GoVer,
-		Restarted:   buildinfo.RestartedByReload(),
-		Plugins:     plugins,
+		ConfigPath: *cfgPath,
+		DataDir:    datadir,
+		Sandbox:    cfg.SandboxEnabled(),
+		Bots:       len(cfg.Bots),
+		Started:    started,
+		Debug:      cfg.Debug.Enabled,
+		Version:    bi.String(),
+		Platform:   bi.Platform,
+		GoVersion:  bi.GoVer,
+		Restarted:  buildinfo.RestartedByReload(),
 	})
 	if buildinfo.RestartedByReload() {
 		log.Info("本次启动由 /reload 触发", "version", bi.String())
@@ -394,7 +320,7 @@ func run() (*core.RestartRequest, error) {
 		}
 	}
 
-	req, dropped, gwFatal := waitExit(ctx, coreImpl.RestartRequests(), gwDone, gwRes)
+	req, dropped, fatalErr := waitExit(ctx, c.RestartRequests(), c.Fatal())
 	// select 在 ctx.Done 与 /reload 同时就绪时是随机选：选中请求就把一次
 	// Ctrl-C 变成"重新执行自身"，systemd 记成异常重启。waitExit 已经把这种
 	// 请求丢掉，这里只负责把现场写进日志（P3-22）。
@@ -408,35 +334,22 @@ func run() (*core.RestartRequest, error) {
 	case req != nil:
 		log.Warn("收到重启请求，开始关闭",
 			"by", req.By, "role", req.Role, "reason", req.Reason)
-	case gwFatal != nil:
-		log.Error("网关永久性错误，停止重连，开始关闭", "err", gwFatal)
+	case fatalErr != nil:
+		log.Error("全部 Bot 的网关都已停止，开始关闭", "err", fatalErr)
 	default:
 		log.Info("收到退出信号，开始关闭")
 	}
 
-	// 先停接入层：connectOnce 返回前会把 session_id / seq 落盘，所以等 gwDone
-	// 就是等"网关状态落盘完成"——它必须发生在 db.Close 之前，否则下次只能冷
-	// Identify，白烧一次 session 配额。
-	//
-	// 超时不能静默：那一刻网关可能还在写库，照常往下走就是 db.Close 与在途写
-	// 并发。这里只记账，退出码在下面统一变成非 0（P3-23）。
-	gwStopped := true
-	select {
-	case <-gwDone:
-	case <-time.After(gatewayStopTimeout):
-		gwStopped = false
-		log.Error("网关读循环未在期限内退出，状态可能未落盘",
-			"timeout", gatewayStopTimeout.String())
-	}
-
+	// 先停接入层：每个 Bot 的网关在 connectOnce 返回前会把 session_id / seq
+	// 落盘，容器等完这些才算"状态落盘完成"——它必须发生在关库之前，否则下次
+	// 只能冷 Identify，白烧一次 session 配额。超时同样只记账，退出码在下面
+	// 统一变成非 0（P3-23）。
+	c.Stop()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	shutdownErr := coreImpl.Shutdown(shutdownCtx)
+	shutdownErr := c.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
 		log.Error("核心关停未完成", "err", shutdownErr)
-	}
-	if !gwStopped {
-		shutdownErr = errors.Join(shutdownErr, errors.New("网关读循环未退出"))
 	}
 
 	if shutdownErr != nil {
@@ -454,21 +367,12 @@ func run() (*core.RestartRequest, error) {
 	} else {
 		log.Info("已退出")
 	}
-	if gwFatal != nil {
+	if fatalErr != nil {
 		// 交给退出码：Restart=on-failure 的 StartLimit 会把"反复因封禁而重启"
 		// 收敛成一次人工介入，而不是每 60s 一条无人看的重连日志。
-		return nil, gwFatal
+		return nil, fatalErr
 	}
 	return req, nil
-}
-
-// rawDumpFunc 只在 [debug].enabled 与 [debug].raw 同时为真时，
-// 把平台原始 JSON 接到核心的调试轨迹上；否则返回 nil，接入层不做任何额外工作。
-func rawDumpFunc(cfg *config.Config, c *core.Core) func(string, []byte) {
-	if !cfg.Debug.Enabled || !cfg.Debug.Raw {
-		return nil
-	}
-	return c.PrintRaw
 }
 
 // notifyShutdown 返回随 Ctrl-C / SIGTERM 取消的 ctx。
@@ -479,26 +383,25 @@ func notifyShutdown(parent context.Context) (context.Context, context.CancelFunc
 	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 }
 
-// waitExit 等待本次运行的结束原因：关停信号、/reload 请求，或网关自己退出。
+// waitExit 等待本次运行的结束原因：关停信号、/reload 请求，或全部网关都停了。
 //
 // dropped 非 nil 表示 /reload 请求确实到了，但与退出信号同时就绪。select 对
 // 同时就绪的多个 case 是随机选，选中请求就会把一次 Ctrl-C 变成"重新执行自身"。
 // 所以这里先判 ctx：信号已到就一律按关停走（P3-22）。
-func waitExit(ctx context.Context, restarts <-chan core.RestartRequest, gwDone <-chan struct{}, gwRes <-chan error) (req, dropped *core.RestartRequest, gwFatal error) {
+//
+// 单个 Bot 的网关永久失败**不是**退出理由（那会把其他租户一起带走）：容器只
+// 在一条能用的连接都不剩时往 fatal 里放一条错误，#63 会把它变成 failing 态。
+func waitExit(ctx context.Context, restarts <-chan core.RestartRequest, fatal <-chan error) (req, dropped *core.RestartRequest, fatalErr error) {
 	select {
 	case <-ctx.Done():
 	case r := <-restarts:
 		req = &r
-	case <-gwDone:
-		// 网关自己退出了。正常退出只发生在 ctx 取消之后，所以走到这里往往是
-		// 永久性错误（4001/4002/4010–4014/4914/4915）：再连也不会好，
-		// 但也不能留着一个"进程在跑、机器人已死"的躯壳。
-		gwFatal = <-gwRes
+	case fatalErr = <-fatal:
 	}
 	if ctx.Err() != nil && req != nil {
 		dropped, req = req, nil
 	}
-	return req, dropped, gwFatal
+	return req, dropped, fatalErr
 }
 
 // lockWait 决定等单实例锁的上限。
@@ -529,82 +432,53 @@ func formatDomainLimits(limits map[string]int) string {
 }
 
 // startupInfo 是"启动完成"那一行需要的事实。抽成结构体是为了让日志内容可测。
+//
+// 这里只放进程级事实：库路径、两把锁与插件清单都是每 Bot 一份，分别打在
+// "Bot 已启动"那几行里（见 internal/instance），全局行不该假装只有一个。
 type startupInfo struct {
-	ConfigPath  string
-	DBPath      string
-	LockPath    string
-	AppLockPath string
-	Sandbox     bool
-	Bots        int
-	Debug       bool
-	Version     string
-	Platform    string
-	GoVersion   string
-	Restarted   bool
-	Plugins     []host.Plugin
+	ConfigPath string
+	DataDir    string
+	Sandbox    bool
+	Bots       int
+	Started    int
+	Debug      bool
+	Version    string
+	Platform   string
+	GoVersion  string
+	Restarted  bool
 }
 
 // logBots 在启动期逐个打印 Bot 的实际生效配置。
 //
-// 数据目录必须可见：它由 appid 推导（[store].path 所在目录下的 bots/<appid>/），
-// 用户只有在这一行才能确认"按 Bot 分库之后数据会落在哪"——备份、迁移、清理都靠它。
-//
-// 同一行还打出当前真正在用的库：本票行为不变，进程仍然只开 [store].path 这一份，
-// 两个字段并列才能让运维看出"推导出来的目录还没启用"，而不是照着一条不存在的
-// 路径去找数据。永不打印 secret，连长度也不打。
+// 数据目录与库路径必须可见：它们由 appid 推导（<datadir>/bots/<appid>/qqbot.db），
+// 备份、迁移、清理都靠这几行确认东西落在哪。永不打印 secret，连长度也不打。
 func logBots(log *slog.Logger, cfg *config.Config) {
 	for _, b := range cfg.Bots {
 		log.Info("Bot 配置",
 			"appid", b.AppID,
 			"data_dir", cfg.BotDataDir(b),
-			"db", cfg.Store.Path,
+			"db", cfg.BotStorePath(b),
 			"cert_type", b.CertType,
 			"quota_profile", b.QuotaProfile,
 			"enabled", b.IsEnabled())
 	}
 }
 
-// firstEnabledBot 返回第一个启用的 Bot。
+// logStartup 打印启动完成。
 //
-// #62 之前进程只装配一个 Bot，所以这里是"取第一个"而不是"取全部"；
-// 跳过停用的那几条，是为了让 enabled=false 立刻生效，而不是只出现在日志里。
-func firstEnabledBot(bots []config.Bot) (config.Bot, bool) {
-	for _, b := range bots {
-		if b.IsEnabled() {
-			return b, true
-		}
-	}
-	return config.Bot{}, false
-}
-
-// logStartup 打印启动完成。插件既报数量也报名字：
-//
-// 只报 plugins=4 时，"新插件没进二进制"与"插件进去了但没注册"看起来一模一样，
-// 现场只能靠"指令没反应"反推，而构建日志里全是成功（P3-17）。
+// 插件数量与名字不在这里：一 Bot 一套插件之后，"这个进程装了哪些插件"不再
+// 是一行能回答的问题，每个 Bot 的清单打在它自己的"Bot 已启动"那行（P3-17
+// 那条"没进产物 vs 没注册"的守卫仍然成立）。
 func logStartup(log *slog.Logger, in startupInfo) {
 	log.Info("qqbot 启动完成",
 		"config", in.ConfigPath,
-		"db", in.DBPath,
-		"lock", in.LockPath,
-		"app_lock", in.AppLockPath,
+		"datadir", in.DataDir,
 		"sandbox", in.Sandbox,
 		"bots", in.Bots,
+		"started", in.Started,
 		"debug", in.Debug,
 		"version", in.Version,
 		"platform", in.Platform,
 		"go", in.GoVersion,
-		"restarted", in.Restarted,
-		"plugins", len(in.Plugins),
-		"plugin_names", pluginNames(in.Plugins))
-}
-
-// pluginNames 把已装配的插件按名字排序后用逗号连起来。
-// 排序只为两次启动能逐字比对——pluginproc.Load 的顺序来自文件名扫描。
-func pluginNames(plugins []host.Plugin) string {
-	names := make([]string, 0, len(plugins))
-	for _, p := range plugins {
-		names = append(names, p.Manifest().Name)
-	}
-	sort.Strings(names)
-	return strings.Join(names, ",")
+		"restarted", in.Restarted)
 }
