@@ -469,15 +469,25 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 |---|---|---|
 | 总开关 | `[active] enabled` | 关闭后所有 `SendActive` 直接返回 `ErrActiveDisabled` |
 | 插件白名单 | `[active] plugins` | 只有名单内插件能发；插件拿到的 Sender 是带名字的包装 |
-| 每日预算 | `[active] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按调度时区 `Asia/Shanghai` 换桶，与 cron 同源），先扣预算再发 HTTP；平台明确拒绝时归还，网络失败不归还 |
+| 软预算（每分钟） | `[quota.<档名>] single_qpm` / `group_qpm` | Bot 级、按场景的每分钟上限（平台频控的 50%），与每日额度同为库里一次原子 upsert；超限拒发并返回 `ErrActiveQuota`，**不排队、不跨天补发** |
+| 每日预算 | `[quota.<档名>] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按调度时区 `Asia/Shanghai` 换桶，与 cron 同源），先扣预算再发 HTTP；平台明确拒绝时归还，网络失败不归还。`[active] daily_per_peer` 是它的全局临时覆盖（0 = 跟随档位） |
+| 超限通知 | 自动 | 当天首次超限私聊 Bot 所有者一条，之后不重复；通知本身不占软预算，仍受 429 冷却约束 |
 | 重启抑制 | `[plugins.bootnotice] min_interval` | 距上次启动不足该间隔则整轮跳过，防崩溃重启刷屏 |
 | 重试 | `[plugins.bootnotice] retry_delay` | 失败只重试一次；主动消息没有 `msg_id` 幂等键，多试等于重复推送 |
+
+优先级是 **429 冷却 > 软预算**（平台才是真相）：冷却期内一律返回 `ErrRateLimited`。
+被动回复完全不占这套预算，也不受这些闸门影响。
 
 ```toml
 [active]
 enabled = true
 plugins = ["bootnotice"]
-daily_per_peer = 5
+# daily_per_peer = 5   # 0（默认）= 跟随 [quota.<档名>].daily_per_peer
+
+[quota.default]
+single_qpm = 300       # 单聊每分钟（Bot 级）
+group_qpm = 30         # 群聊每分钟（Bot 级）
+daily_per_peer = 500   # 每个（群/用户）每天
 
 [plugins.bootnotice]
 enabled = true
