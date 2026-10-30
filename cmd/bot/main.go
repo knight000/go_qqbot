@@ -135,6 +135,23 @@ func run() (*core.RestartRequest, error) {
 	log := logx.New(logLevel, cfg.Log.Format)
 	slog.SetDefault(log)
 
+	// 配置层的"能用但不该这样写"必须在这里落地：多 Bot 环境下环境变量只覆盖
+	// 第一个 Bot，用户如果看不到这条 warn，会以为所有 Bot 都换了凭据。
+	for _, w := range cfg.Warnings {
+		log.Warn(w)
+	}
+
+	// 本票只装配第一个 Bot：把进程拆成「进程级容器 + 每 Bot 编排器」是 #62。
+	// 校验保证列表非空（config.Validate 对空列表直接报错），所以不判长度。
+	bot := cfg.Bots[0]
+	logBots(log, cfg)
+	if len(cfg.Bots) > 1 {
+		// 配置已经能表达多个 Bot，但编排还没落地：静默只跑一个是这里最坏的
+		// 处置——用户会以为其余的号也在线。这条 warn 随 #62 一起删。
+		log.Warn("本版本只连接第一个 Bot，其余 Bot 尚未编排",
+			"configured", len(cfg.Bots), "running", bot.AppID)
+	}
+
 	// 信号注册必须在这里——配置刚读完，后面还要解析字体（约 300ms）、拿单实例锁、
 	// 开库、跑迁移。放在它们之后，这段窗口里收到的 Ctrl-C/SIGTERM 会走 Go 的
 	// 默认处理：进程被直接杀死，会话不落盘，systemd 记的是 "killed by signal"
@@ -198,7 +215,7 @@ func run() (*core.RestartRequest, error) {
 	// 多等一会儿只是保险。普通启动必须 wait=0——双开时等下去没有任何意义，
 	// 只会让用户误以为进程还在启动中。
 	lock, err := instance.Acquire(instance.Options{
-		AppID:    cfg.App.ID,
+		AppID:    bot.AppID,
 		DataPath: cfg.Store.Path + ".lock",
 		Wait:     lockWait(buildinfo.RestartedByReload()),
 	})
@@ -238,10 +255,10 @@ func run() (*core.RestartRequest, error) {
 	}
 	apiClient := api.New(api.Options{
 		HTTP:     hc,
-		BaseURL:  cfg.App.APIBase,
-		TokenURL: cfg.App.TokenURL,
-		AppID:    cfg.App.ID,
-		Secret:   cfg.App.Secret,
+		BaseURL:  cfg.Core.APIBase,
+		TokenURL: cfg.Core.TokenURL,
+		AppID:    bot.AppID,
+		Secret:   bot.Secret,
 		State:    db,
 		Log:      log.With("component", "api"),
 	})
@@ -349,7 +366,8 @@ func run() (*core.RestartRequest, error) {
 		DBPath:      db.Path(),
 		LockPath:    lock.Path(),
 		AppLockPath: lock.AppPath(),
-		Sandbox:     cfg.App.Sandbox,
+		Sandbox:     cfg.SandboxEnabled(),
+		Bots:        len(cfg.Bots),
 		Debug:       cfg.Debug.Enabled,
 		Version:     bi.String(),
 		Platform:    bi.Platform,
@@ -512,12 +530,29 @@ type startupInfo struct {
 	LockPath    string
 	AppLockPath string
 	Sandbox     bool
+	Bots        int
 	Debug       bool
 	Version     string
 	Platform    string
 	GoVersion   string
 	Restarted   bool
 	Plugins     []host.Plugin
+}
+
+// logBots 在启动期逐个打印 Bot 的实际生效配置。
+//
+// 数据目录必须可见：它由 appid 推导（[store].path 所在目录下的 bots/<appid>/），
+// 用户只有在这一行才能确认"这台机器的数据到底落在哪"——备份、迁移、清理都靠它。
+// 永不打印 secret，连长度也不打。
+func logBots(log *slog.Logger, cfg *config.Config) {
+	for _, b := range cfg.Bots {
+		log.Info("Bot 配置",
+			"appid", b.AppID,
+			"data_dir", cfg.BotDataDir(b),
+			"cert_type", b.CertType,
+			"quota_profile", b.QuotaProfile,
+			"enabled", b.IsEnabled())
+	}
 }
 
 // logStartup 打印启动完成。插件既报数量也报名字：
@@ -531,6 +566,7 @@ func logStartup(log *slog.Logger, in startupInfo) {
 		"lock", in.LockPath,
 		"app_lock", in.AppLockPath,
 		"sandbox", in.Sandbox,
+		"bots", in.Bots,
 		"debug", in.Debug,
 		"version", in.Version,
 		"platform", in.Platform,

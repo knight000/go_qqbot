@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/core"
 	"github.com/knight000/go_qqbot/pkg/host"
 )
@@ -45,12 +46,16 @@ func TestLogStartupListsPluginNames(t *testing.T) {
 	var buf bytes.Buffer
 	logStartup(slog.New(slog.NewTextHandler(&buf, nil)), startupInfo{
 		Version: "v0.0.0-test",
+		Bots:    2,
 		Plugins: []host.Plugin{fakePlugin{name: "echo"}, fakePlugin{name: "adminping"}},
 	})
 
 	out := buf.String()
 	if !strings.Contains(out, "plugins=2") {
 		t.Fatalf("启动日志应带插件数量，实际: %s", out)
+	}
+	if !strings.Contains(out, "bots=2") {
+		t.Fatalf("启动日志应带 Bot 数量，实际: %s", out)
 	}
 	i := strings.Index(out, "plugin_names=")
 	if i < 0 {
@@ -72,6 +77,33 @@ func (f fakePlugin) Manifest() host.Manifest             { return host.Manifest{
 func (fakePlugin) Init(context.Context, host.Host) error { return nil }
 func (fakePlugin) Handle(context.Context, *host.Event) (*host.Reply, error) {
 	return nil, nil
+}
+
+// 每个 Bot 的数据目录必须在启动日志里可见：它由 appid 推导，备份、迁移、
+// 清理都靠这一行确认"东西到底落在哪"。secret 一个字节都不许出现。
+func TestLogBotsPrintsDataDirAndNeverSecret(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		Store: config.Store{Path: "data/qqbot.db"},
+		Bots: []config.Bot{
+			{AppID: "102000001", Secret: "super-secret"},
+			{AppID: "102000002", Secret: "another-secret", DataDir: "/srv/qqbot/manual"},
+		},
+	}
+	logBots(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+
+	out := buf.String()
+	if got := strings.Count(out, "Bot 配置"); got != 2 {
+		t.Fatalf("应每个 Bot 一行，实际 %d 行:\n%s", got, out)
+	}
+	for _, want := range []string{"data_dir=", "appid=102000001", "appid=102000002", "data_dir=/srv/qqbot/manual"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("启动日志缺少 %q：\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "super-secret") || strings.Contains(out, "another-secret") {
+		t.Errorf("启动日志泄露了 secret：\n%s", out)
+	}
 }
 
 // 退出信号与 /reload 同时就绪时 select 随机选，选中请求就会把 Ctrl-C 变成重启。

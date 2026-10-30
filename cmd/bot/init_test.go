@@ -126,13 +126,16 @@ func TestInitInEmptyDirCreatesEverything(t *testing.T) {
 	if !bytes.Equal(got, config.ExampleTOML()) {
 		t.Fatalf("写出去的配置不是内嵌的示例（%d 字节 vs %d 字节）", len(got), len(config.ExampleTOML()))
 	}
-	// 示例里 app.id 必须留空：填好了就没人会去填自己的 AppID。
+	// 示例里 bot 的凭据必须留空：填好了就没人会去填自己的 AppID。
 	var parsed config.Config
 	if _, err := toml.Decode(string(got), &parsed); err != nil {
 		t.Fatalf("写出去的配置不是合法 TOML: %v", err)
 	}
-	if strings.TrimSpace(parsed.App.ID) != "" || strings.TrimSpace(parsed.App.Secret) != "" {
-		t.Errorf("示例配置不该带凭据，实际 id=%q secret=%q", parsed.App.ID, parsed.App.Secret)
+	if len(parsed.Bots) != 1 {
+		t.Fatalf("示例配置应有一个 [[bots]] 条目（多 Bot 时用户自己加），实际 %d 个", len(parsed.Bots))
+	}
+	if b := parsed.Bots[0]; strings.TrimSpace(b.AppID) != "" || strings.TrimSpace(b.Secret) != "" {
+		t.Errorf("示例配置不该带凭据，实际 appid=%q secret=%q", b.AppID, b.Secret)
 	}
 
 	// 默认 [store].path = ./data/qqbot.db，相对子进程的工作目录。
@@ -158,7 +161,7 @@ func TestInitInEmptyDirCreatesEverything(t *testing.T) {
 	}
 
 	// 下一步必须说清楚去哪儿填凭据，否则用户拿着空配置启动只会看到校验错误。
-	for _, want := range []string{"[app].id", "[app].secret", cfgPath} {
+	for _, want := range []string{"[[bots]].appid", "secret", cfgPath} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("init 输出缺少 %q：\n%s", want, stdout)
 		}
@@ -277,8 +280,9 @@ func TestInitPluginsWithoutConfigExplains(t *testing.T) {
 	}
 }
 
-// 验收第 4 条：app.id 为空时，启动错误指向 `qqbot init` 与 [app].id。
-// 走真实进程的启动路径（config.Load 是 run() 的第一件事，不需要网络）。
+// 验收第 4 条：appid 为空时，启动错误指向 `qqbot init` 与要填的字段名
+// （保留 #42 的验收语义）。走真实进程的启动路径（config.Load 是 run() 的
+// 第一件事，不需要网络）。
 func TestStartupWithEmptyAppIDPointsToInit(t *testing.T) {
 	work := t.TempDir()
 	cfgPath := filepath.Join(work, "config.local.toml")

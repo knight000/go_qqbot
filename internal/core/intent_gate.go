@@ -56,7 +56,7 @@ func (c *Core) warnIntentGaps() {
 			if !ok || c.cfg.Bot.Intents&req.bit != 0 {
 				continue
 			}
-			c.log.Warn("插件订阅的事件类型没有在 bot.intents 打开，网关不会收到",
+			c.log.Warn("插件订阅的事件类型没有在 [bot].intents 打开，网关不会收到",
 				"plugin", m.Name,
 				"intent", string(it.kind),
 				"missing_bit", req.name,

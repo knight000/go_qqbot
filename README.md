@@ -29,7 +29,7 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按�
 
 插件是**独立进程**（ADR-0005）：核心启动时扫描 `<datadir>/plugins/bin/`，对每个文件跑 `--manifest` 探测，再 spawn 成子进程走 stdio RPC。加插件不用重编译核心，删文件就是卸载。
 
-认证信息按约定写在**本地 config**（默认 `config/config.local.toml`，已 gitignore），不再依赖 `EnvironmentFile`；仍支持 `QQ_APP_ID` / `QQ_APP_SECRET` 覆盖。
+认证信息按约定写在**本地 config**（默认 `config/config.local.toml`，已 gitignore），不再依赖 `EnvironmentFile`；仍支持 `QQ_APP_ID` / `QQ_APP_SECRET` 覆盖（只有单 Bot 的配置能表达，多 Bot 时只覆盖第一个并在启动日志告警）。
 
 ## 首次安装
 
@@ -44,7 +44,7 @@ go run ./tools/build all
 # 2. 生成配置 + 释放四个出厂插件（默认写 config/config.local.toml，已被 gitignore）
 ./bot.exe init
 
-# 3. 填 [app].id / [app].secret（QQ 开放平台 → 机器人 → 开发设置）
+# 3. 填 [[bots]] 里的 appid 与 secret（QQ 开放平台 → 机器人 → 开发设置）
 $EDITOR config/config.local.toml
 
 # 4. 启动（不带 -c 时读同一个默认路径）
@@ -76,7 +76,7 @@ $EDITOR config/config.local.toml
 | 参数 | 用途 |
 |---|---|
 | `--plugins` | 只释放**缺失**的出厂插件，不碰配置。删掉一个插件后补回来就靠它（已存在的文件不覆盖） |
-| `--force` | 覆盖已存在的配置。会丢掉你填过的 `[app].id` / `[app].secret`，只在重来一遍时用 |
+| `--force` | 覆盖已存在的配置。会丢掉你填过的 `[[bots]]` 里的 appid 与 secret，只在重来一遍时用 |
 
 不带 `--force` 时 `init` 拒绝覆盖：`init: 配置文件 ... 已存在，不覆盖（要覆盖请加 --force；只补插件请用 --plugins）`。
 
