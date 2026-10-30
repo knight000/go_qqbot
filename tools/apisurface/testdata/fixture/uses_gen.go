@@ -8,7 +8,7 @@
 //
 //	go run github.com/knight000/go_qqbot/tools/apisurface@<pin>
 //
-// 契约包：github.com/knight000/go_qqbot/pkg/host（api 13）
+// 契约包：github.com/knight000/go_qqbot/pkg/host（api 14）
 // 生成器：(工作区)
 //
 // 反射里才用到的成员静态扫描看不见：写进 uses_extra.go，由 Manifest.Uses

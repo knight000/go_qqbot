@@ -102,8 +102,19 @@ import (
 // 同期还加了 Manifest.Uses（插件自报的使用面，#55/#56），零值同样安全——
 // 没写就是空使用面，判定退化为「api_version 必须与核心相等」。两项都是纯增量。
 //
+// 版本 14：插件进程从「每 Bot 一套」变成「一套服务所有 Bot」（ADR-0008 决策 11）。
+//   - 新增 Host.Bot()（appid + 认证类型），给需要区分 Bot 的插件用——纯增量；
+//   - **行为变更**：同一个插件实例会收到来自不同 Bot 的事件，于是
+//     Host.Config / KV / PeerKV / Query / IsAdmin / Admins / Sender / Session
+//     的返回值都开始取决于「当前这次调用属于哪个 Bot」。签名一个字没变，所以
+//     没有编译期信号，插件必须自己保证「状态按 Bot 隔离」：
+//     · 带 ctx 的调用一律用调用参数里的 ctx（`host.From(ctx)` 取当前 Bot 的
+//     Host），不要把 Init 拿到的 Host 当成"当前 Bot"存进包级变量；
+//     · 需要 Bot 身份时读 `host.From(ctx).Bot()`，不要缓存。
+//     只用 Host.Log 的插件确实不受影响，所以分级表按成员逐个点名，不用 "*"。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "13"
+const APIVersion = "14"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //

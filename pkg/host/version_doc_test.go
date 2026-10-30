@@ -48,7 +48,7 @@ func TestAPIVersionMatchesArchitectureTable(t *testing.T) {
 	}
 }
 
-// TestAPIVersionIsThirteen 把版本号钉成字面量。
+// TestAPIVersionIsFourteen 把版本号钉成字面量。
 //
 // 表尾比对只能保证「表与常量一致」，两个一起忘了涨也会绿；这条用例要求
 // 涨版本时必须同时想清楚「插件要改什么」——版本号就是这句话的声明。
@@ -58,9 +58,11 @@ func TestAPIVersionMatchesArchitectureTable(t *testing.T) {
 // 与 Event.Session（ADR-0004）；10 改了 Params.Str 的空串语义与 Store.Query
 // 的只读实现（#30）；11 导出主动消息的三个失败哨兵（#34）；
 // 12 把契约外置为 pkg/host，不匹配从编译错误变成握手拒绝（ADR-0005 / #38）；
-// 13 引入 Manifest.Upstream，插件可自带发布源（#53），零值行为不变。
-func TestAPIVersionIsThirteen(t *testing.T) {
-	if APIVersion != "13" {
-		t.Fatalf("APIVersion=%q，期望 \"13\"", APIVersion)
+// 13 引入 Manifest.Upstream，插件可自带发布源（#53），零值行为不变；
+// 14 插件进程共享一套、服务 N 个 Bot：新增 Host.Bot（#65），且八个「返回当前
+// Bot 的东西」的成员语义从「单一 Bot」变成「按调用参数里的 ctx 解析」。
+func TestAPIVersionIsFourteen(t *testing.T) {
+	if APIVersion != "14" {
+		t.Fatalf("APIVersion=%q，期望 \"14\"", APIVersion)
 	}
 }
