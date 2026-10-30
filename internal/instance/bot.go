@@ -166,11 +166,14 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		API:   apiClient,
 		// 插件出站也走这个 Bot 自己的客户端：域名额度与冷却桶因此按 Bot 分区，
 		// 与核心自身的调用同一份额度（不是两份额度）。
-		HTTP:     outbound,
-		Log:      rt.log,
-		Config:   c.cfg,
-		Plugins:  plugins,
-		Renderer: c.o.Renderer,
+		HTTP:    outbound,
+		Log:     rt.log,
+		Config:  c.cfg,
+		Plugins: plugins,
+		// 渲染器是进程级共享的一份（字体与内存上限都是全局的），但每个 Bot
+		// 各包一层"同时最多 1 个渲染任务"的闸门：单租户连续提交渲染不该
+		// 把全局那 2 格吃满，让别的租户只能排队。
+		Renderer: renderGateFor(c.o.Renderer),
 		Upgrade:  upgrade,
 	})
 	if err != nil {
