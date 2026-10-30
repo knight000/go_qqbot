@@ -20,6 +20,7 @@ import (
 func TestBotsRunIsolatedWithOwnStoreAndToken(t *testing.T) {
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	c := startContainer(t, cfg, p)
 
 	p.waitReady(t, "102000001")
@@ -101,6 +102,7 @@ func TestLockedBotDoesNotStopTheOthers(t *testing.T) {
 	isolateTemp(t, t.TempDir())
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 
 	// 抢在容器之前占住 B 的 appID 锁，模拟另一个 Core 正在托管它。
 	holder, err := Acquire(LockOptions{
@@ -148,6 +150,7 @@ func TestBrokenBotDoesNotBlockStartup(t *testing.T) {
 	isolateTemp(t, t.TempDir())
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	// 把第一个 Bot 的 data_dir 指向"一个文件下面"：MkdirAll 必然失败。
 	blocked := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
@@ -298,6 +301,7 @@ func TestOneDeadBotDoesNotStopTheOthers(t *testing.T) {
 	p := newFakePlatform(t)
 	p.fatalFor = map[string]int{"102000001": 4915} // 4915 = 机器人已封禁
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	log, logs := testLogger()
 	c := startContainer(t, cfg, p, func(o *Options) { o.Log = log })
 
@@ -371,6 +375,7 @@ func TestStartupSummaryIsVisible(t *testing.T) {
 func TestRateLimitOnOneBotDoesNotSilenceTheOther(t *testing.T) {
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	logs, readLogs := testLogger()
 	startContainer(t, cfg, p, func(o *Options) { o.Log = logs })
 

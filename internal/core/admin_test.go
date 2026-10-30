@@ -35,7 +35,20 @@ func newAdminCore(t *testing.T) (*Core, *fakeAPI) {
 		startedAt: time.Now(),
 		restart:   make(chan RestartRequest, 1),
 	}
+	markActive(t, db)
 	return c, f
+}
+
+// markActive 把测试库标成 active。
+//
+// 闸门按"admins 为空 → pending_claim"推导，而这些用例测的是**认领之后**的
+// 处理链路；不标这一行，每条事件都会在第一道闸门被丢掉，用例会退化成
+// "什么都没发生"。
+func markActive(t *testing.T, db *store.DB) {
+	t.Helper()
+	if err := SaveBotState(context.Background(), db, BotStateActive); err != nil {
+		t.Fatalf("标记 active: %v", err)
+	}
 }
 
 // 事件 ID 与 msg_id 都要唯一：去重表会拦重复事件，被动回复额度按 msg_id 计。

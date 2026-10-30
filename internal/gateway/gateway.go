@@ -43,6 +43,11 @@ type Options struct {
 	Handler    func(ctx context.Context, ev *host.Event)
 	// RawDump 非空时，每条 dispatch 事件在解码前把原始 JSON 交出去（调试用）。
 	RawDump func(typ string, raw []byte)
+	// OnReady 在 READY/RESUMED 到达时回调一次（参数表示是不是 Resume）。
+	//
+	// 只有握手成功才证明"凭据与身份是好的"：TCP 连上、Identify 发出去了都不算。
+	// 装配层用它把 failing 拉回 active——这是状态机唯一认的"重连成功"信号。
+	OnReady func(resumed bool)
 
 	// HTTPClient 注入 WSS 握手的传输层，nil 时用 15s 超时的默认客户端。
 	// 与 httpx 的 HTTPClient 同一个用途：自签证书、将来接代理时不必改构造函数。
@@ -181,6 +186,17 @@ func (c *Client) takeManual() bool {
 
 // connectOnce 建立一条连接并跑到它断开为止。
 //
+// notifyReady 把"这条连接真的接上了"告诉装配层。
+//
+// 不在读循环里加锁、不做任何可能阻塞的事：它在每一条连接上都会走一次，
+// 回调里只该是一次状态判定（绝大多数情况是 no-op）。
+func (c *Client) notifyReady(resumed bool) {
+	if c.o.OnReady == nil {
+		return
+	}
+	c.o.OnReady(resumed)
+}
+
 // readyFor 是"READY/RESUMED 之后这条连接还活着多久"：用来判断连接是否稳定过，
 // 从而决定 Run 里的退避要不要复位。没收到 READY/RESUMED 时为 0。
 func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err error) {
@@ -307,11 +323,13 @@ func (c *Client) connectOnce(ctx context.Context) (readyFor time.Duration, err e
 				hsCancel()
 				c.onReady(ctx, p.D)
 				readySince = time.Now()
+				c.notifyReady(false)
 			} else if p.T == "RESUMED" {
 				hs.markReady()
 				hsCancel()
 				c.lg.Info("Resume 成功，事件不中断")
 				readySince = time.Now()
+				c.notifyReady(true)
 			} else {
 				c.dispatch(ctx, p.T, p.D)
 			}
