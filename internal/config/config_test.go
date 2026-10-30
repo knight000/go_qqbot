@@ -66,8 +66,8 @@ secret = ""
 	if err == nil {
 		t.Fatal("app.secret 为空时应当报错")
 	}
-	if !strings.Contains(err.Error(), ".secret") {
-		t.Fatalf("错误串应指到 secret，实际 %q", err)
+	if !strings.Contains(err.Error(), ".secret 为空") {
+		t.Fatalf("错误串应指到 secret 为空，实际 %q", err)
 	}
 	// 旧形态要能被认出来：用户写的明明是 [app]，报错却只说 bots[0] 会让人
 	// 在一份没有 [[bots]] 的配置里找不到北。
@@ -665,6 +665,31 @@ secret = "s"
 				}
 			}
 		})
+	}
+}
+
+// 文件里手抄的 appid/secret 可能带首尾空格。appid 会被拼进数据目录与锁文件名，
+// secret 会进 Authorization 请求头，所以归一化必须写回配置，而不是只在比较时 Trim
+// ——否则校验通过、运行时带着空格去连，报错点离病因很远。
+func TestBotFieldsAreTrimmed(t *testing.T) {
+	t.Setenv("QQ_APP_ID", "")
+	t.Setenv("QQ_APP_SECRET", "")
+	path := writeConfig(t, `
+[[bots]]
+appid = " 102000001 "
+secret = " s "
+data_dir = " /srv/qqbot/manual "
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := cfg.Bots[0]
+	if b.AppID != "102000001" || b.Secret != "s" {
+		t.Errorf("凭据未归一化: appid=%q secret=%q", b.AppID, b.Secret)
+	}
+	if got := cfg.BotDataDir(b); got != "/srv/qqbot/manual" {
+		t.Errorf("data_dir 未归一化: %q", got)
 	}
 }
 

@@ -79,6 +79,23 @@ func (fakePlugin) Handle(context.Context, *host.Event) (*host.Reply, error) {
 	return nil, nil
 }
 
+// enabled=false 不能只出现在日志里：过渡期只装配一个 Bot，取的是"第一个启用的"，
+// 全部停用时启动直接失败——带着一个本该停用的 Bot 起来等于把开关当装饰。
+func TestFirstEnabledBotSkipsDisabled(t *testing.T) {
+	disabled, enabled := false, true
+	bots := []config.Bot{
+		{AppID: "102000001", Enabled: &disabled},
+		{AppID: "102000002", Enabled: &enabled},
+	}
+	b, ok := firstEnabledBot(bots)
+	if !ok || b.AppID != "102000002" {
+		t.Fatalf("应跳过停用的 Bot 取下一个，实际 %+v ok=%v", b, ok)
+	}
+	if _, ok := firstEnabledBot([]config.Bot{{AppID: "102000003", Enabled: &disabled}}); ok {
+		t.Fatal("全部停用时应返回 false，由调用方失败退出")
+	}
+}
+
 // 每个 Bot 的数据目录必须在启动日志里可见：它由 appid 推导，备份、迁移、
 // 清理都靠这一行确认"东西到底落在哪"。secret 一个字节都不许出现。
 func TestLogBotsPrintsDataDirAndNeverSecret(t *testing.T) {
@@ -96,7 +113,12 @@ func TestLogBotsPrintsDataDirAndNeverSecret(t *testing.T) {
 	if got := strings.Count(out, "Bot 配置"); got != 2 {
 		t.Fatalf("应每个 Bot 一行，实际 %d 行:\n%s", got, out)
 	}
-	for _, want := range []string{"data_dir=", "appid=102000001", "appid=102000002", "data_dir=/srv/qqbot/manual"} {
+	for _, want := range []string{
+		"data_dir=", "appid=102000001", "appid=102000002",
+		"data_dir=/srv/qqbot/manual",
+		// 推导出来的目录还没启用：同一行必须能看到当前真正在用的库。
+		"db=data/qqbot.db",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("启动日志缺少 %q：\n%s", want, out)
 		}

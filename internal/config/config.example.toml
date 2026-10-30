@@ -36,8 +36,7 @@ secret = ""
 # 缺省 true。false 表示这个 Bot 不连接（状态 suspended）。
 enabled = true
 # 认证类型：unverified | personal | enterprise，缺省 personal。
-# 它决定平台把这个 Bot 的事件推给谁（未认证只有所有者私聊；个人认证只有
-# 自己是群主/管理员的群与开发体验用户；企业认证可公开加群），核心不做来源判定。
+# 它决定平台把这个 Bot 的事件推给谁（见 GLOSSARY「认证类型」），核心不做来源判定。
 cert_type = "personal"
 # 配额档：指向全局配额表，缺省 default（配额表尚未落地，当前只做承载与校验）。
 quota_profile = "default"

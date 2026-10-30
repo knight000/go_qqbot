@@ -161,7 +161,8 @@ func TestInitInEmptyDirCreatesEverything(t *testing.T) {
 	}
 
 	// 下一步必须说清楚去哪儿填凭据，否则用户拿着空配置启动只会看到校验错误。
-	for _, want := range []string{"[[bots]].appid", "secret", cfgPath} {
+	// 断言整句而不是分别断言 "appid"/"secret"：后者任何一段输出都能满足。
+	for _, want := range []string{"[[bots]].appid 与 secret", cfgPath} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("init 输出缺少 %q：\n%s", want, stdout)
 		}

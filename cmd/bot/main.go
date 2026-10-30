@@ -141,15 +141,20 @@ func run() (*core.RestartRequest, error) {
 		log.Warn(w)
 	}
 
-	// 本票只装配第一个 Bot：把进程拆成「进程级容器 + 每 Bot 编排器」是 #62。
-	// 校验保证列表非空（config.Validate 对空列表直接报错），所以不判长度。
-	bot := cfg.Bots[0]
+	// 本票只装配一个 Bot：把进程拆成「进程级容器 + 每 Bot 编排器」是 #62。
+	// 取第一个"启用的"，而不是无脑取第一个：enabled=false 已经是配置层的事实，
+	// 只打日志不执行会让运维以为停用了、实际还在连。真正连不上时（全部停用）
+	// 直接失败，而不是带着一个不该上线的 Bot 起来。
+	bot, ok := firstEnabledBot(cfg.Bots)
+	if !ok {
+		return nil, errors.New("没有启用的 Bot：所有 [[bots]] 都是 enabled = false，进程无事可做")
+	}
 	logBots(log, cfg)
 	if len(cfg.Bots) > 1 {
 		// 配置已经能表达多个 Bot，但编排还没落地：静默只跑一个是这里最坏的
-		// 处置——用户会以为其余的号也在线。这条 warn 随 #62 一起删。
-		log.Warn("本版本只连接第一个 Bot，其余 Bot 尚未编排",
-			"configured", len(cfg.Bots), "running", bot.AppID)
+		// 处置——用户会以为其余的 Bot 也在线。这条 warn 随 #62 一起删。
+		log.Warn("本版本只连接第一个启用的 Bot，其余 Bot 尚未编排",
+			"configured", len(cfg.Bots), "appid", bot.AppID)
 	}
 
 	// 信号注册必须在这里——配置刚读完，后面还要解析字体（约 300ms）、拿单实例锁、
@@ -542,17 +547,34 @@ type startupInfo struct {
 // logBots 在启动期逐个打印 Bot 的实际生效配置。
 //
 // 数据目录必须可见：它由 appid 推导（[store].path 所在目录下的 bots/<appid>/），
-// 用户只有在这一行才能确认"这台机器的数据到底落在哪"——备份、迁移、清理都靠它。
-// 永不打印 secret，连长度也不打。
+// 用户只有在这一行才能确认"按 Bot 分库之后数据会落在哪"——备份、迁移、清理都靠它。
+//
+// 同一行还打出当前真正在用的库：本票行为不变，进程仍然只开 [store].path 这一份，
+// 两个字段并列才能让运维看出"推导出来的目录还没启用"，而不是照着一条不存在的
+// 路径去找数据。永不打印 secret，连长度也不打。
 func logBots(log *slog.Logger, cfg *config.Config) {
 	for _, b := range cfg.Bots {
 		log.Info("Bot 配置",
 			"appid", b.AppID,
 			"data_dir", cfg.BotDataDir(b),
+			"db", cfg.Store.Path,
 			"cert_type", b.CertType,
 			"quota_profile", b.QuotaProfile,
 			"enabled", b.IsEnabled())
 	}
+}
+
+// firstEnabledBot 返回第一个启用的 Bot。
+//
+// #62 之前进程只装配一个 Bot，所以这里是"取第一个"而不是"取全部"；
+// 跳过停用的那几条，是为了让 enabled=false 立刻生效，而不是只出现在日志里。
+func firstEnabledBot(bots []config.Bot) (config.Bot, bool) {
+	for _, b := range bots {
+		if b.IsEnabled() {
+			return b, true
+		}
+	}
+	return config.Bot{}, false
 }
 
 // logStartup 打印启动完成。插件既报数量也报名字：

@@ -9,7 +9,8 @@
 //   - 同一份代码、同一套配置结构，沙箱与正式只差 [core].sandbox；
 //   - 认证信息写在本地 config 文件里（config.local.toml，不入 git），
 //     同时保留 QQ_APP_ID / QQ_APP_SECRET 环境变量覆盖，便于生产环境收紧权限。
-//     环境变量只有单值，所以只对"恰好一个 Bot"的形态生效。
+//     环境变量只有单值：唯一一个 Bot 时照旧生效，多个 Bot 时只覆盖第一个并
+//     告警——多值环境变量没有可用的表达形式。
 package config
 
 import (
@@ -454,12 +455,8 @@ func (c *Config) PluginDisabled(name string) bool {
 // Load 读取配置、把旧形态归一、套默认值、做环境变量覆盖，最后校验。
 func Load(path string) (*Config, error) {
 	c := new(Config)
-	md, err := decodeFile(path, c)
-	if err != nil {
+	if err := decodeAndNormalize(path, c); err != nil {
 		return nil, err
-	}
-	if err := c.normalize(md); err != nil {
-		return nil, fmt.Errorf("解析配置 %s: %w", path, err)
 	}
 	c.applyEnv()
 	c.applyDefaults()
@@ -472,19 +469,30 @@ func Load(path string) (*Config, error) {
 // LoadForInit 读取配置、把旧形态归一、套默认值，但**不校验**。
 //
 // `qqbot init --plugins` 只需要 [store].path 来定位数据目录。init 生成的
-// 配置里 appid/secret 本来就是留空的，用 Load 会因为"还没填 AppID"而
+// 配置里 appid/secret 本来就是留空的，用 Load 会因为"还没填 Bot 凭据"而
 // 拒绝释放插件——而那正是这个命令要救的现场（ADR-0005 决策 12）。
 func LoadForInit(path string) (*Config, error) {
 	c := new(Config)
-	md, err := decodeFile(path, c)
-	if err != nil {
+	if err := decodeAndNormalize(path, c); err != nil {
 		return nil, err
-	}
-	if err := c.normalize(md); err != nil {
-		return nil, fmt.Errorf("解析配置 %s: %w", path, err)
 	}
 	c.applyDefaults()
 	return c, nil
+}
+
+// decodeAndNormalize 读文件、解 TOML、把旧形态归一，两个入口共用。
+//
+// 归一化必须走同一条路径：漏了它，一份老配置在 Load 里是"一个 Bot"，
+// 在 LoadForInit 里却是"没有 Bot"，init 与启动就会落到不同的数据目录。
+func decodeAndNormalize(path string, c *Config) error {
+	md, err := decodeFile(path, c)
+	if err != nil {
+		return err
+	}
+	if err := c.normalize(md); err != nil {
+		return fmt.Errorf("解析配置 %s: %w", path, err)
+	}
+	return nil
 }
 
 // normalize 把旧形态的 [app] 翻译成 Bots[0]，并拒绝两种形态同时出现。
@@ -498,9 +506,12 @@ func (c *Config) normalize(md toml.MetaData) error {
 	}
 	if len(c.Bots) > 0 {
 		// 两个来源都在，静默择一是最坏的处置：用户会以为自己登记的那个 Bot
-		// 生效了，实际上跑到另一个号上。二义一律拒绝。
+		// 生效了，实际上跑到另一个 Bot 上。二义一律拒绝，并在同一句话里
+		// 说清迁移动作——转成 [[bots]] 时 [app] 的端点没有等价位置，
+		// 不提醒就会被静默丢掉、直接连上正式环境。
 		return errors.New("[app] 与 [[bots]] 不能同时出现：前者是单 Bot 的旧形态，" +
-			"后者是数组形态，两处都写等于两个来源（留 [app] 就删掉 [[bots]]，反之亦然）")
+			"后者是数组形态，两处都写等于两个来源（留 [app] 就删掉 [[bots]]；" +
+			"反过来转成 [[bots]] 时，把 [app] 的 sandbox / api_base / token_url 搬到 [core]）")
 	}
 	c.Bots = []Bot{{
 		AppID:  c.App.ID,
@@ -576,10 +587,18 @@ func (c *Config) applyEnv() {
 
 func (c *Config) applyDefaults() {
 	// 每个 Bot 的缺省值。cert_type 缺省 personal：旧形态没有这个概念，
-	// 而 personal 正是"自己的号自己用"的档位；quota_profile 缺省 default
+	// 而 personal 正是"自己的 Bot 自己用"的档位；quota_profile 缺省 default
 	// 指向配额表的默认档（表在 T7 落，这里只承载档名）。
+	//
+	// appid/secret/data_dir 在这里 Trim：环境变量早就 Trim 过，文件里手抄的值
+	// 却可能带首尾空格，而 appid 会被拼进数据目录与锁文件名、secret 会进
+	// Authorization——带着空格只会在很远的地方炸，校验时 Trim 而不写回等于
+	// 把问题留到运行时。
 	for i := range c.Bots {
 		b := &c.Bots[i]
+		b.AppID = strings.TrimSpace(b.AppID)
+		b.Secret = strings.TrimSpace(b.Secret)
+		b.DataDir = strings.TrimSpace(b.DataDir)
 		if b.CertType = strings.ToLower(strings.TrimSpace(b.CertType)); b.CertType == "" {
 			b.CertType = CertPersonal
 		}
