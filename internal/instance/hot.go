@@ -86,6 +86,14 @@ func (c *Container) findRuntime(appid string) *botRuntime {
 // 跟在后面。后者必须出现——否则"purge 一个已经删掉条目的 Bot"这件事在
 // /bot list 里没有任何入口提示。
 func (c *Container) Snapshot(ctx context.Context) ([]core.BotView, error) {
+	// 与结构性热操作串行：一次 reload 中途读到的名单会是"半套"，
+	// 而 /bot list 是给人做判断用的，半套比没有更糟。
+	if c.shuttingDown() {
+		return nil, errors.New("进程正在关停")
+	}
+	c.hotMu.Lock()
+	defer c.hotMu.Unlock()
+
 	cfg := c.config()
 	views := make([]core.BotView, 0, len(cfg.Bots))
 	seen := make(map[string]bool, len(cfg.Bots))
@@ -394,6 +402,9 @@ func (c *Container) stop(ctx context.Context, rt *botRuntime, reason string) {
 
 // PurgeStats 返回 purge 会删掉多少行（预览，不动数据）。
 func (c *Container) PurgeStats(ctx context.Context, appid string) (store.ResetCounts, error) {
+	if c.shuttingDown() {
+		return store.ResetCounts{}, errors.New("进程正在关停")
+	}
 	c.hotMu.Lock()
 	defer c.hotMu.Unlock()
 	b, inConfig := c.botEntry(appid)
@@ -418,6 +429,9 @@ func (c *Container) PurgeStats(ctx context.Context, appid string) (store.ResetCo
 // 会留下无引用的孤儿文件。保留的东西也一致——admins、qq_groups、bot_state
 // 都不动，所以再加回配置条目时群名单、历史归属与认领关系都还在。
 func (c *Container) Purge(ctx context.Context, appid string) (store.ResetCounts, int, error) {
+	if c.shuttingDown() {
+		return store.ResetCounts{}, 0, errors.New("进程正在关停")
+	}
 	c.hotMu.Lock()
 	defer c.hotMu.Unlock()
 
