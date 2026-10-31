@@ -120,7 +120,7 @@ type pluginServer struct {
 // botState 是一个 Bot 在本插件进程里的全部状态。
 //
 // 一个 Bot 可以**被重新初始化**：`/bot reload <appid>` 会先停掉它的核心
-//（注销 Host、关库、放锁），再用同一套插件进程重新 init/start。所以这里的
+// （注销 Host、关库、放锁），再用同一套插件进程重新 init/start。所以这里的
 // 字段描述的是"这一轮初始化"，不是"这个 Bot 的永久属性"。
 type botState struct {
 	host *HostClient
