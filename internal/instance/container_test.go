@@ -20,6 +20,7 @@ import (
 func TestBotsRunIsolatedWithOwnStoreAndToken(t *testing.T) {
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	c := startContainer(t, cfg, p)
 
 	p.waitReady(t, "102000001")
@@ -101,6 +102,7 @@ func TestLockedBotDoesNotStopTheOthers(t *testing.T) {
 	isolateTemp(t, t.TempDir())
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 
 	// 抢在容器之前占住 B 的 appID 锁，模拟另一个 Core 正在托管它。
 	holder, err := Acquire(LockOptions{
@@ -148,6 +150,7 @@ func TestBrokenBotDoesNotBlockStartup(t *testing.T) {
 	isolateTemp(t, t.TempDir())
 	p := newFakePlatform(t)
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	// 把第一个 Bot 的 data_dir 指向"一个文件下面"：MkdirAll 必然失败。
 	blocked := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
@@ -298,6 +301,7 @@ func TestOneDeadBotDoesNotStopTheOthers(t *testing.T) {
 	p := newFakePlatform(t)
 	p.fatalFor = map[string]int{"102000001": 4915} // 4915 = 机器人已封禁
 	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
 	log, logs := testLogger()
 	c := startContainer(t, cfg, p, func(o *Options) { o.Log = log })
 
@@ -363,4 +367,65 @@ func TestStartupSummaryIsVisible(t *testing.T) {
 	if strings.Contains(out, "secret-102000001") {
 		t.Errorf("启动日志泄露了 secret：\n%s", out)
 	}
+}
+
+// 一个 Bot 被 429 罚下，另一个 Bot 必须照常出网。
+//
+// 这是 #66 的核心验收：冷却桶从「域名」改成「(bot, 域名)」。断言落在平台侧
+// 收到的请求上——共享桶时 B 的 POST 根本不会出网（本地就被冷却挡下），
+// 而"没出网"与"出网了但失败"在日志里长得一样，只有平台侧能区分。
+func TestRateLimitOnOneBotDoesNotSilenceTheOther(t *testing.T) {
+	p := newFakePlatform(t)
+	cfg := testConfig(t, p, "102000001", "102000002")
+	seedActiveBots(t, cfg)
+	logs, readLogs := testLogger()
+	startContainer(t, cfg, p, func(o *Options) { o.Log = logs })
+
+	p.waitReady(t, "102000001")
+	p.waitReady(t, "102000002")
+
+	// A 的下一次发消息吃 429；B 完全正常。
+	p.throttle429("102000001", 1)
+	p.push(t, "102000001", "GROUP_AT_MESSAGE_CREATE", groupMessage("EV-A", "G-A", "hello-A"))
+
+	// 冷却日志必须点名到 Bot：排障时"谁被罚"只能从这一行看出来。
+	waitLog(t, readLogs, "出站 429", "bot=102000001")
+
+	// A 的桶此刻正在冷却（Retry-After: 5s）。B 的请求必须真的到达平台。
+	p.push(t, "102000002", "GROUP_AT_MESSAGE_CREATE", groupMessage("EV-B", "G-B", "hello-B"))
+
+	sends := p.waitSends(t, 1)
+	if len(sends) != 1 || sends[0].appID != "102000002" {
+		t.Fatalf("被 429 的 Bot 只该影响自己：期望只有 B 的出站，实际 %+v", sends)
+	}
+	if got := sends[0].content; got != "echo:hello-B" {
+		t.Fatalf("B 的回复内容不对: %q", got)
+	}
+	// A 的请求确实被平台拒过（不是本地就没发出去）。
+	if n := p.messageAttempts("102000001"); n != 1 {
+		t.Fatalf("A 应有过 1 次发消息尝试（被平台 429），实际 %d", n)
+	}
+}
+
+// 多 Bot 时装配层要建一份共享的任务额度池，只有一个启用的 Bot 时不建。
+//
+// 这条看的是装配事实（容器字段）而不是外部行为：并行度的效果已在 core 侧
+// 按"全局 4 / 每 Bot 1"有用例，这里只防一个不会报错的疏漏——忘了建池或忘了
+// 注入时，功能会静默退回 4×N，没有任何日志能看出来。
+func TestJobPoolIsSharedOnlyWhenMultipleBots(t *testing.T) {
+	t.Run("两个 Bot 共享一份池", func(t *testing.T) {
+		p := newFakePlatform(t)
+		c := startContainer(t, testConfig(t, p, "102000001", "102000002"), p)
+		if c.jobs == nil {
+			t.Fatal("多 Bot 时必须建进程级共享池（否则并行度是 4×N）")
+		}
+	})
+
+	t.Run("单个 Bot 保持自建", func(t *testing.T) {
+		p := newFakePlatform(t)
+		c := startContainer(t, testConfig(t, p, "102000001"), p)
+		if c.jobs != nil {
+			t.Fatal("只有唯一租户时不该注入共享池（并行度会被砍到 1）")
+		}
+	})
 }
