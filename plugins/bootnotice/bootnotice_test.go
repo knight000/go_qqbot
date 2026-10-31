@@ -63,7 +63,10 @@ type fakeHost struct {
 	dir    fakeDir
 }
 
-func (f *fakeHost) Plugin() string              { return "bootnotice" }
+func (f *fakeHost) Plugin() string { return "bootnotice" }
+
+// Bot 返回零值：这些用例是单 Bot 的，没有共享进程上下文。
+func (f *fakeHost) Bot() host.BotInfo           { return host.BotInfo{} }
 func (f *fakeHost) Config() host.Params         { return f.cfg }
 func (f *fakeHost) Sender() host.Sender         { return f.sender }
 func (f *fakeHost) KV() host.KV                 { return f.kv }

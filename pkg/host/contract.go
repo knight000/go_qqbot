@@ -98,6 +98,14 @@ var contractChanges = []Change{
 	// 与 Uses（插件自报的使用面，#56）。两项都是纯增量：按 12 编译的插件根本没有
 	// 这两个字段，判定整条跳过。记进来的作用只是让表覆盖本版的全部契约变更。
 	{Version: 13, Class: Additive, Surface: "Manifest.Upstream,Manifest.Uses"},
+
+	// v14：一套插件进程服务 N 个 Bot（ADR-0008 决策 11）。两类变更分两行记：
+	//   - Host.Bot 是新增能力，插件不用它是安全的；
+	//   - 另外八个成员的**返回值开始取决于当前 Bot**——签名不变，但没有编译期
+	//     信号，插件里存了"当前 Bot"或用包级状态的会串库。逐个点名而不用 "*"：
+	//     只用 Host.Log 的插件确实不受影响，这正是 ADR-0007 要的按使用面判定。
+	{Version: 14, Class: Additive, Surface: "Host.Bot"},
+	{Version: 14, Class: Behavioral, Surface: "Host.Config,Host.KV,Host.PeerKV,Host.Query,Host.IsAdmin,Host.Admins,Host.Sender,Host.Session"},
 }
 
 // CheckCompat 判断一个按 builtAgainst 编译、声明了 uses 使用面的插件能否被

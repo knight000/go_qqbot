@@ -19,19 +19,20 @@ import (
 // botRuntime 是一个 Bot 的全部运行期资源，也是它的编排器。
 //
 // 「一 Bot 一库」在代码里的落点就是这里：一个 Bot 一份 store、一个 api 客户端
-// （令牌缓存因此天然按 Bot 分区）、一条网关连接、一套插件进程。容器只按
-// 配置顺序把它们逐个装起来，彼此之间不共享任何可变状态。
+// （令牌缓存因此天然按 Bot 分区）、一条网关连接、一个只服务本 Bot 的 Core。
+// 容器只按配置顺序把它们逐个装起来，彼此之间不共享任何可变状态。
 //
-// 插件进程目前在每 Bot 各起一套，是过渡形态：ADR-0008 决策 11 要求共享一套
-// 进程、由核心按 Bot 给独立 Host 实例，那是 #65 的事。在那之前，宁可多花内存，
-// 也不能让两个 Bot 的事件落到同一个插件的 Host 上——那会直接串库。
+// 插件是**进程级共享**的（ADR-0008 决策 11）：rt.plugins 指向容器那一份句柄，
+// 每个 Bot 只是把自己的 Host 注册进这些句柄（plugin.Init 时按 bot_id 登记）。
+// 所以这里不持有插件生命周期——关停时只摘掉自己的登记，插件由容器最后统一关。
 type botRuntime struct {
 	cfg config.Bot
 	log *slog.Logger
 
-	db      *store.DB
-	lock    *Lock
+	db *store.DB
+	// plugins 是共享句柄的一份引用（不拥有生命周期），只用于注册/注销与日志。
 	plugins []host.Plugin
+	lock    *Lock
 	// coreImpl 是核心；为 nil 表示装配在它之前就失败了。
 	coreImpl *core.Core
 	gw       *gateway.Client
@@ -177,11 +178,8 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		Gate:  rt,
 	})
 
-	plugins, err := c.loadPlugins(ctx, b, rt.log)
-	if err != nil {
-		rt.err = err
-		return rt
-	}
+	// 插件是进程级共享的：这里只拿到容器的同一份句柄，不新起进程。
+	plugins := c.plugins
 	rt.plugins = plugins
 
 	var upgrade core.UpgradeService
@@ -199,8 +197,12 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		API:   apiClient,
 		// 插件出站也走这个 Bot 自己的客户端：域名额度与冷却桶因此按 Bot 分区，
 		// 与核心自身的调用同一份额度（不是两份额度）。
-		HTTP:    outbound,
-		Log:     rt.log,
+		HTTP: outbound,
+		Log:  rt.log,
+		// Bot 是本 Core 的身份：共享插件进程时，每条插件调用都由它标注
+		// 「这次属于谁」（ADR-0008 决策 11）。
+		Bot:     host.BotInfo{AppID: b.AppID, CertType: b.CertType},
+		BotID:   b.AppID,
 		Config:  c.cfg,
 		Plugins: plugins,
 		// 渲染器是进程级共享的一份（字体与内存上限都是全局的），但每个 Bot
@@ -208,7 +210,6 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		// 把全局那 2 格吃满，让别的租户只能排队。
 		Renderer: renderGateFor(c.o.Renderer),
 		Upgrade:  upgrade,
-		BotID:    b.AppID,
 		// c.jobs 为 nil 时 Scheduler 自建一份容量 4 的池（单 Bot 行为不变）；
 		// 非 nil 时所有 Bot 共享它，并因此各自同时只跑 1 个桶。
 		Jobs:  c.jobs,
@@ -345,10 +346,34 @@ func (b *botRuntime) waitGateway(ctx context.Context) bool {
 	}
 }
 
-// close 按装配的逆序释放：核心（内含调度收尾、派发排空、关插件）→ 库 → 锁。
+// botHostForgetter 是共享插件句柄可能实现的「按 Bot 注销」能力。
 //
-// 装配中途失败时也走这里：coreImpl 为 nil 就直接关插件，库与锁各自判空。
-// 顺序不能反——插件与核心都在写库，先关库会得到一串 database is closed。
+// 只有跨进程的 proxy 需要它（进程内插件不存在多 Bot 的情形）；定义成可选
+// 接口而不是往 host.Plugin 里加方法：host.Plugin 是插件契约，而"这个 Bot
+// 走了"是装配层的事实，插件不该为此涨一次契约版本。
+type botHostForgetter interface {
+	UnregisterBotHost(botID string)
+}
+
+// unregisterBotHost 把本 Bot 的 Host 从每个共享句柄上摘掉。
+//
+// 必须在关库之前：迟到的 host.* 调用如果还能查到这份 Host，就会写进一个
+// 正在关闭的库，症状是一串 database is closed 且看不出是谁在写。
+func unregisterBotHost(plugins []host.Plugin, botID string) {
+	for _, p := range plugins {
+		if f, ok := p.(botHostForgetter); ok {
+			f.UnregisterBotHost(botID)
+		}
+	}
+}
+
+// close 按装配的逆序释放：核心（内含调度收尾、派发排空）→ 注销本 Bot 的
+// Host → 库 → 锁。**不关插件**：它是进程级共享的，由容器在最后统一关
+// （ADR-0008 决策 11）。
+//
+// 装配中途失败时也走这里：coreImpl 为 nil 时插件里可能已经登记过本 Bot 的
+// Host（Init 之后才失败），照样注销，不留一条指向已关闭数据库的表项。
+// 顺序不能反——核心与插件都在写库，先关库会得到一串 database is closed。
 func (b *botRuntime) close(ctx context.Context) error {
 	var errs []error
 	if b.coreImpl != nil {
@@ -356,11 +381,9 @@ func (b *botRuntime) close(ctx context.Context) error {
 			b.log.Warn("核心关停未完成", "err", err)
 			errs = append(errs, err)
 		}
-		// Shutdown 一定会走到关插件那一步，别再关第二遍。
-	} else {
-		// 装配在 core.New 之前就失败了：插件已经活着，但没有 Core 替它收尾。
-		core.ClosePlugins(ctx, b.log, b.plugins)
 	}
+	// 插件进程还在服务别的 Bot，摘掉的只是这一个 Bot 的登记。
+	unregisterBotHost(b.plugins, b.cfg.AppID)
 	b.plugins = nil
 	if b.db != nil {
 		path := b.db.Path()

@@ -166,7 +166,7 @@ func TestConcurrentHandles(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			want := fmt.Sprint(i)
-			reply, err := p.conn.CallHandle(ctx, p.event("/echo", want))
+			reply, err := p.conn.CallHandle(ctx, p.bot, p.event("/echo", want))
 			if err != nil {
 				errs <- fmt.Errorf("第 %d 个: %w", i, err)
 				return
@@ -229,7 +229,7 @@ func TestLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := p.conn.CallStart(ctx); err != nil {
+	if err := p.conn.CallStart(ctx, p.bot); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	spec := host.JobSpec{
@@ -240,7 +240,7 @@ func TestLifecycle(t *testing.T) {
 		PerPeer: true,
 		Peer:    "g9",
 	}
-	if err := p.conn.CallRunJob(ctx, spec); err != nil {
+	if err := p.conn.CallRunJob(ctx, p.bot, spec); err != nil {
 		t.Fatalf("RunJob: %v", err)
 	}
 	p.expect("/job", "", "job=tick peer=g9 perPeer=true timeout=90000000000 started=true")

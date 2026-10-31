@@ -61,12 +61,14 @@ type Options struct {
 	// Handshake 只用于 WSS 握手（测试注入信任自签证书的客户端，生产留 nil
 	// 走默认）。它与 Outbound 是两个东西：前者是"连得上"，后者是"发得出去"。
 	Handshake *http.Client
-	// LoadPlugins 装配某个 Bot 的插件集。nil 表示这个 Core 不加载插件
-	// （会打一条 warn，不是静默）。
+	// LoadPlugins 装配**进程级**的插件集：一套插件进程服务所有 Bot
+	// （ADR-0008 决策 11）。nil 表示这个 Core 不加载插件（会打一条 warn，
+	// 不是静默）。
 	//
 	// 这是个回调而不是容器自己去调 pluginproc.Load：插件目录、停用名单、
-	// 错误码表都是装配点（cmd/bot）的事实，容器只负责"每个 Bot 各装一套"。
-	LoadPlugins func(ctx context.Context, bot config.Bot, log *slog.Logger) ([]host.Plugin, error)
+	// 错误码表都是装配点（cmd/bot）的事实，容器只负责"进程级加载一次、
+	// 所有 Bot 共享这一组句柄"。
+	LoadPlugins func(ctx context.Context, log *slog.Logger) ([]host.Plugin, error)
 	// UpgradeFor 返回某个 Bot 的升级能力；nil 表示不装配自更新。
 	UpgradeFor func(bot config.Bot, db *store.DB, plugins []host.Plugin) core.UpgradeService
 	// LockWait 是每个 Bot 等单实例锁的上限：/reload 交接给 15s，普通启动 0。
@@ -94,6 +96,9 @@ type Container struct {
 	cancel context.CancelFunc
 
 	mu sync.Mutex
+	// plugins 是**进程级共享**的插件句柄：启动时加载一次，所有 Bot 共用。
+	// 它们的生命周期不归任何单个 Bot——由 Shutdown 在最后统一关。
+	plugins []host.Plugin
 	// bots 按配置顺序记录每个"启用"的 Bot 的装配结果（失败的也在里面）。
 	bots []*botRuntime
 	// live 是还没退出的网关数；starting 表示启动循环还没走完。
@@ -170,6 +175,16 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 		"bots", len(cfg.Bots), "enabled", enabled,
 		"stagger", c.stagger.Interval().String())
 
+	// 插件只加载一次：一套进程服务所有 Bot（ADR-0008 决策 11）。加载失败是
+	// 整机级失败——没有插件时"启动了但什么都不响应"比报错难查得多。
+	shared, err := c.loadPlugins(runCtx, log)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	c.plugins = shared
+	logPluginSet(shared, log)
+
 	// 多 Bot 时任务桶共享一份池：调度桶并行 4 是按进程内存实测调的，每个
 	// Core 各持一份等于 4×N，且一个租户能占满自己那 4 格（ADR-0008 决策 13）。
 	// 只有一个启用的 Bot 时不注入：那时它就是唯一租户，凭空把并行砍到 1
@@ -236,52 +251,57 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 		}
 	}
 
-	// 过渡形态下每个 Bot 各起一套插件进程，进程数 = plugins_total。它必须
-	// 出现在这一行：内存上限是按 cgroup 整体算的，N 个租户要 N 倍插件内存，
-	// 而"到底起了几个进程"只有这里能一眼看到（ADR-0008 决策 11 落地后归零）。
-	pluginsTotal := 0
-	for _, rt := range c.bots {
-		pluginsTotal += len(rt.plugins)
-	}
+	// 一套插件进程服务所有 Bot：进程数 = 插件数，不再随租户数线性增长
+	// （ADR-0008 决策 11 要消灭的就是那个乘法）。这一行是"到底起了几个
+	// 插件进程"的唯一权威来源。
 	log.Info("Bot 启动完成",
 		"bots", len(cfg.Bots), "enabled", enabled,
 		"started", started, "failed", enabled-started,
-		"plugins_total", pluginsTotal,
+		"plugins_total", len(c.plugins),
 		"elapsed", time.Since(startedAt).Round(time.Millisecond).String())
 	return c, nil
 }
 
-// loadPlugins 装配某个 Bot 的插件集。没有加载器时返回空集：这条分支已在
+// loadPlugins 装配进程级的插件集。没有加载器时返回空集：这条分支已在
 // Start 里 warn 过，不在每个 Bot 上重复刷屏。
-func (c *Container) loadPlugins(ctx context.Context, b config.Bot, log *slog.Logger) ([]host.Plugin, error) {
+func (c *Container) loadPlugins(ctx context.Context, log *slog.Logger) ([]host.Plugin, error) {
 	if c.o.LoadPlugins == nil {
 		return nil, nil
 	}
-	plugins, err := c.o.LoadPlugins(ctx, b, log)
+	plugins, err := c.o.LoadPlugins(ctx, log)
 	if err != nil {
 		return nil, fmt.Errorf("装配插件: %w", err)
 	}
 	return plugins, nil
 }
 
-// logBotStarted 打出这个 Bot 实际用的库、两把锁与插件清单。
+// logPluginSet 打出这次进程级装配的插件清单。
 //
-// 库路径必须可见：它由 appid 推导，备份、迁移、清理都靠这一行确认东西落在哪。
 // 插件名必须可见：只报数量时"新插件没打进产物"与"插件进去了但没注册"在日志里
-// 完全一样（P3-17）。永不打印 secret。
-func logBotStarted(rt *botRuntime) {
-	names := make([]string, 0, len(rt.plugins))
-	for _, p := range rt.plugins {
+// 完全一样（P3-17）。共享之后这份清单不再按 Bot 重复，所以只打一次。
+func logPluginSet(plugins []host.Plugin, log *slog.Logger) {
+	if len(plugins) == 0 {
+		return
+	}
+	names := make([]string, 0, len(plugins))
+	for _, p := range plugins {
 		names = append(names, p.Manifest().Name)
 	}
 	sort.Strings(names)
+	log.Info("进程级插件已装配", "plugins", len(plugins), "plugin_names", strings.Join(names, ","))
+}
+
+// logBotStarted 打出这个 Bot 实际用的库与两把锁。
+//
+// 库路径必须可见：它由 appid 推导，备份、迁移、清理都靠这一行确认东西落在哪。
+// 插件不在这一行：它是进程级共享的，由 logPluginSet 统一打一次。
+func logBotStarted(rt *botRuntime) {
 	rt.log.Info("Bot 已启动",
 		"appid", rt.cfg.AppID,
 		"db", rt.db.Path(),
 		"lock", rt.lock.Path(),
 		"app_lock", rt.lock.AppPath(),
-		"plugins", len(rt.plugins),
-		"plugin_names", strings.Join(names, ","))
+		"plugins", len(rt.plugins))
 }
 
 // Stop 断开所有 Bot 的接入层。ctx 取消也会走到同一个结果（它们同源），
@@ -289,11 +309,15 @@ func logBotStarted(rt *botRuntime) {
 func (c *Container) Stop() { c.cancel() }
 
 // Shutdown 关停全部 Bot：并行等每条网关落盘 → 并行核心收尾（调度、派发、
-// GC、插件）→ 各自关库 → 各自放锁。
+// GC）→ 各自注销 Host、关库、放锁 → **最后统一关插件**。
 //
-// 两段都并行：各 Bot 彼此独立（各自的库、各自的插件），串行只会让最后一个
-// Bot 分到的期限变少。ctx 是整体预算，超时或未按时落盘的 Bot 会被记下来，
-// 调用方据此以非 0 退出（与单 Bot 时代一致）。
+// 顺序不能反：插件在写库，先关库会得到一串 database is closed；而插件是共享
+// 的，任何一个 Bot 关它都会带走别人正在用的进程，所以它排在所有 Bot 之后
+// （ADR-0008 决策 11）。
+//
+// 两段都并行：各 Bot 彼此独立（各自的库），串行只会让最后一个 Bot 分到的
+// 期限变少。ctx 是整体预算，超时或未按时落盘的 Bot 会被记下来，调用方据此
+// 以非 0 退出（与单 Bot 时代一致）。
 func (c *Container) Shutdown(ctx context.Context) error {
 	c.Stop()
 
@@ -314,6 +338,10 @@ func (c *Container) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+
+	// 所有 Core 都收完了才轮到插件：它们到此为止不会再收到任何调用。
+	core.ClosePlugins(ctx, c.log, c.plugins)
+	c.plugins = nil
 	return errors.Join(errs...)
 }
 

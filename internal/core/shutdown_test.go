@@ -338,3 +338,78 @@ func TestShutdownDrainLeavesNoClosedDatabaseErrors(t *testing.T) {
 		}
 	}
 }
+
+// closerPlugin 只记"被关了几次"。
+type closerPlugin struct {
+	manifest host.Manifest
+
+	mu     sync.Mutex
+	closed int
+}
+
+func (p *closerPlugin) Manifest() host.Manifest               { return p.manifest }
+func (p *closerPlugin) Init(context.Context, host.Host) error { return nil }
+func (p *closerPlugin) Handle(context.Context, *host.Event) (*host.Reply, error) {
+	return nil, nil
+}
+func (p *closerPlugin) Close(context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed++
+	return nil
+}
+
+func (p *closerPlugin) closeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closed
+}
+
+// TestShutdownDoesNotCloseSharedPlugins 锁住「插件不归 Core 所有」（#65）。
+//
+// 一套插件进程服务 N 个 Bot：任何一个 Core 在关停时关掉它，等于把还在运行的
+// 其他租户的插件带走。关闭由装配层在所有 Core 收完之后统一做——所以
+// Core.Shutdown 一次都不该调 Close，ClosePlugins 调且只调一次。
+func TestShutdownDoesNotCloseSharedPlugins(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "shared.db"))
+	if err != nil {
+		t.Fatalf("打开测试库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+
+	p := &closerPlugin{manifest: host.Manifest{Name: "shared", APIVersion: host.APIVersion}}
+	c, err := New(Options{
+		Store:   db,
+		Log:     slog.New(slog.DiscardHandler),
+		Config:  &config.Config{},
+		Bot:     host.BotInfo{AppID: "bot-a", CertType: "personal"},
+		Plugins: []host.Plugin{p},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// 关停前先取消 Start 收到的 ctx：GC 协程挂在它上面，不取消就等不到退出。
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	if err := c.Start(runCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if n := p.closeCount(); n != 0 {
+		t.Fatalf("Core.Shutdown 关掉了共享插件 %d 次：一个 Bot 退出会带走其他租户的插件", n)
+	}
+
+	ClosePlugins(ctx, slog.New(slog.DiscardHandler), []host.Plugin{p})
+	if n := p.closeCount(); n != 1 {
+		t.Fatalf("ClosePlugins 之后关闭次数 = %d，期望 1", n)
+	}
+	ClosePlugins(ctx, slog.New(slog.DiscardHandler), nil)
+}

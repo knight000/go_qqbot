@@ -80,7 +80,7 @@ func loadOne(t *testing.T, mode string, mutate func(*pluginproc.Options)) (host.
 // initPlugin 让插件进程起来。失败即致命：后面的断言都以"进程在跑"为前提。
 func initPlugin(t *testing.T, p host.Plugin, cfg map[string]any) {
 	t.Helper()
-	if err := p.Init(context.Background(), testHost(p.Manifest().Name, cfg)); err != nil {
+	if err := p.Init(testBotCtx(), testHost(p.Manifest().Name, cfg)); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 }
@@ -173,7 +173,7 @@ func TestInitSpawnsAndHandleForwards(t *testing.T) {
 
 	ctx := context.Background()
 	// 1. 配置快照必须过通道（插件读的是 plugin.init 给的 map，不是它自己的环境）。
-	reply, err := p.Handle(ctx, message("/cfg", ""))
+	reply, err := p.Handle(host.WithBot(ctx, testBot), message("/cfg", ""))
 	if err != nil {
 		t.Fatalf("Handle(/cfg): %v", err)
 	}
@@ -181,7 +181,7 @@ func TestInitSpawnsAndHandleForwards(t *testing.T) {
 		t.Fatalf("/cfg 回复 = %#v，期望配置里的 greeting", reply)
 	}
 	// 2. 普通命令的参数与回复要一字不差地往返。
-	reply, err = p.Handle(ctx, message("/echo", "参数 带空格"))
+	reply, err = p.Handle(host.WithBot(ctx, testBot), message("/echo", "参数 带空格"))
 	if err != nil {
 		t.Fatalf("Handle(/echo): %v", err)
 	}
@@ -212,7 +212,7 @@ func TestHandleTimesOutAndNextEventStillServes(t *testing.T) {
 	initPlugin(t, p, nil)
 
 	start := time.Now()
-	_, err := p.Handle(context.Background(), message("/slow", "hang"))
+	_, err := p.Handle(testBotCtx(), message("/slow", "hang"))
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -227,7 +227,7 @@ func TestHandleTimesOutAndNextEventStillServes(t *testing.T) {
 	}
 
 	// 下一次投递不受影响：超时只取消那一次请求，不毒化连接。
-	reply, err := p.Handle(context.Background(), message("/slow", "ok"))
+	reply, err := p.Handle(testBotCtx(), message("/slow", "ok"))
 	if err != nil {
 		t.Fatalf("超时之后的下一条应正常处理，实际 %v", err)
 	}
@@ -249,7 +249,7 @@ func TestRunJobHonoursDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	err := jobber.RunJob(ctx, host.JobSpec{Plugin: modeSlow, Name: "hang", Payload: "hang"})
+	err := jobber.RunJob(host.WithBot(ctx, testBot), host.JobSpec{Plugin: modeSlow, Name: "hang", Payload: "hang"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("卡死的任务应返回 DeadlineExceeded，实际 %v", err)
 	}
@@ -266,7 +266,7 @@ func TestTimeoutBurstTripsBreaker(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-		_, err := p.Handle(ctx, message("/slow", "hang"))
+		_, err := p.Handle(host.WithBot(ctx, testBot), message("/slow", "hang"))
 		cancel()
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("第 %d 次应超时，实际 %v", i+1, err)
@@ -278,7 +278,7 @@ func TestTimeoutBurstTripsBreaker(t *testing.T) {
 	}
 	// 停用之后立刻失败：不能再让调用方白等一个超时。
 	start := time.Now()
-	_, err := p.Handle(context.Background(), message("/slow", "ok"))
+	_, err := p.Handle(testBotCtx(), message("/slow", "ok"))
 	if !errors.Is(err, pluginproc.ErrUnavailable) {
 		t.Fatalf("停用后的调用应立刻返回 ErrUnavailable，实际 %v", err)
 	}
@@ -330,10 +330,10 @@ func TestCrashBacksOffThenDisables(t *testing.T) {
 
 	// 启动即崩的插件不能让 Init 失败（否则整台机器人起不来，还会进
 	// systemd 重启循环白烧 Identify 配额，决策 6）。
-	if err := crashy.Init(context.Background(), testHost(modeCrashy, nil)); err != nil {
+	if err := crashy.Init(testBotCtx(), testHost(modeCrashy, nil)); err != nil {
 		t.Fatalf("启动即崩不该让 Init 失败: %v", err)
 	}
-	if err := echo.Init(context.Background(), testHost(modeEcho, nil)); err != nil {
+	if err := echo.Init(testBotCtx(), testHost(modeEcho, nil)); err != nil {
 		t.Fatalf("正常插件 Init: %v", err)
 	}
 
@@ -344,11 +344,11 @@ func TestCrashBacksOffThenDisables(t *testing.T) {
 		t.Fatalf("停用日志没说是哪个插件：\n%s", logs.text())
 	}
 	// 停用之后立即失败，不再白起进程。
-	if _, err := crashy.Handle(context.Background(), message("/echo", "x")); !errors.Is(err, pluginproc.ErrUnavailable) {
+	if _, err := crashy.Handle(testBotCtx(), message("/echo", "x")); !errors.Is(err, pluginproc.ErrUnavailable) {
 		t.Fatalf("停用后应返回 ErrUnavailable，实际 %v", err)
 	}
 	// 其它插件完全不受影响：崩溃的隔离收益就在这里。
-	reply, err := echo.Handle(context.Background(), message("/echo", "还在"))
+	reply, err := echo.Handle(testBotCtx(), message("/echo", "还在"))
 	if err != nil || reply == nil || reply.Content != "还在" {
 		t.Fatalf("另一个插件应该照常工作，实际 reply=%#v err=%v", reply, err)
 	}
@@ -359,7 +359,7 @@ func TestCrashBacksOffThenDisables(t *testing.T) {
 func TestInitRejectedByPluginIsFatal(t *testing.T) {
 	p, _, _ := loadOne(t, modeBadInit, nil)
 
-	err := p.Init(context.Background(), testHost(modeBadInit, nil))
+	err := p.Init(testBotCtx(), testHost(modeBadInit, nil))
 	if err == nil {
 		t.Fatal("插件在 Init 里报错应当让启动失败，而不是被当成崩溃吞掉")
 	}
@@ -416,7 +416,7 @@ func TestCloseRunsPluginHookBeforeTerminating(t *testing.T) {
 		t.Fatalf("第二次 Close 应无操作地成功，实际 %v", err)
 	}
 	// 4. 关停之后不再有"可投递的进程"。
-	if _, err := p.Handle(context.Background(), message("/echo", "x")); !errors.Is(err, pluginproc.ErrUnavailable) {
+	if _, err := p.Handle(testBotCtx(), message("/echo", "x")); !errors.Is(err, pluginproc.ErrUnavailable) {
 		t.Fatalf("关停后 Handle 应返回 ErrUnavailable，实际 %v", err)
 	}
 }
@@ -451,10 +451,10 @@ func TestOptionalMethodsAreSkippedWhenNotImplemented(t *testing.T) {
 	p, _, _ := loadOne(t, modePlain, nil)
 	initPlugin(t, p, nil)
 
-	if err := p.(host.Starter).Start(context.Background()); err != nil {
+	if err := p.(host.Starter).Start(testBotCtx()); err != nil {
 		t.Fatalf("插件没实现 Start 时应当是空操作，实际 %v", err)
 	}
-	err := p.(host.JobRunner).RunJob(context.Background(), host.JobSpec{Plugin: modePlain, Name: "n"})
+	err := p.(host.JobRunner).RunJob(testBotCtx(), host.JobSpec{Plugin: modePlain, Name: "n"})
 	if !errors.Is(err, rpc.ErrMethodNotFound) {
 		t.Fatalf("插件没实现 RunJob 时应当如实报方法未注册，实际 %v", err)
 	}
@@ -471,7 +471,7 @@ func TestStartForwardedToPlugin(t *testing.T) {
 	p, _, _ := loadOne(t, modeEcho, nil)
 	initPlugin(t, p, nil)
 
-	if err := p.(host.Starter).Start(context.Background()); err != nil {
+	if err := p.(host.Starter).Start(testBotCtx()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if n := countLines(t, marker, "start="+modeEcho); n != 1 {
@@ -492,7 +492,7 @@ func TestRunJobForwardsSpec(t *testing.T) {
 	if !ok {
 		t.Fatal("proxy 必须实现 host.JobRunner")
 	}
-	if err := jobber.RunJob(context.Background(),
+	if err := jobber.RunJob(testBotCtx(),
 		host.JobSpec{Plugin: modeEcho, Name: "daily", Peer: "g-42"}); err != nil {
 		t.Fatalf("RunJob: %v", err)
 	}

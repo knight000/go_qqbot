@@ -135,7 +135,7 @@ func TestReplaceBinarySwapsOnlyThatPlugin(t *testing.T) {
 		t.Errorf("旧进程收到 close 的次数 = %d，期望 1（日志：\n%s)", n, readFile(t, marker))
 	}
 	// 4. 新进程接了活：Handle 打到的必须是 0.9.0 那一代。
-	reply, err := echo.Handle(context.Background(), message("/echo", "升级后"))
+	reply, err := echo.Handle(testBotCtx(), message("/echo", "升级后"))
 	if err != nil {
 		t.Fatalf("升级后的 Handle: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestReplaceBinaryRollsBackWhenHandshakeFails(t *testing.T) {
 	}
 
 	// 旧版本继续服务：这是整条回滚的意义。
-	reply, err := echo.Handle(context.Background(), message("/echo", "回滚之后"))
+	reply, err := echo.Handle(testBotCtx(), message("/echo", "回滚之后"))
 	if err != nil {
 		t.Fatalf("回滚后 Handle: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestReplaceBinaryRejectsWrongIdentity(t *testing.T) {
 	if got := readPid(t, pidDir, modeEcho); got != oldPid {
 		t.Errorf("被拒绝时不该动正在跑的进程：%d → %d", oldPid, got)
 	}
-	if _, err := echo.Handle(context.Background(), message("/echo", "还在")); err != nil {
+	if _, err := echo.Handle(testBotCtx(), message("/echo", "还在")); err != nil {
 		t.Errorf("被拒绝之后旧进程必须还能服务: %v", err)
 	}
 }

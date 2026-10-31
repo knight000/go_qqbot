@@ -232,7 +232,7 @@ func TestShutdownDuringStartupLaunchesNoMoreBots(t *testing.T) {
 		Log:       quietLogger(),
 		Outbound:  p.httpx(),
 		Handshake: p.srv.Client(),
-		LoadPlugins: func(context.Context, config.Bot, *slog.Logger) ([]host.Plugin, error) {
+		LoadPlugins: func(context.Context, *slog.Logger) ([]host.Plugin, error) {
 			return []host.Plugin{&stubPlugin{name: "echo"}}, nil
 		},
 	})
@@ -351,13 +351,15 @@ func TestStartupSummaryIsVisible(t *testing.T) {
 	_ = c
 
 	out := logs()
-	for _, want := range []string{"Bot 启动完成", "bots=2", "started=2", "elapsed=", "plugins_total=2"} {
+	// plugins_total 是**插件进程数**，不是"Bot × 插件"：共享一套进程之后
+	// 两个 Bot 共用 echo 这一份（ADR-0008 决策 11），它必须等于插件数。
+	for _, want := range []string{"Bot 启动完成", "bots=2", "started=2", "elapsed=", "plugins_total=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("启动日志缺少 %q：\n%s", want, out)
 		}
 	}
-	// 每个 Bot 各自一行，带库路径与插件名（secret 永不出现）。
-	for _, want := range []string{"appid=102000001", "appid=102000002", "plugin_names=echo"} {
+	// 每个 Bot 各自一行，带库路径；插件清单是进程级的一份（secret 永不出现）。
+	for _, want := range []string{"appid=102000001", "appid=102000002", "进程级插件已装配", "plugin_names=echo"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("启动日志缺少 %q：\n%s", want, out)
 		}

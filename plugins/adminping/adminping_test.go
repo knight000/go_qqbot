@@ -22,7 +22,10 @@ type fakeHost struct {
 	log *slog.Logger
 }
 
-func (f *fakeHost) Plugin() string              { return "adminping" }
+func (f *fakeHost) Plugin() string { return "adminping" }
+
+// Bot 返回零值：这些用例是单 Bot 的，没有共享进程上下文。
+func (f *fakeHost) Bot() host.BotInfo           { return host.BotInfo{} }
 func (f *fakeHost) Config() host.Params         { return f.cfg }
 func (f *fakeHost) Sender() host.Sender         { return nil }
 func (f *fakeHost) KV() host.KV                 { return nil }
