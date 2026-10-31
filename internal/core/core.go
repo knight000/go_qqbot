@@ -38,6 +38,10 @@ type Options struct {
 	// BotID 是平台侧的 AppID。它只用于日志与状态（"哪个 Bot 变了状态"），
 	// 不参与鉴权、不落业务表——数据隔离靠一 Bot 一库，不靠这个字段。
 	BotID string
+	// Secret 是该 Bot 在配置文件里的 AppSecret，也是 /claim 的唯一凭证
+	// （ADR-0008 决策 4）。由装配层从 config.Bot 传入：核心不生成、不派发、
+	// 不打印任何凭据。空串表示这个 Bot 无法认领。
+	Secret string
 	// Jobs 是本 Core 的调度器要用的并行额度池。多 Bot 装配时由调用方建
 	// **一份**注入所有 Core：全局并行 4 不随 Bot 数增长，每个 Bot 同时只跑
 	// 1 个桶（ADR-0008 决策 13）。nil 表示自建一份容量 4 的池、不按 Bot 串行
@@ -63,9 +67,8 @@ type Core struct {
 	dispatch *Dispatcher
 	sched    *Scheduler
 
-	claimMu    sync.Mutex
-	claimToken string
-	claimExp   time.Time
+	// claimMu 串行化认领：两个用户同时通过"admins 为空"检查会双双成为 owner。
+	claimMu sync.Mutex
 
 	startedAt time.Time
 	// restart 只缓冲一条：重复的 /reload 直接返回 ErrRestartPending，
@@ -93,6 +96,10 @@ type Core struct {
 
 	// botID 是平台侧 AppID，只用于日志与状态变更。
 	botID string
+
+	// secret 是配置文件里这个 Bot 的 AppSecret，也是 /claim 的唯一凭证。
+	// 它只在认领比对时被读取，绝不出现在日志、轨迹或错误串里。
+	secret string
 
 	// stateMu 保护 Bot 状态机的全部可变部分：缓存状态、连续鉴权失败计数、
 	// 按状态的丢弃计数。它们都在 Handle 的热路径上，必须一把锁、不能查库。
@@ -182,6 +189,7 @@ func New(o Options) (*Core, error) {
 		gcDone:    make(chan struct{}),
 		upgrade:   o.Upgrade,
 		botID:     o.BotID,
+		secret:    o.Secret,
 		dropped:   make(map[BotState]int64, 4),
 	}
 	// 出站成败必须回灌到状态机：连续鉴权类失败是"这个 Bot 的身份已不可用"的
@@ -213,7 +221,7 @@ const (
 )
 
 // Start 依次完成：校验插件配置 → 绑定任务执行者 → 插件 Init（注册 Job）
-// → 启动调度 → 启动插件 → 生成认领令牌。
+// → 启动调度 → 启动插件 → 提示认领入口。
 func (c *Core) Start(ctx context.Context) error {
 	// 配置校验整体先于任何 Init：Manifest.config_schema 是「声明即必填」的契约
 	// （评审 §4.1）。放到各自 Init 之前逐个做也不行——先校验先 Init 的话，后面
@@ -266,7 +274,7 @@ func (c *Core) Start(ctx context.Context) error {
 		}
 	}
 
-	if err := c.ensureOwner(ctx); err != nil {
+	if err := c.announceClaimState(ctx); err != nil {
 		return err
 	}
 	c.logGroupGateState(ctx)
@@ -418,6 +426,14 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		return
 	}
 
+	// /claim 只对私聊生效（ADR-0008 决策 4/5）。群里的认领必须在**去重之前**
+	// 就拒掉：进了幂等表就等于承认这条消息被处理过，而它连一条消息都不该算。
+	if isClaimCommand(ev) && ev.Scene != host.SceneC2C {
+		c.trace.CoreCommand("/claim")
+		c.replyText(ctx, ev, claimGroupReject)
+		return
+	}
+
 	seen, err := c.store.MarkEventSeen(ctx, ev.ID)
 	if err != nil {
 		// 去重表不可用时宁可不处理：重复回复会直接消耗被动额度
@@ -427,6 +443,15 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	if !seen {
 		c.trace.Duplicate(ev)
 		c.log.Debug("重复事件，忽略", "event", ev.ID)
+		return
+	}
+
+	// 认领是控制动作，不是消息（ADR-0008 决策 5）：拦截点排在去重之后、落库
+	// 之前——平台重投同一条消息只认领一次，secret 也永远不会躺进 messages 表。
+	// 处理完就地终止：不进群准入、不进插件路由。
+	if isClaimCommand(ev) {
+		c.trace.CoreCommand("/claim")
+		c.handleClaim(ctx, ev)
 		return
 	}
 

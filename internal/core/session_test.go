@@ -708,6 +708,7 @@ func hasSession(t *testing.T, c *Core, peer string) bool {
 func TestResetLevelsClearSessions(t *testing.T) {
 	c, f := newAdminCore(t)
 	seedAdmin(t, c, "owner-1", "", store.RoleOwner)
+	seedCoreOwners(c, "owner-1")
 	ctx := context.Background()
 
 	// R1：只清当前 peer。

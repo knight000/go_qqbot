@@ -267,7 +267,7 @@ func (d *Dispatcher) handle(ctx context.Context, ev *host.Event) {
 	matches := d.router.Match(ev)
 	if len(matches) == 0 {
 		d.trace.NoMatch(ev)
-		d.log.Debug("无插件匹配", "name", ev.Name, "content", ev.Content)
+		d.log.Debug("无插件匹配", "name", ev.Name, "content", bodyForTrace(ev))
 		return
 	}
 
