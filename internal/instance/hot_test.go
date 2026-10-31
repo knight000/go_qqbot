@@ -333,6 +333,66 @@ func TestReloadOneRefusesSelf(t *testing.T) {
 	}
 }
 
+// enabled 从 true 改 false：该 Bot 停用（原因 config_disabled），数据保留；
+// 改回 true 则重新上线，且不需要重读别的 Bot 的连接。
+func TestReloadAppliesEnabledToggle(t *testing.T) {
+	isolation := t.TempDir()
+	isolateTemp(t, isolation)
+	p := newFakePlatform(t)
+	dir := t.TempDir()
+	media := filepath.Join(dir, "media")
+
+	path, cfg := writeConfig(t, p, dir, media, botEntry("102000001"), botEntry("102000002"))
+	seedActiveBots(t, cfg)
+	c := startHot(t, cfg, path, p)
+	p.waitReady(t, "102000001")
+	p.waitReady(t, "102000002")
+	aConn := connOf(p, "102000001")
+
+	off := false
+	disabled := botEntry("102000002")
+	disabled.Enabled = &off
+	writeConfig(t, p, dir, media, botEntry("102000001"), disabled)
+
+	sum, err := c.ReloadAll(context.Background(), "102000001")
+	if err != nil {
+		t.Fatalf("热重载: %v", err)
+	}
+	if sum.Stopped != 1 {
+		t.Fatalf("应停用 1 个，实际 %+v", sum)
+	}
+	if c.findRuntime("102000002") != nil {
+		t.Fatal("B 应已停止")
+	}
+	if connOf(p, "102000001") != aConn {
+		t.Fatal("停用 B 不该影响 A 的连接")
+	}
+	db := openStoreForTest(t, cfg.BotStorePath(botEntry("102000002")))
+	if st, err := core.LoadBotState(context.Background(), db); err != nil || st != core.BotStateSuspended {
+		t.Fatalf("B 应为 suspended，实际 %q err=%v", st, err)
+	}
+	if reason, err := core.LoadSuspendReason(context.Background(), db); err != nil || reason != core.SuspendReasonConfigDisabled {
+		t.Fatalf("停用原因应为 config_disabled，实际 %q err=%v", reason, err)
+	}
+	_ = db.Close()
+
+	// 改回 true：重新上线。
+	writeConfig(t, p, dir, media, botEntry("102000001"), botEntry("102000002"))
+	sum, err = c.ReloadAll(context.Background(), "102000001")
+	if err != nil {
+		t.Fatalf("改回启用: %v", err)
+	}
+	if sum.Restarted != 1 {
+		t.Fatalf("应重新启用 1 个，实际 %+v", sum)
+	}
+	if rt := c.findRuntime("102000002"); rt == nil || rt.err != nil {
+		t.Fatal("B 应重新装上")
+	}
+	if connOf(p, "102000001") != aConn {
+		t.Fatal("重新启用 B 不该影响 A 的连接")
+	}
+}
+
 // purge 的三条约束：配置里还在时拒绝、先删文件再删行、保留群名单与管理员。
 func TestPurgeRequiresConfigGoneAndClearsData(t *testing.T) {
 	isolation := t.TempDir()
@@ -541,6 +601,63 @@ func TestRemovingBotDuringConcurrentEventsDoesNotCrossStores(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("拆掉 C 之后 A 应仍然可用")
+}
+
+// 端到端：/bot 指令从消息进来，经核心落到容器，再回一条摘要。
+//
+// 这条用例专门盯"装配点"——core.Options.Hot 忘了注入时，上面所有直接调用
+// 容器的用例都会绿，而现实里 /bot 只会回一句"未装配"。
+func TestBotCommandsAreWiredThroughCore(t *testing.T) {
+	isolation := t.TempDir()
+	isolateTemp(t, isolation)
+	p := newFakePlatform(t)
+	dir := t.TempDir()
+	media := filepath.Join(dir, "media")
+
+	path, cfg := writeConfig(t, p, dir, media, botEntry("102000001"), botEntry("102000002"))
+	seedActiveBots(t, cfg)
+	startHot(t, cfg, path, p)
+	p.waitReady(t, "102000001")
+	aConn := connOf(p, "102000001")
+
+	p.push(t, "102000001", "C2C_MESSAGE_CREATE", c2cMessage("EV-LIST", "owner-openid", "/bot list"))
+	got := p.waitSends(t, 1)[0]
+	if !strings.Contains(got.content, "Bot 列表（2 个）") || !strings.Contains(got.content, "102000002") {
+		t.Fatalf("/bot list 应经核心回到消息里，实际: %q", got.content)
+	}
+
+	// 加一条新条目，再用消息触发 reload。
+	writeConfig(t, p, dir, media, botEntry("102000001"), botEntry("102000002"), botEntry("102000003"))
+	p.push(t, "102000001", "C2C_MESSAGE_CREATE", c2cMessage("EV-RELOAD", "owner-openid", "/bot reload"))
+	sends := p.waitSends(t, 2)
+	if !strings.Contains(sends[1].content, "新增 1") {
+		t.Fatalf("reload 的摘要应回到消息里，实际: %q", sends[1].content)
+	}
+	p.waitReady(t, "102000003")
+	if connOf(p, "102000001") != aConn {
+		t.Fatal("发指令的那个 Bot 不该被自己的 reload 停掉")
+	}
+
+	// 新 Bot 按 ADR-0008 决策 8 是 pending_claim：认领之前它什么都不收。
+	db := openStoreForTest(t, cfg.BotStorePath(botEntry("102000003")))
+	defer func() { _ = db.Close() }()
+	if st, err := core.LoadBotState(context.Background(), db); err != nil || st != core.BotStatePendingClaim {
+		t.Fatalf("新装的 Bot 应为 pending_claim，实际 %q err=%v", st, err)
+	}
+}
+
+// c2cMessage 是一条单聊消息事件体（字段与网关解码表对齐）。
+func c2cMessage(eventID, openID, content string) map[string]any {
+	return map[string]any{
+		"id": eventID,
+		"author": map[string]any{
+			"id":          openID,
+			"user_openid": openID,
+		},
+		"content":      content,
+		"message_type": 0,
+		"timestamp":    "2026-10-30T12:00:00+08:00",
+	}
 }
 
 // --- 造数据的小工具（库里只有 store 的少量写入口，媒体行直接走 SQL） ---

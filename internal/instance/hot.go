@@ -123,7 +123,9 @@ func (c *Container) viewOf(ctx context.Context, b config.Bot, inConfig bool) cor
 
 	rt := c.findRuntime(b.AppID)
 	if rt != nil {
-		v.Running = rt.err == nil && rt.gw != nil
+		// Running 认的是"这条网关还算在活的连接里"，不是"装配过"：
+		// 一个永久性错误退出的网关仍然有 rt.gw，但它已经不在服务了。
+		v.Running = rt.err == nil && c.liveGateway(rt)
 		if rt.err != nil {
 			v.Err = rt.err.Error()
 		}
@@ -152,6 +154,13 @@ func (c *Container) viewOf(ctx context.Context, b config.Bot, inConfig bool) cor
 	}
 	c.fillStateFromDB(ctx, &v, b)
 	return v
+}
+
+// liveGateway 报告这个 Bot 的网关是否还计在 live 里（见 noteGatewayExit）。
+func (c *Container) liveGateway(rt *botRuntime) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return rt.gwLive
 }
 
 // fillStateFromDB 临时开一份连接读状态（只读，不迁移、不创造文件）。
