@@ -7,12 +7,12 @@ package instance
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
@@ -86,11 +86,15 @@ func (b *blockingRenderer) snapshot() (inflight, peak map[string]int, total int)
 
 // renderPlugin 在处理每条事件时同步发起一次渲染，源就是消息正文：
 // 这样"哪张图是哪个 Bot 要的"在渲染器一侧可读。
+//
+// 插件实例是进程级共享的：Init 会按 Bot 各来一次，所以 Host 要按 Bot 存，
+// Handle 里再用 host.BotOf(ctx) 取回本次调用该用哪一个——只存一个字段会让
+// 后初始化的 Bot 覆盖前一个，两个租户就挤进同一个闸门了。
 type renderPlugin struct {
 	name string
 
-	mu sync.Mutex
-	h  host.Host
+	mu    sync.Mutex
+	hosts map[string]host.Host
 }
 
 func (p *renderPlugin) Manifest() host.Manifest {
@@ -102,17 +106,25 @@ func (p *renderPlugin) Manifest() host.Manifest {
 	}
 }
 
-func (p *renderPlugin) Init(_ context.Context, h host.Host) error {
+func (p *renderPlugin) Init(ctx context.Context, h host.Host) error {
 	p.mu.Lock()
-	p.h = h
+	if p.hosts == nil {
+		p.hosts = map[string]host.Host{}
+	}
+	info, _ := host.BotOf(ctx)
+	p.hosts[info.AppID] = h
 	p.mu.Unlock()
 	return nil
 }
 
 func (p *renderPlugin) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
+	info, _ := host.BotOf(ctx)
 	p.mu.Lock()
-	h := p.h
+	h := p.hosts[info.AppID]
 	p.mu.Unlock()
+	if h == nil {
+		return nil, fmt.Errorf("没有 Bot %q 的 Host", info.AppID)
+	}
 	if _, err := h.Renderer().Markdown(ctx, ev.Content); err != nil {
 		return nil, err
 	}
@@ -131,7 +143,7 @@ func TestRenderIsSerializedPerBot(t *testing.T) {
 	block := newBlockingRenderer()
 	startContainer(t, cfg, p, func(o *Options) {
 		o.Renderer = block
-		o.LoadPlugins = func(context.Context, config.Bot, *slog.Logger) ([]host.Plugin, error) {
+		o.LoadPlugins = func(context.Context, *slog.Logger) ([]host.Plugin, error) {
 			return []host.Plugin{&renderPlugin{name: "md"}}, nil
 		}
 	})

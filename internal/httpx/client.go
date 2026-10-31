@@ -142,7 +142,6 @@ func (c *Client) Partition(log *slog.Logger) *Client {
 	return New(o)
 }
 
-
 // newRequestClient 复用 hc 的连接池与超时设置，但把重定向策略绑到**当前**
 // Client 上。
 //
