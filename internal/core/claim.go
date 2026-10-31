@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"fmt"
@@ -166,4 +167,24 @@ func (c *Core) claimSecretMatches(got string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(c.secret)) == 1
+}
+
+// redactSecret 把认领凭证从任何将要落盘的字节里抹掉。
+//
+// 轨迹的原始载荷（`[debug].raw=true`）打印的是平台下发的 JSON 原文，其中就有
+// 这条消息的 content——一次 /claim 等于把 secret 抄进 stdout / journald，还会
+// 被日志轮转长期保留。按字面量替换而不是"解析 JSON 再看前缀"，是因为字段名、
+// 层级、编解码方式以后都可能变，而"这个字符串不该出现在日志里"不会变。
+//
+// 代价是 secret 若出现在别处（比如用户把它贴进某条普通消息）也会被打码——
+// 那种情况本来就是泄露，打码反而是对的。
+func (c *Core) redactSecret(b []byte) []byte {
+	if c.secret == "" || len(b) == 0 {
+		return b
+	}
+	s := []byte(c.secret)
+	if !bytes.Contains(b, s) {
+		return b
+	}
+	return bytes.ReplaceAll(b, s, []byte("***"))
 }

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -194,5 +195,28 @@ func TestBotCommandsStillRequireBotAdmin(t *testing.T) {
 		adminEvent("/admin list", "core-1", "", host.SceneC2C, "core-1"))
 	if got := lastReply(t, f); !strings.Contains(got, "仅管理员") {
 		t.Fatalf("Core 所有者不该自动成为 Bot 管理员，实际: %q", got)
+	}
+}
+
+// 原始载荷（[debug].raw=true）打印平台下发的 JSON 原文，里面就有 content。
+// 这条路径不经过 Received 的正文脱敏，是 /claim 正文仅剩的泄露面。
+func TestRawDumpRedactsSecret(t *testing.T) {
+	c, _ := newStateCore(t)
+	var buf bytes.Buffer
+	c.trace = NewTrace(&buf, LevelFull)
+
+	c.PrintRaw("C2C_MESSAGE_CREATE",
+		[]byte(`{"d":{"id":"e1","content":"/claim `+testBotSecret+`"}}`))
+
+	got := buf.String()
+	if strings.Contains(got, testBotSecret) {
+		t.Fatalf("原始载荷里读到了 secret：\n%s", got)
+	}
+	if !strings.Contains(got, "***") {
+		t.Errorf("应留下打码痕迹，而不是整条静默丢弃：\n%s", got)
+	}
+	// 除 secret 之外的结构必须原样保留，否则这条调试轨迹就没有价值了。
+	if !strings.Contains(got, `"id": "e1"`) {
+		t.Errorf("打码不该破坏载荷结构：\n%s", got)
 	}
 }

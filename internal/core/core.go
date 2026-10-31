@@ -522,7 +522,10 @@ func (c *Core) replyText(ctx context.Context, ev *host.Event, text string) {
 
 // PrintRaw 让接入层把平台原始 JSON 回吐到同一条调试轨迹上（[debug].raw=true）。
 // 放在 Core 上而不是 gateway 里，是为了与消息轨迹共用一把锁、输出不交错。
-func (c *Core) PrintRaw(typ string, raw []byte) { c.trace.Raw(typ, raw) }
+//
+// 原文里带着每条消息的 content，所以先抹掉认领凭证：这条路径不经过
+// bodyForTrace，是 /claim 正文仅剩的泄露面。
+func (c *Core) PrintRaw(typ string, raw []byte) { c.trace.Raw(typ, c.redactSecret(raw)) }
 
 // activePolicy 把配置转成 Sender 用的闸门。白名单为空表示谁都不能发主动消息。
 func activePolicy(cfg *config.Config) ActivePolicy {
