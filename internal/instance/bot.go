@@ -210,6 +210,9 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		// 把全局那 2 格吃满，让别的租户只能排队。
 		Renderer: renderGateFor(c.o.Renderer),
 		Upgrade:  upgrade,
+		// 认领凭证就是配置文件里这个 Bot 的 secret（ADR-0008 决策 4）：
+		// 核心不生成、不派发、不打印任何凭据。
+		Secret: b.Secret,
 		// c.jobs 为 nil 时 Scheduler 自建一份容量 4 的池（单 Bot 行为不变）；
 		// 非 nil 时所有 Bot 共享它，并因此各自同时只跑 1 个桶。
 		Jobs:  c.jobs,

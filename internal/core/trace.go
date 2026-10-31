@@ -113,12 +113,27 @@ func (t *Trace) Received(ctx context.Context, ev *host.Event) {
 	b.WriteString(lblPeer + dash(ev.PeerID) + "\n")
 	b.WriteString(lblEvent + dash(ev.ID) + "\n")
 	if ev.IsMessage() {
-		b.WriteString(lblBody + contentBlock(ev.Content) + "\n")
+		b.WriteString(lblBody + contentBlock(bodyForTrace(ev)) + "\n")
 		if ev.HasMedia {
 			b.WriteString(lblMedia + "有（当前未下载）\n")
 		}
 	}
 	t.emit(b.String())
+}
+
+// bodyForTrace 返回可以写进轨迹的正文。
+//
+// /claim 的正文就是 secret（ADR-0008 决策 5）：轨迹默认写 stdout / journald，
+// 原样打印等于把凭据抄进日志，而且会被日志轮转长期保留。整个正文打码，
+// 不留首尾——长度本身也是信息。
+func bodyForTrace(ev *host.Event) string {
+	if ev != nil && isClaimCommand(ev) {
+		return "***"
+	}
+	if ev == nil {
+		return ""
+	}
+	return ev.Content
 }
 
 // groupLabel 生成 `群名(group_openid)`。
@@ -198,7 +213,7 @@ func (t *Trace) NoMatch(ev *host.Event) {
 	}
 	what := eventLabel(ev) + " · " + ev.Name
 	if ev.IsMessage() {
-		what = "内容 " + preview(ev.Content, 40)
+		what = "内容 " + preview(bodyForTrace(ev), 40)
 	}
 	t.emit(fmt.Sprintf("%s 未命中任何插件（%s），忽略\n", t.stamp(), what))
 }
@@ -228,7 +243,7 @@ func (t *Trace) Hit(m Match, ev *host.Event) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s 命中插件 %s · %s\n", t.stamp(), name, cmd)
 	if ev != nil && ev.IsMessage() {
-		b.WriteString(lblBody + contentBlock(ev.Content) + "\n")
+		b.WriteString(lblBody + contentBlock(bodyForTrace(ev)) + "\n")
 	} else if ev != nil {
 		b.WriteString(lblEvent + ev.Name + "\n")
 	}

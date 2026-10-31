@@ -11,57 +11,61 @@ import (
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
-func TestReloadRejectsNonAdmin(t *testing.T) {
+// /reload 重启整个进程：Bot 管理员也不够，只认 Core 所有者（ADR-0008 决策 9）。
+func TestReloadRejectsNonCoreOwner(t *testing.T) {
 	c, f := newAdminCore(t)
+	seedAdmin(t, c, "bot-owner", "", store.RoleOwner)
 	if !c.handleReserved(context.Background(), adminEvent("/reload", "stranger", "", host.SceneC2C, "stranger")) {
 		t.Fatal("/reload 应被核心消费，不能落到插件")
 	}
-	if got := lastReply(t, f); !strings.Contains(got, "仅管理员") {
-		t.Fatalf("非管理员应被拒绝，实际: %q", got)
+	if got := lastReply(t, f); !strings.Contains(got, "Core 所有者") {
+		t.Fatalf("非 Core 所有者应被拒绝，实际: %q", got)
+	}
+
+	// Bot 所有者同样被拒：他管的是这个 Bot，不是整台机器。
+	c.handleReserved(context.Background(), adminEvent("/reload", "bot-owner", "", host.SceneC2C, "bot-owner"))
+	if got := lastReply(t, f); !strings.Contains(got, "Core 所有者") {
+		t.Fatalf("Bot 所有者也不该重启进程，实际: %q", got)
 	}
 	select {
 	case req := <-c.restart:
-		t.Fatalf("非管理员不应产生重启请求: %+v", req)
+		t.Fatalf("非 Core 所有者不应产生重启请求: %+v", req)
 	default:
 	}
 }
 
-// admin 与 owner 都能重启：这是"运维手段"，不是权限变更。
-func TestReloadEnqueuesForAdmin(t *testing.T) {
-	for _, role := range []string{store.RoleOwner, store.RoleAdmin} {
-		t.Run(role, func(t *testing.T) {
-			c, f := newAdminCore(t)
-			seedAdmin(t, c, "u-"+role, "", role)
+// Core 所有者在任意 Bot 里都能重启，不要求是这个 Bot 的 admin。
+func TestReloadEnqueuesForCoreOwner(t *testing.T) {
+	c, f := newAdminCore(t)
+	seedCoreOwners(c, "core-1")
 
-			c.handleReserved(context.Background(),
-				adminEvent("/reload 升级到新构建", "u-"+role, "", host.SceneC2C, "u-"+role))
+	c.handleReserved(context.Background(),
+		adminEvent("/reload 升级到新构建", "core-1", "", host.SceneC2C, "core-1"))
 
-			got := lastReply(t, f)
-			for _, want := range []string{"正在重启", "版本", "已运行", "备注 升级到新构建"} {
-				if !strings.Contains(got, want) {
-					t.Errorf("回复缺少 %q:\n%s", want, got)
-				}
-			}
+	got := lastReply(t, f)
+	for _, want := range []string{"正在重启", "版本", "已运行", "备注 升级到新构建"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("回复缺少 %q:\n%s", want, got)
+		}
+	}
 
-			select {
-			case req := <-c.restart:
-				if req.By != "u-"+role || req.Role != role {
-					t.Fatalf("重启请求的身份不对: %+v", req)
-				}
-				if req.Reason != "升级到新构建" {
-					t.Fatalf("备注未透传: %q", req.Reason)
-				}
-			default:
-				t.Fatal("应产生一条重启请求")
-			}
-		})
+	select {
+	case req := <-c.restart:
+		if req.By != "core-1" || req.Role != "core_owner" {
+			t.Fatalf("重启请求的身份不对: %+v", req)
+		}
+		if req.Reason != "升级到新构建" {
+			t.Fatalf("备注未透传: %q", req.Reason)
+		}
+	default:
+		t.Fatal("应产生一条重启请求")
 	}
 }
 
 // 同一个进程只接受一条重启请求：第二条只回提示，不再入队。
 func TestReloadIsIdempotentWithinProcess(t *testing.T) {
 	c, f := newAdminCore(t)
-	seedAdmin(t, c, "u1", "", store.RoleOwner)
+	seedCoreOwners(c, "u1")
 	ctx := context.Background()
 
 	c.handleReserved(ctx, adminEvent("/reload", "u1", "", host.SceneC2C, "u1"))
@@ -80,7 +84,7 @@ func TestReloadIsIdempotentWithinProcess(t *testing.T) {
 
 func TestReloadHelpDoesNotRestart(t *testing.T) {
 	c, f := newAdminCore(t)
-	seedAdmin(t, c, "u1", "", store.RoleOwner)
+	seedCoreOwners(c, "u1")
 
 	c.handleReserved(context.Background(), adminEvent("/reload help", "u1", "", host.SceneC2C, "u1"))
 
@@ -95,7 +99,7 @@ func TestReloadHelpDoesNotRestart(t *testing.T) {
 // /restart 是 /reload 的别名，两者行为一致。
 func TestRestartAliasConsumed(t *testing.T) {
 	c, _ := newAdminCore(t)
-	seedAdmin(t, c, "u1", "", store.RoleOwner)
+	seedCoreOwners(c, "u1")
 
 	if !c.handleReserved(context.Background(), adminEvent("/restart", "u1", "", host.SceneC2C, "u1")) {
 		t.Fatal("/restart 应被核心消费")

@@ -56,7 +56,7 @@ func TestReservedPrefixUsesWordBoundary(t *testing.T) {
 // 白占名字（第三方插件想用也会被拒绝加载），少列一个则核心的处理会
 // 静默遮蔽插件声明的同名命令。
 func TestReservedPrefixesMatchCoreCommands(t *testing.T) {
-	want := []string{"/claim", "/admin", "/group", "/reset", "/reload", "/restart", "/upgrade"}
+	want := []string{"/claim", "/admin", "/group", "/reset", "/reload", "/restart", "/upgrade", "/bot"}
 	if len(reservedPrefixes) != len(want) {
 		t.Fatalf("保留前缀 = %v, want %v", reservedPrefixes, want)
 	}

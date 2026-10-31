@@ -89,7 +89,7 @@ const resetUsage = `用法：
 /reset reconnect | r0   断开并立即重连，不动数据（仅所有者，冷却 60 秒）
 /reset session   | r1   清空本会话的插件状态（管理员，冷却 10 分钟）
 /reset data      | r2   清空本会话的消息与媒体文件（管理员 + 确认码，冷却 1 小时）
-/reset all       | r3   清空全部业务数据（仅所有者 + 确认码 + 短语，冷却 24 小时）
+/reset all       | r3   清空全部业务数据（仅 Core 所有者 + 确认码 + 短语，冷却 24 小时）
 /reset status          查看冷却与最近记录
 
 群聊里作用于当前群，私聊里作用于你自己；也可显式指定 /reset data <group_openid>。
@@ -106,7 +106,10 @@ func (c *Core) handleReset(ctx context.Context, ev *host.Event) {
 	}
 
 	p := c.authorize(ctx, ev)
-	if !p.IsBotAdmin() {
+	// 判定顺序：先 Core 所有者，再本 Bot 管理员（ADR-0008 决策 9）。
+	// Core 所有者不需要是这个 Bot 的 admin——他是进程级身份。
+	coreOwner := c.isCoreOwner(ev)
+	if !p.IsBotAdmin() && !coreOwner {
 		// 与 /admin、/group 一致：明确拒绝比静默更好排障。
 		// 未放行的群根本走不到这里——闸门已经把消息丢了。
 		c.replyText(ctx, ev, "该指令仅管理员可用。")
@@ -127,7 +130,14 @@ func (c *Core) handleReset(ctx context.Context, ev *host.Event) {
 		c.replyText(ctx, ev, "未知的重置级别。\n"+resetUsage)
 		return
 	}
-	if !spec.perm.Admits(p) {
+	// R3 清空的是整个 Bot 的业务数据，属于进程级不可逆操作，只认 Core 所有者；
+	// 其余三级的作用域是本 Bot（会话 / 数据 / 重连），按 Bot 所有者判定。
+	if spec.level == store.ResetLevelAll {
+		if !coreOwner {
+			c.replyText(ctx, ev, "该级别仅 Core 所有者可用。")
+			return
+		}
+	} else if !spec.perm.Admits(p) {
 		c.replyText(ctx, ev, "该级别仅 Bot 所有者可用。")
 		return
 	}

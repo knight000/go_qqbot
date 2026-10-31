@@ -62,16 +62,20 @@ func newUpgradeCore(t *testing.T, svc UpgradeService) (*Core, *fakeAPI) {
 	return c, f
 }
 
-// 升级通道就是远程代码执行通道：辅助管理员不该有这个能力（决策 2）。
-func TestUpgradeIsOwnerOnly(t *testing.T) {
+// 升级通道就是远程代码执行通道：Bot 管理员与 Bot 所有者都不该有这个能力，
+// 只认 Core 所有者（ADR-0008 决策 9）。
+func TestUpgradeIsCoreOwnerOnly(t *testing.T) {
 	svc := &fakeUpgrade{report: upgrade.Report{Latest: "9.9.9"}}
 	c, f := newUpgradeCore(t, svc)
 	seedAdmin(t, c, "a1", "", store.RoleAdmin)
+	seedAdmin(t, c, "bo1", "", store.RoleOwner)
 
-	for _, content := range []string{"/upgrade", "/upgrade apply", "/upgrade status"} {
-		c.handleReserved(context.Background(), adminEvent(content, "a1", "", host.SceneC2C, "a1"))
-		if got := lastReply(t, f); !strings.Contains(got, "仅所有者") {
-			t.Errorf("%s 对管理员应被拒绝，实际: %q", content, got)
+	for _, sender := range []string{"a1", "bo1"} {
+		for _, content := range []string{"/upgrade", "/upgrade apply", "/upgrade status"} {
+			c.handleReserved(context.Background(), adminEvent(content, sender, "", host.SceneC2C, sender))
+			if got := lastReply(t, f); !strings.Contains(got, "Core 所有者") {
+				t.Errorf("%s 对 %s 应被拒绝，实际: %q", content, sender, got)
+			}
 		}
 	}
 	if svc.previewCalls+svc.applyCalls+svc.statusCalls != 0 {
@@ -89,7 +93,7 @@ func TestUpgradePreviewRepliesReport(t *testing.T) {
 		CoreName: "qqbot-1.2.4-windows-amd64.exe", CoreSize: 40 << 20,
 	}}
 	c, f := newUpgradeCore(t, svc)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	if !c.handleReserved(context.Background(), adminEvent("/upgrade", "o1", "", host.SceneC2C, "o1")) {
 		t.Fatal("/upgrade 必须被核心消费，不能落到插件")
@@ -108,7 +112,7 @@ func TestUpgradePreviewRepliesReport(t *testing.T) {
 func TestUpgradePreviewErrorIsReported(t *testing.T) {
 	svc := &fakeUpgrade{previewErr: errors.New("请求 https://x 返回 404")}
 	c, f := newUpgradeCore(t, svc)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade", "o1", "", host.SceneC2C, "o1"))
 	if got := lastReply(t, f); !strings.Contains(got, "检查更新失败") {
@@ -135,7 +139,7 @@ func TestUpgradeApplyRepliesBeforeHandingPlan(t *testing.T) {
 	}
 	svc := &fakeUpgrade{plan: plan}
 	c, f := newUpgradeCore(t, svc)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	queuedAtSend := -1
 	f.onSend = func() { queuedAtSend = len(c.restart) }
@@ -161,7 +165,9 @@ func TestUpgradeApplyRepliesBeforeHandingPlan(t *testing.T) {
 		if req.Plan == nil || req.Plan.To != "1.2.4" {
 			t.Fatalf("换盘计划没有交给 main: %+v", req)
 		}
-		if req.By != "o1" || req.Role != store.RoleOwner {
+		// 身份口径是 core_owner：这个人来自 [core].owners，未必是这个 Bot 的
+		// admins 之一，写 owner 会让人事后翻 admins 表找不到人。
+		if req.By != "o1" || req.Role != "core_owner" {
 			t.Errorf("重启请求的身份不对: %+v", req)
 		}
 		if !strings.Contains(req.Reason, "1.2.4") {
@@ -185,7 +191,7 @@ func TestUpgradeApplyReportsPluginFailures(t *testing.T) {
 		},
 	}
 	c, f := newUpgradeCore(t, &fakeUpgrade{plan: plan})
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade apply", "o1", "", host.SceneC2C, "o1"))
 	got := lastReply(t, f)
@@ -202,7 +208,7 @@ func TestUpgradeApplyReportsPluginFailures(t *testing.T) {
 func TestUpgradeApplyFailureKeepsServing(t *testing.T) {
 	svc := &fakeUpgrade{applyErr: errors.New("校验和不匹配，已删除下载的产物")}
 	c, f := newUpgradeCore(t, svc)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade apply", "o1", "", host.SceneC2C, "o1"))
 
@@ -221,7 +227,7 @@ func TestUpgradeApplyFailureKeepsServing(t *testing.T) {
 func TestUpgradeApplyUpToDate(t *testing.T) {
 	svc := &fakeUpgrade{applyErr: upgrade.ErrUpToDate}
 	c, f := newUpgradeCore(t, svc)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade apply", "o1", "", host.SceneC2C, "o1"))
 	if got := lastReply(t, f); !strings.Contains(got, "已是最新版本") {
@@ -237,7 +243,7 @@ func TestUpgradeDisabledSkipsServiceEntirely(t *testing.T) {
 	svc := &fakeUpgrade{}
 	c, f := newUpgradeCore(t, svc)
 	c.cfg = &config.Config{Upgrade: config.Upgrade{Enabled: boolPtr(false)}}
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	for _, content := range []string{"/upgrade", "/upgrade apply"} {
 		c.handleReserved(context.Background(), adminEvent(content, "o1", "", host.SceneC2C, "o1"))
@@ -262,7 +268,7 @@ func TestUpgradeStatusReportsPending(t *testing.T) {
 		LastError: "",
 	}}
 	c, f := newUpgradeCore(t, svc)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade status", "o1", "", host.SceneC2C, "o1"))
 	got := lastReply(t, f)
@@ -275,7 +281,7 @@ func TestUpgradeStatusReportsPending(t *testing.T) {
 
 func TestUpgradeUnknownSubcommand(t *testing.T) {
 	c, f := newUpgradeCore(t, &fakeUpgrade{})
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade nope", "o1", "", host.SceneC2C, "o1"))
 	if got := lastReply(t, f); !strings.Contains(got, "未知子命令") {
@@ -285,7 +291,7 @@ func TestUpgradeUnknownSubcommand(t *testing.T) {
 
 func TestUpgradeHelp(t *testing.T) {
 	c, f := newUpgradeCore(t, &fakeUpgrade{})
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade help", "o1", "", host.SceneC2C, "o1"))
 	got := lastReply(t, f)
@@ -299,7 +305,7 @@ func TestUpgradeHelp(t *testing.T) {
 // 没装配升级能力时命令仍要被核心消费：落到插件就等于把名字让了出去。
 func TestUpgradeWithoutServiceIsConsumed(t *testing.T) {
 	c, f := newUpgradeCore(t, nil)
-	seedAdmin(t, c, "o1", "", store.RoleOwner)
+	seedCoreOwners(c, "o1")
 
 	if !c.handleReserved(context.Background(), adminEvent("/upgrade", "o1", "", host.SceneC2C, "o1")) {
 		t.Fatal("/upgrade 应被核心消费")

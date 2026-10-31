@@ -36,6 +36,7 @@ func newStateCore(t *testing.T, plugins ...host.Plugin) (*Core, *fakeAPI) {
 		startedAt: time.Now(),
 		restart:   make(chan RestartRequest, 1),
 		dropped:   make(map[BotState]int64, 4),
+		secret:    testBotSecret,
 	}
 	return c, f
 }
@@ -123,15 +124,8 @@ func TestClaimMakesBotActive(t *testing.T) {
 	}}
 	c, _ := newStateCore(t, probe)
 	ctx := context.Background()
-	if err := c.ensureOwner(ctx); err != nil {
-		t.Fatalf("生成认领令牌: %v", err)
-	}
-	token := c.claimToken
-	if token == "" {
-		t.Fatal("ensureOwner 应生成令牌")
-	}
 
-	c.Handle(ctx, adminEvent("/claim "+token, "u1", "", host.SceneC2C, "u1"))
+	c.Handle(ctx, adminEvent("/claim "+testBotSecret, "u1", "", host.SceneC2C, "u1"))
 
 	if st := stateOf(t, c); st != BotStateActive {
 		t.Fatalf("认领成功应迁移到 active，实际 %q", st)
