@@ -54,6 +54,12 @@ type Options struct {
 	// 就解析掉了）。nil 表示按 [quota.default] / [active].daily_per_peer
 	// 推导——单 Bot 与测试走这条路。
 	Quota *config.QuotaProfile
+	// Hot 是装配层提供的热操作入口（/bot 系列）。nil 表示本进程没有装配
+	// 热操作（单测、精简构建），此时 /bot 如实回答"未装配"而不是假装成功。
+	//
+	// 它是接口而不是 *instance.Container：core 不能 import 装配层，否则
+	// 两者互为依赖。接口只声明核心需要的最小面（见 BotHotService）。
+	Hot BotHotService
 }
 
 type Core struct {
@@ -107,6 +113,9 @@ type Core struct {
 
 	// botID 是平台侧 AppID，只用于日志与状态变更。
 	botID string
+
+	// hot 是 /bot 系列的热操作入口（装配层注入，见 Options.Hot）。
+	hot BotHotService
 
 	// stateMu 保护 Bot 状态机的全部可变部分：缓存状态、连续鉴权失败计数、
 	// 按状态的丢弃计数。它们都在 Handle 的热路径上，必须一把锁、不能查库。
@@ -205,6 +214,7 @@ func New(o Options) (*Core, error) {
 		gcDone:    make(chan struct{}),
 		upgrade:   o.Upgrade,
 		botID:     o.BotID,
+		hot:       o.Hot,
 		dropped:   make(map[BotState]int64, 4),
 	}
 	// 出站成败必须回灌到状态机：连续鉴权类失败是"这个 Bot 的身份已不可用"的

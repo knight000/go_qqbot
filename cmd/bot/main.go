@@ -247,6 +247,9 @@ func run() (*core.RestartRequest, error) {
 		Renderer: renderer,
 		Outbound: hc,
 		LockWait: lockWait(buildinfo.RestartedByReload()),
+		// /bot reload 靠它重读磁盘（#68）。容器不认识 -c，所以路径必须从
+		// 这里给：否则"配置文件在哪"会有两份互不知情的事实。
+		ConfigPath: *cfgPath,
 		LoadPlugins: func(ctx context.Context, blog *slog.Logger) ([]host.Plugin, error) {
 			// 一套插件进程服务所有 Bot（ADR-0008 决策 11）：加载只做一次，
 			// 之后每个 Bot 只是把自己注册进这些句柄（按 bot_id 各 init 一次）。

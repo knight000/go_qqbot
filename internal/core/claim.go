@@ -83,6 +83,12 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		c.trace.CoreCommand(cmd)
 		c.handleUpgrade(ctx, ev)
 		return true
+	case "/bot":
+		// 进程级的 Bot 管理（ADR-0008 决策 9/15）：只认 Core 所有者，
+		// 与 /reset（管一个 Bot 的数据）是两条不相交的线。
+		c.trace.CoreCommand(cmd)
+		c.handleBot(ctx, ev)
+		return true
 	}
 	return false
 }

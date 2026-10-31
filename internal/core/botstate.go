@@ -36,6 +36,35 @@ const (
 // 就会出现"写入用 bot.status、读取用 bot_state"这种只在排障时发现的错位。
 const StateKeyBotState = "bot_state"
 
+// StateKeyBotSuspendReason 是 bot_state 表里存"为什么停用"的键。
+//
+// suspended 有两个来源：配置里 enabled=false，以及配置里**没有这一条**了
+// （#68 的热删除，数据保留）。两者对闸门是同一件事——都全丢事件——但对人
+// 完全不是：前者是"我关的"，后者是"它从配置里消失了，可以 purge"。状态仍是
+// 四态里的 suspended（ADR-0008 决策 8），不新造第五个状态。
+const StateKeyBotSuspendReason = "bot_suspend_reason"
+
+const (
+	// SuspendReasonConfigDisabled 是配置 enabled = false。
+	SuspendReasonConfigDisabled = "config_disabled"
+	// SuspendReasonConfigGone 是配置里已经删掉了这一条。
+	SuspendReasonConfigGone = "config_gone"
+)
+
+// SaveSuspendReason 记录停用原因。只写 bot_state，不动状态本身。
+func SaveSuspendReason(ctx context.Context, db *store.DB, reason string) error {
+	return db.PutState(ctx, StateKeyBotSuspendReason, reason)
+}
+
+// LoadSuspendReason 读停用原因；没有记录时返回空串。
+func LoadSuspendReason(ctx context.Context, db *store.DB) (string, error) {
+	v, ok, err := db.GetState(ctx, StateKeyBotSuspendReason)
+	if err != nil || !ok {
+		return "", err
+	}
+	return v, nil
+}
+
 // authFailureThreshold 是进入 failing 的连续失败次数。
 // 偶发一次鉴权错误（例如平台抖动、令牌刚好过期）不该让 Bot 停摆。
 const authFailureThreshold = 3
@@ -117,6 +146,9 @@ func ReconcileBotState(ctx context.Context, db *store.DB, enabled bool) (BotStat
 		return st, nil
 	}
 	if st != BotStateSuspended {
+		// 已是启用态：残留的停用原因必须清掉，否则排障时它会一直指向一次
+		// 早已结束的停用（"配置里没了"是最容易被误读成当前事实的一句话）。
+		_ = db.DeleteState(ctx, StateKeyBotSuspendReason)
 		return st, nil
 	}
 	// 解除停用：admins 非空即 active，否则又是"等人认领"。
@@ -130,6 +162,10 @@ func ReconcileBotState(ctx context.Context, db *store.DB, enabled bool) (BotStat
 	}
 	if err := SaveBotState(ctx, db, next); err != nil {
 		return st, err
+	}
+	// 停用原因随解除一起消失：它只描述"上一次为什么停下"。
+	if err := db.DeleteState(ctx, StateKeyBotSuspendReason); err != nil {
+		return next, err
 	}
 	return next, nil
 }

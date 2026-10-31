@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -361,9 +362,22 @@ func (c *Core) clearAllData(ctx context.Context) (store.ResetCounts, int, error)
 // 配了 [media].dir 时只删该目录内的路径——库里的 path 若被写坏，
 // 不该变成一次任意文件删除。
 func (c *Core) removeMediaFiles(paths []string) int {
+	dir := ""
+	if c.cfg != nil {
+		dir = c.cfg.Media.Dir
+	}
+	return RemoveMediaFiles(c.log, dir, paths)
+}
+
+// RemoveMediaFiles 按 [media].dir 收敛后逐个删文件，返回成功删除的数量。
+//
+// 从 (*Core).removeMediaFiles 里抽出来是为了能在**没有 Core** 的地方复用：
+// /bot remove --purge 删的是一个已经不在运行、没有 Core 的 Bot
+// （#68）。两份实现早晚会分叉，而这条路径一旦分叉就是"删了行没删文件"。
+func RemoveMediaFiles(log *slog.Logger, mediaDir string, paths []string) int {
 	root := ""
-	if c.cfg != nil && strings.TrimSpace(c.cfg.Media.Dir) != "" {
-		if abs, err := filepath.Abs(c.cfg.Media.Dir); err == nil {
+	if strings.TrimSpace(mediaDir) != "" {
+		if abs, err := filepath.Abs(mediaDir); err == nil {
 			root = filepath.Clean(abs)
 		}
 	}
@@ -372,12 +386,12 @@ func (c *Core) removeMediaFiles(paths []string) int {
 	for _, p := range paths {
 		clean := filepath.Clean(p)
 		if root != "" && !strings.HasPrefix(clean, root+string(os.PathSeparator)) {
-			c.log.Warn("媒体路径不在 [media].dir 内，跳过删除", "path", p, "dir", root)
+			log.Warn("媒体路径不在 [media].dir 内，跳过删除", "path", p, "dir", root)
 			continue
 		}
 		if err := os.Remove(clean); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
-				c.log.Warn("删除媒体文件失败", "path", clean, "err", err)
+				log.Warn("删除媒体文件失败", "path", clean, "err", err)
 			}
 			continue
 		}
