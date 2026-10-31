@@ -52,6 +52,10 @@ type proxy struct {
 	// hosts 是「哪个 Bot 用哪一份 Host」：共享进程下（ADR-0008 决策 11）
 	// 一个插件实例服务 N 个 Bot，host.* 的每条调用都靠 bot_id 在这里选。
 	hosts map[string]host.Host
+	// botInfos 是每个 Bot 的 host.BotInfo（appid + 认证类型）。插件进程崩溃
+	// 重启后要重放 init，而重放必须带上认证类型——只传 appid 会让插件侧
+	// Host.Bot() 返回空 CertType，插件据此做的分档（限额、提示）就全错了。
+	botInfos map[string]host.BotInfo
 	// cfgs 是每个 Bot 的配置快照（`[plugins.<name>]` 的原始 map）。配置是
 	// 业务面的、按 Bot 不同（决策 10），所以按 Bot 各存一份、各 init 一次。
 	cfgs map[string]map[string]any
@@ -90,6 +94,7 @@ func newProxy(pr probeResult, o Options) host.Plugin {
 		backoff:   o.backoff(),
 		probe:     o.probeTimeout(),
 		hosts:     make(map[string]host.Host),
+		botInfos:  make(map[string]host.BotInfo),
 		cfgs:      make(map[string]map[string]any),
 		started:   make(map[string]bool),
 	}
@@ -136,6 +141,7 @@ func (p *proxy) Init(ctx context.Context, h host.Host) error {
 		return fmt.Errorf("pluginproc: 插件 %s 已经为 Bot %s 初始化过（Init 每个 Bot 只调用一次）", p.name, bot.AppID)
 	}
 	p.hosts[bot.AppID] = h
+	p.botInfos[bot.AppID] = bot
 	p.cfgs[bot.AppID] = p.configFor(p.name)
 	alive := p.cur != nil
 	p.mu.Unlock()
@@ -691,6 +697,12 @@ func (p *proxy) registeredBots() []host.BotInfo {
 	defer p.mu.Unlock()
 	out := make([]host.BotInfo, 0, len(p.hosts))
 	for id := range p.hosts {
+		if info, ok := p.botInfos[id]; ok {
+			out = append(out, info)
+			continue
+		}
+		// 没有记录（不该发生）时退回只有 appid 的形态：插件仍能工作，只是
+		// 拿不到认证类型——比不初始化这个 Bot 好。
 		out = append(out, host.BotInfo{AppID: id})
 	}
 	return out
@@ -705,6 +717,7 @@ func (p *proxy) registeredBots() []host.BotInfo {
 func (p *proxy) UnregisterBotHost(botID string) {
 	p.mu.Lock()
 	delete(p.hosts, botID)
+	delete(p.botInfos, botID)
 	delete(p.cfgs, botID)
 	delete(p.started, botID)
 	p.mu.Unlock()

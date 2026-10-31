@@ -239,6 +239,15 @@ func (c *Container) ReloadAll(ctx context.Context, self string) (core.BotReloadS
 	// 与配额也一致。已经在跑的那些仍用自己的那份（全局配置不热改）。
 	c.setConfig(next)
 
+	// 任务桶是**进程级共享**的额度池（#66），它在启动装配时按"会不会有多个
+	// 启用的 Bot"决定建不建，而 Core 一旦建好就拿不到后补的池。所以从 1 个
+	// 热增到 2 个之后，两个 Core 会各自持一份容量 4 —— 总并发变成 8。
+	// 这是本票不做的事（要修得让 Core 的池可替换），但不能装作没发生。
+	if c.jobs == nil && countEnabled(next.Bots) > 1 {
+		c.log.Warn("热重载后启用多个 Bot，但任务桶仍是每 Bot 一份（总并发 8 而非 4）；要回到共享 4 需重启进程",
+			"enabled", countEnabled(next.Bots))
+	}
+
 	for _, nb := range next.Bots {
 		ob, existed := oldByID[nb.AppID]
 		switch {
@@ -520,3 +529,14 @@ func botNeedsReconnect(ob, nb config.Bot) bool {
 
 // shuttingDown 报告进程是否已经进入关停。热操作在拿 hotMu 之前先看它。
 func (c *Container) shuttingDown() bool { return c.ctx.Err() != nil }
+
+// countEnabled 数配置里有几个启用的 Bot。
+func countEnabled(bots []config.Bot) int {
+	n := 0
+	for _, b := range bots {
+		if b.IsEnabled() {
+			n++
+		}
+	}
+	return n
+}

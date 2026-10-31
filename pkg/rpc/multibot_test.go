@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -167,4 +168,60 @@ func otherBot(id string) string {
 		return "bot-b"
 	}
 	return "bot-a"
+}
+
+// 热重连（`/bot reload <appid>`）会对同一个 Bot 再来一次 init：它在核心侧
+// 是「停核心 → 摘 Host → 重新装配」，在插件侧必须是一次干净的重新初始化。
+//
+// 这条用例钉的是"重新 init 被允许"以及"旧状态确实被换掉"。之前线协议把
+// init 当成一次性动作（Init 每 Bot 只调用一次），热重连之后这个 Bot 的所有
+// 事件都会撞在"已经初始化过"的拒绝上——插件全哑，且没有任何日志。
+func TestReinitSameBotAfterReload(t *testing.T) {
+	p := &multiBotPlugin{}
+	a, b := newPair(t)
+	if err := ServePlugin(b, p); err != nil {
+		t.Fatalf("ServePlugin: %v", err)
+	}
+
+	kv1, kv2 := newMultiBotKV(), newMultiBotKV()
+	h1 := host.NewService(host.Options{Name: "multibot", Bot: host.BotInfo{AppID: "bot-a", CertType: "personal"}, KV: kv1})
+	h2 := host.NewService(host.Options{Name: "multibot", Bot: host.BotInfo{AppID: "bot-a", CertType: "personal"}, KV: kv2})
+	cur := host.Host(h1)
+	if err := ServeHost(a, func(string) (host.Host, error) { return cur, nil }); err != nil {
+		t.Fatalf("ServeHost: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	info := host.BotInfo{AppID: "bot-a", CertType: "personal"}
+	if err := a.CallInit(ctx, info, "multibot", nil); err != nil {
+		t.Fatalf("首次 init: %v", err)
+	}
+	p.mu.Lock()
+	first := p.hosts["bot-a"]
+	p.mu.Unlock()
+
+	// 核心侧重连：换上新的 Host，再 init 一次同一个 Bot。
+	cur = h2
+	if err := a.CallInit(ctx, info, "multibot", nil); err != nil {
+		t.Fatalf("重新 init 同一个 Bot 应被允许: %v", err)
+	}
+
+	// 插件侧拿到的是**新一轮的 HostClient**：同一个 Bot 只该留一条记录，
+	// 且必须换成新那份（留着旧的等于还在往已经关掉的库上写）。
+	p.mu.Lock()
+	second, n := p.hosts["bot-a"], len(p.hosts)
+	p.mu.Unlock()
+	if n != 1 || second == nil || second == first {
+		t.Fatalf("插件侧应只剩新的 HostClient（n=%d，复用旧值=%v）", n, second == first)
+	}
+
+	// 重连之后事件照常可达：gate 是新建的，不该再挂着。
+	reply, err := a.CallHandle(ctx, info, &host.Event{ID: "e-after-reload", Kind: host.KindMessage})
+	if err != nil {
+		t.Fatalf("重连后的 handle: %v", err)
+	}
+	if reply == nil || !strings.HasPrefix(reply.Content, "bot-a/personal/") {
+		t.Fatalf("重连后的回复 = %v", reply)
+	}
 }

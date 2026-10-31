@@ -111,15 +111,25 @@ type pluginServer struct {
 
 	mu   sync.Mutex
 	bots map[string]*botState
+	// closing 在进程级 close 到达后置位：此后再来的 Init 一律拒绝。
+	// 它挡的不是"重复 Init"，而是"插件已在收尾，核心还在装配新 Bot"。
+	closing bool
 }
 
 // botState 是一个 Bot 在插件侧的全部状态。
+// botState 是一个 Bot 在本插件进程里的全部状态。
+//
+// 一个 Bot 可以**被重新初始化**：`/bot reload <appid>` 会先停掉它的核心
+//（注销 Host、关库、放锁），再用同一套插件进程重新 init/start。所以这里的
+// 字段描述的是"这一轮初始化"，不是"这个 Bot 的永久属性"。
 type botState struct {
 	host *HostClient
 	cfg  map[string]any
 	// gate 在该 Bot 的 Init 返回（成功、失败或 panic）时关闭。
-	gate   chan struct{}
-	closed bool
+	gate chan struct{}
+	// inited 表示这一轮 Init 已经有结果（gate 已关）；false 说明还有一次
+	// Init 在跑，此时再来一个 Init 是协议违规。
+	inited bool
 	err    error
 }
 
@@ -179,15 +189,20 @@ func (s *pluginServer) init(ctx context.Context, req Request) (Response, error) 
 	}
 
 	s.mu.Lock()
-	bs, ok := s.bots[botID]
-	if ok && bs.closed {
+	if s.closing {
 		s.mu.Unlock()
-		return Response{}, fmt.Errorf("rpc: Bot %s 的插件已经初始化过（Init 每个 Bot 只调用一次）", botID)
+		return Response{}, fmt.Errorf("rpc: 插件正在关闭，拒绝初始化 Bot %s", botID)
 	}
-	if !ok {
-		bs = &botState{gate: make(chan struct{})}
-		s.bots[botID] = bs
+	// 同一个 Bot 再来一次 Init 是**合法**的（热重连），但必须等上一轮结束：
+	// 还在跑就再来一个，等于两个 Init 同时改同一份插件状态。
+	if old, ok := s.bots[botID]; ok && !old.inited {
+		s.mu.Unlock()
+		return Response{}, fmt.Errorf("rpc: Bot %s 的上一次 Init 还没结束", botID)
 	}
+	// 重连就是新的一轮：旧的 gate / HostClient / 配置全部作废。插件自己按
+	// appid 存的业务状态不在我们这里，重连后它该收到一次干净的 Init。
+	bs := &botState{gate: make(chan struct{})}
+	s.bots[botID] = bs
 	// HostClient 现在就建好：Init 里就要用它（Config 是本地值，其余能力
 	// 会带着这个 Bot 的 id 发 RPC）。
 	bs.host = NewHostClient(s.c, name, vals, host.BotInfo{AppID: botID, CertType: p.CertType})
@@ -206,7 +221,7 @@ func (s *pluginServer) init(ctx context.Context, req Request) (Response, error) 
 		}
 		s.mu.Lock()
 		bs.err = initErr
-		bs.closed = true
+		bs.inited = true
 		s.mu.Unlock()
 		close(bs.gate)
 	}()
@@ -306,6 +321,7 @@ func (s *pluginServer) close(ctx context.Context, _ Request) (Response, error) {
 	// 但要等所有已开始的 Init 落定——否则 close 会与在跑的 Init 撞在
 	// 同一份插件状态上。
 	s.mu.Lock()
+	s.closing = true
 	gates := make([]chan struct{}, 0, len(s.bots))
 	for _, bs := range s.bots {
 		gates = append(gates, bs.gate)
