@@ -647,6 +647,9 @@ func (c *Config) normalize(md toml.MetaData) error {
 //
 // 缺文件单独给一句话：那是新用户看到的第一条错误，必须直接指向
 // `qqbot init`，而不是 "open xxx: The system cannot find the file specified"。
+//
+// 语法错误单独重建一遍（见 maskQuotedValues）：解析器会回显出错的那个词，
+// 而最常见的现场就是 secret 那一行少写一对引号——那条错误串会原样进启动日志。
 func decodeFile(path string, c *Config) (toml.MetaData, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -657,9 +660,52 @@ func decodeFile(path string, c *Config) (toml.MetaData, error) {
 	}
 	md, err := toml.Decode(string(data), c)
 	if err != nil {
+		var pe toml.ParseError
+		if errors.As(err, &pe) {
+			return toml.MetaData{}, fmt.Errorf(
+				"解析配置 %s: 第 %d 行第 %d 列附近语法错误（出错前最后一个键：%s）：%s",
+				path, pe.Position.Line, pe.Position.Col, orDash(pe.LastKey), maskQuotedValues(pe.Message))
+		}
 		return toml.MetaData{}, fmt.Errorf("解析配置 %s: %w", path, err)
 	}
 	return md, nil
+}
+
+// maskQuotedValues 把错误串里引号内的内容替换成 ***。
+//
+// TOML 解析器的技术描述会回显"出错的那个词"（`expected value but found "abc"
+// instead`）。secret 那一行少写一对引号时，回显的就是凭据开头的字母——
+// 这条错误会被启动日志原样打印、进 journald、被用户贴进截图。定位不靠那个词：
+// 行号、列号与"出错前最后一个键"都在同一条错误里。
+func maskQuotedValues(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	open := false
+	for _, r := range s {
+		if r != '"' {
+			// 引号内的内容一律丢掉：那正是"出错的那个词"。
+			if !open {
+				b.WriteRune(r)
+			}
+			continue
+		}
+		if !open {
+			b.WriteString(`"***`)
+			open = true
+			continue
+		}
+		b.WriteByte('"')
+		open = false
+	}
+	return b.String()
+}
+
+// orDash 让"没有键"这种情况在错误串里读得出来，而不是留一段空白。
+func orDash(s string) string {
+	if s == "" {
+		return "无"
+	}
+	return s
 }
 
 // applyEnv 用环境变量覆盖凭据。

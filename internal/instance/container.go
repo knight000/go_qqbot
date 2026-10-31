@@ -222,7 +222,7 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 	started := 0
 	for _, b := range cfg.Bots {
 		if !b.IsEnabled() {
-			log.Info("Bot 已停用，不连接", "appid", b.AppID)
+			log.Info("Bot 已停用，不连接", "bot", b.AppID)
 			// 停用也要落一行状态：库里留着的 failing/active 会让第二天排障的人
 			// 误判成"它自己挂的"，而实际上是人工关的。
 			c.markSuspended(runCtx, b, core.SuspendReasonConfigDisabled)
@@ -237,7 +237,7 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 		c.addRuntime(rt)
 		if rt.err != nil {
 			log.Error("Bot 未启动，其余 Bot 继续",
-				"appid", b.AppID,
+				"bot", b.AppID,
 				"db", cfg.BotStorePath(b),
 				"err", rt.err)
 			continue
@@ -279,12 +279,99 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 	// 一套插件进程服务所有 Bot：进程数 = 插件数，不再随租户数线性增长
 	// （ADR-0008 决策 11 要消灭的就是那个乘法）。这一行是"到底起了几个
 	// 插件进程"的唯一权威来源。
+	//
+	// 摘要排在完成行之前：它是"起了什么"的收口，而最后一行留给"起完了"这个
+	// 事实——两行都在同一个函数里，天然只打一次。
+	c.logBotStateSummary(runCtx)
 	log.Info("Bot 启动完成",
 		"bots", len(cfg.Bots), "enabled", enabled,
 		"started", started, "failed", enabled-started,
 		"plugins_total", len(c.plugins),
 		"elapsed", time.Since(startedAt).Round(time.Millisecond).String())
 	return c, nil
+}
+
+// botStateTally 是按状态汇总的一组计数。
+//
+// 四个状态与 core.BotState 一一对应，另外两个数不落在状态里：Total 是配置里
+// 登记的 Bot 总数（含停用的），NotStarted 是其中"根本没起来"的个数
+// （它们没有可读的库，计数记进 Failing，见 tallyBotStates）。
+type botStateTally struct {
+	Total        int
+	Active       int
+	PendingClaim int
+	Failing      int
+	Suspended    int
+	NotStarted   int
+}
+
+// String 生成启动摘要的正文（验收文案，改字要同步改 #69 的验收）。
+func (t botStateTally) String() string {
+	return fmt.Sprintf("共 %d 个 Bot：%d 个 active、%d 个 pending_claim、%d 个 failing、%d 个 suspended",
+		t.Total, t.Active, t.PendingClaim, t.Failing, t.Suspended)
+}
+
+// tallyBotStates 汇总所有已登记 Bot 的状态。
+//
+// 取值口径与 #63 完全一致：库里有 bot_state 就用它，没有行时按 admins 是否
+// 为空推导——唯一读法是 core.LoadBotState，这里不另立一套（两套推导迟早会
+// 在"启动摘要说 pending_claim、闸门却按 active 放行"上分叉）。
+//
+// 三类 Bot 各有各的读法：
+//   - 起成功的：读它自己的库；
+//   - 配置里停用的：不连接，库里的状态在启动时已由 markSuspended 落成
+//     suspended，这里用配置事实（不为读一行再开一次库）；
+//   - 没起来的（锁被占、开库失败…）：没有可读的库，记进 Failing 并单列
+//     NotStarted——"配置里有、实际没跑"是必须能被看见的事实，混进 active
+//     才是真正的误导。
+func tallyBotStates(ctx context.Context, log *slog.Logger, bots []config.Bot, runtimes map[string]*botRuntime) botStateTally {
+	t := botStateTally{Total: len(bots)}
+	for _, b := range bots {
+		if !b.IsEnabled() {
+			t.Suspended++
+			continue
+		}
+		rt := runtimes[b.AppID]
+		if rt == nil || rt.db == nil {
+			t.Failing++
+			t.NotStarted++
+			continue
+		}
+		st, err := core.LoadBotState(ctx, rt.db)
+		if err != nil {
+			log.Warn("读取 Bot 状态失败，按 failing 计入启动摘要", "bot", b.AppID, "err", err)
+			t.Failing++
+			continue
+		}
+		switch st {
+		case core.BotStateActive:
+			t.Active++
+		case core.BotStatePendingClaim:
+			t.PendingClaim++
+		case core.BotStateFailing:
+			t.Failing++
+		default:
+			t.Suspended++
+		}
+	}
+	return t
+}
+
+// logBotStateSummary 打启动摘要：一行回答"这台机器上现在有几个 Bot、各是什么
+// 状态"。正文给人扫，attrs 给 grep 与看板——两者同源，不会各说各话。
+func (c *Container) logBotStateSummary(ctx context.Context) {
+	runtimes := make(map[string]*botRuntime, len(c.bots))
+	for _, rt := range c.bots {
+		runtimes[rt.cfg.AppID] = rt
+	}
+	t := tallyBotStates(ctx, c.log, c.cfg.Bots, runtimes)
+	c.log.Info(t.String(),
+		"bots", t.Total,
+		"active", t.Active,
+		"pending_claim", t.PendingClaim,
+		"failing", t.Failing,
+		"suspended", t.Suspended,
+		"not_started", t.NotStarted)
 }
 
 // loadPlugins 装配进程级的插件集。没有加载器时返回空集：这条分支已在
@@ -320,9 +407,11 @@ func logPluginSet(plugins []host.Plugin, log *slog.Logger) {
 //
 // 库路径必须可见：它由 appid 推导，备份、迁移、清理都靠这一行确认东西落在哪。
 // 插件不在这一行：它是进程级共享的，由 logPluginSet 统一打一次。
+//
+// 这里不再打 appid：rt.log 已经预置 `bot=<appid>`（见 startBot），同一行里
+// 再拼一个 appid 只是把同一个值写两遍，还会让"按 bot 检索"的 grep 出现两种键名。
 func logBotStarted(rt *botRuntime) {
 	rt.log.Info("Bot 已启动",
-		"appid", rt.cfg.AppID,
 		"db", rt.db.Path(),
 		"lock", rt.lock.Path(),
 		"app_lock", rt.lock.AppPath(),
@@ -484,25 +573,25 @@ func (c *Container) config() *config.Config {
 func (c *Container) markSuspended(ctx context.Context, b config.Bot, reason string) {
 	db, err := store.Open(c.config().BotStorePath(b))
 	if err != nil {
-		c.log.Error("停用 Bot 的状态未落库（打开库失败）", "appid", b.AppID, "err", err)
+		c.log.Error("停用 Bot 的状态未落库（打开库失败）", "bot", b.AppID, "err", err)
 		return
 	}
 	defer func() { _ = db.Close() }()
 	if err := db.Migrate(ctx); err != nil {
-		c.log.Error("停用 Bot 的状态未落库（迁移失败）", "appid", b.AppID, "err", err)
+		c.log.Error("停用 Bot 的状态未落库（迁移失败）", "bot", b.AppID, "err", err)
 		return
 	}
 	st, err := core.ReconcileBotState(ctx, db, false)
 	if err != nil {
-		c.log.Error("停用 Bot 的状态未落库", "appid", b.AppID, "err", err)
+		c.log.Error("停用 Bot 的状态未落库", "bot", b.AppID, "err", err)
 		return
 	}
 	if reason != "" {
 		if err := core.SaveSuspendReason(ctx, db, reason); err != nil {
-			c.log.Warn("停用原因未落库", "appid", b.AppID, "reason", reason, "err", err)
+			c.log.Warn("停用原因未落库", "bot", b.AppID, "reason", reason, "err", err)
 		}
 	}
-	c.log.Info("Bot 状态标记为 suspended", "appid", b.AppID, "state", string(st), "reason", reason)
+	c.log.Info("Bot 状态标记为 suspended", "bot", b.AppID, "state", string(st), "reason", reason)
 }
 
 // noteGatewayStart 记一条活着的网关。启动循环用它判断"启动期就全退了"。

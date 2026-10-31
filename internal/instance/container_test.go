@@ -359,10 +359,22 @@ func TestStartupSummaryIsVisible(t *testing.T) {
 		}
 	}
 	// 每个 Bot 各自一行，带库路径；插件清单是进程级的一份（secret 永不出现）。
-	for _, want := range []string{"appid=102000001", "appid=102000002", "进程级插件已装配", "plugin_names=echo"} {
+	// 键名是 bot= 而不是 appid=：多 Bot 之后"这行属于谁"只能有一个键（#69）。
+	for _, want := range []string{"bot=102000001", "bot=102000002", "进程级插件已装配", "plugin_names=echo"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("启动日志缺少 %q：\n%s", want, out)
 		}
+	}
+
+	// 状态摘要：一行、只打一次、数值来自库里的 bot_state。这两个 Bot 都没有
+	// 管理员也没有状态行（#63 的口径：推导成 pending_claim），所以 0 个 active。
+	const summary = "共 2 个 Bot：0 个 active、2 个 pending_claim、0 个 failing、0 个 suspended"
+	if got := strings.Count(out, summary); got != 1 {
+		t.Errorf("启动摘要应恰好出现 1 次，实际 %d 次：\n%s", got, out)
+	}
+	if !strings.Contains(out, "active=0") || !strings.Contains(out, "pending_claim=2") ||
+		!strings.Contains(out, "not_started=0") {
+		t.Errorf("启动摘要缺少可 grep 的计数 attrs：\n%s", out)
 	}
 	if strings.Contains(out, "secret-102000001") {
 		t.Errorf("启动日志泄露了 secret：\n%s", out)

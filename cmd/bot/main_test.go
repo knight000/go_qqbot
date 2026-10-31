@@ -83,7 +83,7 @@ func TestLogBotsPrintsDataDirAndNeverSecret(t *testing.T) {
 		t.Fatalf("应每个 Bot 一行，实际 %d 行:\n%s", got, out)
 	}
 	for _, want := range []string{
-		"data_dir=", "appid=102000001", "appid=102000002",
+		"data_dir=", "bot=102000001", "bot=102000002",
 		"data_dir=/srv/qqbot/manual",
 		// 库路径也必须是推导结果：运维照着这一行去备份，不能是 [store].path。
 		"db=" + filepath.Join("data", "bots", "102000001", "qqbot.db"),

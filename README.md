@@ -64,18 +64,28 @@ $EDITOR config/config.local.toml
 启动日志里能确认插件真的装上了（这几行都在连网关之前，网关连不上照样打）：
 
 ```text
-[INFO] 发现插件 component=pluginproc plugin=echo version=0.1.0 api_version=12 commands=2 optional=0
+[INFO] 发现插件 component=pluginproc plugin=echo version=0.1.0 api_version=14 commands=2 optional=0
+[INFO] 进程级插件已装配 plugins=4 plugin_names=adminping,bootnotice,echo,md
 [INFO] 核心已启动 bot=102xxxxx plugins=4 sandbox=true
-[INFO] Bot 已启动 bot=102xxxxx appid=102xxxxx db=...\bots\102xxxxx\qqbot.db plugins=4 plugin_names=adminping,bootnotice,echo,md
-[INFO] Bot 启动完成 bots=2 enabled=2 started=2 failed=0 plugins_total=8 elapsed=30.4s
+[INFO] Bot 已启动 bot=102xxxxx db=...\bots\102xxxxx\qqbot.db lock=... app_lock=... plugins=4
+[INFO] 共 2 个 Bot：2 个 active、0 个 pending_claim、0 个 failing、0 个 suspended
+[INFO] Bot 启动完成 bots=2 enabled=2 started=2 failed=0 plugins_total=4 elapsed=30.4s
 [INFO] qqbot 启动完成 config=config/config.local.toml ... version="dev 4a19ec1e" platform=windows/amd64 bots=2 started=2
 ```
 
-`plugin_names` 是"哪些插件真的装上了"的唯一权威来源（**每个 Bot 一行**：插件按 Bot 各装
-一套，两个 Bot 的清单可以不一样）：`bootnotice` 不再报插件清单（插件进程看不到别的插件，
-契约里也没有这个访问器）。`Bot 启动完成` 那一行的 `elapsed` 就是启动错峰的代价——
-`GET /gateway/bot` 限 2 QPM，N 个 Bot 默认串行 + 30s 间隔（`[bot].gateway_stagger`）。
-`plugins_total` 是**插件进程总数**：过渡形态下每 Bot 一套，多租户前先按它核 `MemoryMax`。
+几处读法：
+
+- **每一行都用 `bot=<appid>` 回答"这行属于谁"**。`appid=` 只出现在配置校验的文案里
+  （那里指的就是 `[[bots]].appid` 这个键）。多 Bot 排队排障时按 `bot=` 一条 grep 即可。
+- `plugin_names` 是"哪些插件真的装上了"的唯一权威来源。插件是**一套进程服务所有 Bot**
+  （ADR-0008 决策 11），所以这行只打一次；`Bot 已启动` 上的 `plugins=` 是该 Bot 的
+  Host 注册数。
+- **状态摘要那一行只打一次**，数值来自各 Bot 库里的 `bot_state`；库里没有行时按
+  `admins` 是否为空推导（与闸门同一口径）。`not_started` 是"配置里有、实际没起来"的数
+  ——锁被占、开库失败这类，它们同时被计入 `failing`。
+- `elapsed` 是启动错峰的代价：`GET /gateway/bot` 限 2 QPM，N 个 Bot 默认串行 + 30s
+  间隔（`[bot].gateway_stagger`）。`plugins_total` 是**插件进程数**，等于插件数，不随
+  Bot 数增长。
 
 `init` 的两个开关：
 
@@ -129,6 +139,78 @@ WARN 未检测到管理员，已生成一次性认领令牌 ttl=10m0s token=<64�
 
 在目标群或单聊发送 `/claim <token>` 即成为 owner（一次性、10 分钟过期）。
 之后可用 `/admin add <openid> [备注]` 添加辅助管理员，用 `/ping` 查看运行状态，用 `!ping`、`!echo <文本>` 验证收发链路。
+
+## 多 Bot 部署（一个进程托管 N 个 Bot）
+
+一个进程可以同时跑多个平台 Bot：每个 Bot 各取一把单实例锁、各开一份 SQLite、各连一条
+网关，彼此不共享任何可变状态（ADR-0008）。加一个 Bot 就是加一段 `[[bots]]`，不必为每个号
+再维护一份配置与 systemd unit。平台规则上这也是官方支持的形态（"单机多账号"）。
+
+### 配置分两层
+
+```toml
+[core]
+# 进程级命令（/reload /restart /upgrade /reset all /bot 系列）的唯一授权来源。
+# 填 openid 列表；留空表示这些命令谁都执行不了——这也是"租户重启不了整台机器"的原因。
+owners = ["<你的 openid>"]
+
+[[bots]]
+appid = "102xxxxx"          # 平台侧 appid，同时是数据目录名与锁的维度
+secret = "..."              # AppSecret，明文在文件里，配置文件必须 600
+enabled = true              # false = 不连接，库里的状态落成 suspended
+cert_type = "personal"      # unverified | personal | enterprise
+quota_profile = "default"   # 指向 [quota.<档名>]
+
+[[bots]]
+appid = "102yyyyy"
+secret = "..."
+cert_type = "enterprise"
+quota_profile = "tight"
+```
+
+分工是硬边界：
+
+- **全局管基础设施**：`[core]` `[store]` `[http]` `[log]` `[plugins]` `[quota]` `[upgrade]`
+  这些顶层段是进程级的，同一台机器上的所有 Bot 共用一份。改它们要重启进程（`/reload`）。
+- **每 Bot 只覆盖业务面**：启用哪些插件、人设/前缀、开关默认值——这些存在**该 Bot 自己
+  的库**里，租户自己能改，也碰不到基础设施。
+- 数据落在 `<datadir>/bots/<appid>/qqbot.db`（一 Bot 一库），可用 `[[bots]].data_dir` 把
+  某一户挪到别的盘。库之间没有 `bot_id` 列，隔离靠物理边界。
+
+### 认领：第一个知道 secret 的人成为所有者
+
+1. 配置文件里写 `appid` 与 `secret`（人工开户，没有在线自助注册——secret 本来就是平台
+   线下交付给你的东西）。
+2. 起 Bot。新 Bot 的状态是 `pending_claim`：**除 `/claim` 之外什么都收不到**，被丢弃的
+   消息连库都不进（闸门排在去重之前）。
+3. 用该 Bot **私聊** `/claim <secret>`。常量时间比对成功即绑定为这个 Bot 的所有者，状态
+   转 `active`，从这一刻起才收发普通消息。一次性、不转移；群里发 `/claim` 一律拒绝。
+
+**托管方能解密任何租户的 secret。** 这句话必须写在明面上：secret 防的是第三方冒认
+（别人没有你的 secret 就抢不走这个 Bot），**不防托管方**——配置文件就在托管方手里，
+技术上它能认领任何租户的 Bot。这是 BYOB（bring your own bot）形态的固有代价，别把它
+当成零信任。
+
+### secret 泄露或轮换：顺序不能反
+
+```
+平台重置 secret → 改配置文件 → /bot reload <appid> → （重新）认领
+```
+
+反着做的后果是具体的：
+
+- **先改配置、后重置平台**：reload 之后新值在平台上还不存在，取 token 直接吃
+  `100016`；连续 3 次鉴权类失败会把该 Bot 推进 `failing`，然后按 1/2/4/8/16 分钟退避
+  重连——每一轮撞的都是同一堵墙。
+- **平台重置后不动配置**：旧值在平台上**立即**失效，症状同上（Bot 进 `failing`）。这段
+  时间它不发不收，但库里的群名单、管理员、会话都还在，改完配置 reload 即恢复 `active`。
+- **所有权换人不能只靠重置 secret**：`/claim` 一次性、不转移，库里已有所有者时再发只会
+  回"该 Bot 已被认领"。`/reset` 系列刻意不动 `admins`（删了就永久锁在门外），所以换人
+  目前要连带手工清掉该 Bot 库里的 `admins` 行，或整库重建——这是还没补上的口子。
+
+> 本节引用的 `/claim <secret>` 与 `/bot reload <appid>` 分别由认领改造（#64）与热增删改
+> （#68）提供。本版本（#69 所在的集成分支）启动日志里打的仍是 #64 之前的一次性认领令牌，
+> 用那条令牌 `/claim` 即可。
 
 ## 升级
 
@@ -841,6 +923,9 @@ go run github.com/knight000/go_qqbot/tools/apisurface@<pin>
 - **搁置**：分片上传。出站图片只支持 ≤ 5 MB 的 base64 直传，更大的图本地直接拒绝；大图请用 `ImageFromURL`，下载发生在平台侧；
 - **在插件仓做**：`plugins/torn` 业务插件与 Torn 限流/缓存分层。核心侧的前置能力（带请求头的 GET、只发一次、按请求放宽超时、按域名分桶、配置解码）已就绪，见 `docs/ARCHITECTURE.md §6` 与插件仓的设计文档；
 - **待做**：多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
+- **待做**：Bot 所有权转移与「重置 secret 后重新认领」。`/claim` 一次性、不转移，`/reset`
+  系列刻意不动 `admins`，所以换人目前只能手工清掉该 Bot 库里的 `admins` 行（见「多 Bot
+  部署」里那段顺序说明）。
 
 `/grant` / `/revoke` 已删除（不是搁置）：功能由 `/admin add|rm` 取代，指令与保留前缀一并清理。
 
