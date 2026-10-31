@@ -81,13 +81,17 @@ func (c *Core) isCoreOwner(ev *host.Event) bool {
 	return false
 }
 
+// coreOwnerLabel 是 Core 所有者的身份口径：它来自配置文件，不在 admins 表里，
+// 所以任何日志与请求都不能写成 admins 的 owner，否则事后审计会翻不到人。
+const coreOwnerLabel = "core_owner"
+
 // actorLabel 是日志与重启请求里的身份口径。
 //
 // Core 所有者的身份来自配置文件，与 admins 表无关；直接写 p.Role 会显示成
 // user（他可能确实不是这个 Bot 的管理员），让事后审计误判成越权。
 func actorLabel(p host.Principal, coreOwner bool) string {
 	if coreOwner {
-		return "core_owner"
+		return coreOwnerLabel
 	}
 	return string(p.Role)
 }

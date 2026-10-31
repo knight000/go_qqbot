@@ -170,9 +170,11 @@ func (c *Core) upgradeApply(ctx context.Context, ev *host.Event) {
 	// 先回消息，再入队：顺序反了这条回复必丢。
 	c.replyText(ctx, ev, b.String())
 
+	// 口径与 /reload 一致：/upgrade 的每条子命令都只认 Core 所有者（决策 9），
+	// 能走到这里的必然是 core_owner，不该再写成 admins 里的 owner。
 	req := RestartRequest{
 		By:     ev.SenderID,
-		Role:   string(ev.Actor.Role),
+		Role:   coreOwnerLabel,
 		Scene:  ev.Scene,
 		Reason: "upgrade " + plan.From + " -> " + plan.To,
 		At:     time.Now(),

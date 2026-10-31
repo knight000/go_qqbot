@@ -41,6 +41,8 @@ func pluginCore(t *testing.T, svc UpgradeService) (*Core, *fakeAPI, *hotPlugin) 
 	plain := &fakePlugin{m: host.Manifest{Name: "plain", Version: "0.1.0", APIVersion: host.APIVersion}}
 	c, f := newUpgradeCore(t, svc)
 	c.plugins = []host.Plugin{echo, plain}
+	// 插件热替换与核心升级同属进程级动作：只认 Core 所有者（ADR-0008 决策 9）。
+	seedCoreOwners(c, "o1")
 	return c, f, echo
 }
 
@@ -154,7 +156,9 @@ func TestUpgradePluginWithoutNameShowsUsage(t *testing.T) {
 func TestUpgradePluginDisabledSkipsService(t *testing.T) {
 	svc := &fakeUpgrade{}
 	c, f, _ := pluginCore(t, svc)
-	c.cfg = &config.Config{Upgrade: config.Upgrade{Enabled: boolPtr(false)}}
+	// 只改 Upgrade 字段：整块换掉 Config 会连 Core.Owners 一起清空，
+	// 于是这条用例会被权限挡在门外，测不到"自更新关闭"的分支。
+	c.cfg.Upgrade = config.Upgrade{Enabled: boolPtr(false)}
 	seedAdmin(t, c, "o1", "", store.RoleOwner)
 
 	c.handleReserved(context.Background(), adminEvent("/upgrade plugin all", "o1", "", host.SceneC2C, "o1"))

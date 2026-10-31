@@ -165,7 +165,9 @@ func TestUpgradeApplyRepliesBeforeHandingPlan(t *testing.T) {
 		if req.Plan == nil || req.Plan.To != "1.2.4" {
 			t.Fatalf("换盘计划没有交给 main: %+v", req)
 		}
-		if req.By != "o1" || req.Role != store.RoleOwner {
+		// 身份口径是 core_owner：这个人来自 [core].owners，未必是这个 Bot 的
+		// admins 之一，写 owner 会让人事后翻 admins 表找不到人。
+		if req.By != "o1" || req.Role != "core_owner" {
 			t.Errorf("重启请求的身份不对: %+v", req)
 		}
 		if !strings.Contains(req.Reason, "1.2.4") {
