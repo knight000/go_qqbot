@@ -96,7 +96,7 @@ type fakePlatform struct {
 	// attemptsByApp 按 appid 记"发消息"到达平台的总次数（含被 429 的那些）。
 	// 只有它才能区分"本地没出网"与"出网了被平台拒"，sends 记的是成功的那些。
 	attemptsByApp map[string]int
-	seq             map[string]int
+	seq           map[string]int
 }
 
 func newFakePlatform(t *testing.T) *fakePlatform {

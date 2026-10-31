@@ -89,9 +89,9 @@ type Container struct {
 	stagger  *Stagger
 	// jobs 是多 Bot 时的共享任务桶额度池；nil 表示每个 Core 自建一份容量 4
 	// 的池（单 Bot 与"只有一个启用的 Bot"时都是这个形态，行为与旧版一致）。
-	jobs *core.JobPool
-	ctx      context.Context
-	cancel   context.CancelFunc
+	jobs   *core.JobPool
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu sync.Mutex
 	// bots 按配置顺序记录每个"启用"的 Bot 的装配结果（失败的也在里面）。
