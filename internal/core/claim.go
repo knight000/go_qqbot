@@ -3,7 +3,9 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -113,16 +115,8 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 	c.claimMu.Lock()
 	defer c.claimMu.Unlock()
 
-	n, err := c.store.CountAdmins(ctx)
-	if err != nil {
-		c.log.Error("读取管理员失败", "err", err)
-		return
-	}
-	if n > 0 {
-		c.replyText(ctx, ev, "该 Bot 已被认领，认领入口已关闭（不支持转移）。")
-		return
-	}
-
+	// 先验格式与凭据，再看"是否已认领"：顺序反了的话，任何人对一个已认领的
+	// Bot 发一句 /claim 就会得到"已被认领"，这条回复本身成了状态预言机。
 	fields := strings.Fields(ev.Content)
 	if len(fields) < 2 {
 		c.replyText(ctx, ev, "用法：/claim <secret>（secret 在配置文件里，由 Bot 所有者持有）")
@@ -136,6 +130,31 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 		return
 	}
 
+	n, err := c.store.CountAdmins(ctx)
+	if err != nil {
+		c.log.Error("读取管理员失败", "err", err)
+		return
+	}
+
+	rotated := false
+	if n > 0 {
+		// 已认领：唯一能重开认领入口的情况是**配置里的 secret 在认领之后被换过**
+		// （ADR-0008 决策 4 的恢复路径）。判据是认领时记下的指纹，不看时间、
+		// 不看状态——平台重置后旧 secret 立刻失效，Bot 会掉进 failing，那时
+		// 靠状态判断已经晚了。
+		rotated, err = c.secretRotated(ctx)
+		if err != nil {
+			c.log.Error("读取认领指纹失败", "err", err)
+			c.replyText(ctx, ev, "认领失败，请查看日志。")
+			return
+		}
+		if !rotated {
+			c.replyText(ctx, ev, "该 Bot 已被认领，认领入口已关闭（不支持转移）。\n"+
+				"需要换人：在平台重置 secret → 改配置文件 → /bot reload <appid> → 重新 /claim。")
+			return
+		}
+	}
+
 	admin := store.Admin{
 		OpenID:      ev.SenderID,
 		UnionID:     ev.UnionID,
@@ -143,19 +162,77 @@ func (c *Core) handleClaim(ctx context.Context, ev *host.Event) {
 		GrantedBy:   "claim",
 		SourceScene: string(ev.Scene),
 	}
-	if err := c.store.UpsertAdmin(ctx, admin); err != nil {
+	if rotated {
+		// secret 换过 = 托管方或租户主动重置过所有权，旧管理员一律作废。
+		// 这是 /admin 永远不会做的事，所以只能由这条证明过的路径来删。
+		removed, err := c.store.ReplaceAdmins(ctx, admin)
+		if err != nil {
+			c.log.Error("重置管理员失败", "err", err)
+			c.replyText(ctx, ev, "认领失败，请查看日志。")
+			return
+		}
+		c.log.Warn("secret 已轮换，所有权已重置",
+			"bot", c.botID, "openid", ev.SenderID, "removed_admins", removed)
+	} else if err := c.store.UpsertAdmin(ctx, admin); err != nil {
 		c.log.Error("写入管理员失败", "err", err)
 		c.replyText(ctx, ev, "认领失败，请查看日志。")
 		return
 	}
 
+	if err := c.saveSecretFingerprint(ctx); err != nil {
+		// 指纹写不进去只影响"下一次能不能重置"，不该让这次认领失败：
+		// 此时管理员已经落库，回滚反而是更坏的结果。
+		c.log.Warn("认领指纹未落库，下次 secret 轮换将无法自动重置",
+			"bot", c.botID, "err", err)
+	}
+
 	// 认领是 pending_claim → active 的唯一迁移点：从这一刻起闸门才放行普通事件。
 	c.transition(ctx, BotStateActive, "认领成功")
-	c.log.Info("Bot 认领成功", "bot", c.botID, "openid", ev.SenderID, "scene", ev.Scene)
+	c.log.Info("Bot 认领成功", "bot", c.botID, "openid", ev.SenderID,
+		"scene", ev.Scene, "reset", rotated)
+	if rotated {
+		c.replyText(ctx, ev, "认领成功：secret 已轮换，原管理员已被替换，你是这个 Bot 唯一的所有者。\n"+
+			"用 /admin add <openid> [备注] 重新添加辅助管理员。")
+		return
+	}
 	c.replyText(ctx, ev, "认领成功，你已成为这个 Bot 的所有者。\n"+
 		"用 /admin add <openid> [备注] 添加辅助管理员，/admin list 查看，/admin whoami 查自己的身份。\n"+
 		"群准入默认开启：新群需用 /group allow <group_openid> 加入白名单，或由你在群内发 /group allow。\n"+
 		"所有权不可转移：需要换人时在平台重置 secret、改配置文件后重新认领。")
+}
+
+// saveSecretFingerprint 记下这次认领所用 secret 的指纹（不存明文）。
+func (c *Core) saveSecretFingerprint(ctx context.Context) error {
+	if c.secret == "" {
+		return nil
+	}
+	return c.store.PutState(ctx, StateKeyClaimSecretFP, secretFingerprint(c.secret))
+}
+
+// secretRotated 判断配置里的 secret 是否与认领时记录的不一样。
+//
+// 没有指纹记录（升级前就认领过的库）返回 false：宁可让运维手工处理，也不让
+// "缺指纹"变成一个可以绕过"已认领"的缺口。
+func (c *Core) secretRotated(ctx context.Context) (bool, error) {
+	if c.secret == "" {
+		return false, nil
+	}
+	recorded, ok, err := c.store.GetState(ctx, StateKeyClaimSecretFP)
+	if err != nil {
+		return false, err
+	}
+	if !ok || recorded == "" {
+		return false, nil
+	}
+	return recorded != secretFingerprint(c.secret), nil
+}
+
+// secretFingerprint 是 secret 的 sha256 十六进制。
+//
+// 只比指纹不存原文：bot_state 会被 R3/备份带出去，存明文等于把凭据另存一份。
+func secretFingerprint(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
 }
 
 // claimSecretMatches 与配置里的 secret 做常量时间比对。

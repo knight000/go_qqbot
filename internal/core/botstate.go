@@ -44,6 +44,15 @@ const StateKeyBotState = "bot_state"
 // 四态里的 suspended（ADR-0008 决策 8），不新造第五个状态。
 const StateKeyBotSuspendReason = "bot_suspend_reason"
 
+// StateKeyClaimSecretFP 是**认领时所用 secret 的指纹**（sha256 hex，不存明文）。
+//
+// 它只服务一件事：判断"配置里的 secret 是不是在认领之后被换过"。换过就意味着
+// 平台侧已经重置、旧值失效，ADR-0008 决策 4 的恢复路径（重置 → 改配置 →
+// 重新 /claim）必须放行，否则 admins 非空会把所有权永久锁死。没有这一行记录
+// （升级前就认领过的库）一律按"没换过"处理——宁可让运维手工处理，也不让
+// 缺指纹变成一个绕过"已认领"的缺口。
+const StateKeyClaimSecretFP = "claim_secret_fp"
+
 const (
 	// SuspendReasonConfigDisabled 是配置 enabled = false。
 	SuspendReasonConfigDisabled = "config_disabled"

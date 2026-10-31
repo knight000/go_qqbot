@@ -224,3 +224,53 @@ func TestRawDumpRedactsSecret(t *testing.T) {
 		t.Errorf("打码不该破坏载荷结构：\n%s", got)
 	}
 }
+
+// secret 轮换是 ADR-0008 决策 4 写的唯一恢复路径：平台重置 → 改配置 →
+// 重新 /claim。没有它，admins 非空就把所有权永久锁死，只能手工改库。
+func TestClaimAfterSecretRotationReplacesOwner(t *testing.T) {
+	c, f := newStateCore(t)
+	ctx := context.Background()
+
+	c.Handle(ctx, adminEvent("/claim "+testBotSecret, "u1", "", host.SceneC2C, "u1"))
+	if !strings.Contains(lastReply(t, f), "认领成功") {
+		t.Fatalf("首次认领失败: %q", lastReply(t, f))
+	}
+
+	// 运维在平台重置 secret 并改了配置文件——对 Core 就是换掉 c.secret。
+	const rotated = "rotated-secret-value"
+	c.secret = rotated
+
+	// 旧值：平台侧已失效，核心也必须拒绝，且不能透露"这 Bot 已认领"之外的东西。
+	c.Handle(ctx, adminEvent("/claim "+testBotSecret, "u2", "", host.SceneC2C, "u2"))
+	if got := lastReply(t, f); got != claimBadSecret {
+		t.Fatalf("旧 secret 必须失效，实际: %q", got)
+	}
+
+	// 新值：放行，且旧 owner 被替换——只能剩一个所有者。
+	c.Handle(ctx, adminEvent("/claim "+rotated, "u2", "", host.SceneC2C, "u2"))
+	if got := lastReply(t, f); !strings.Contains(got, "secret 已轮换") {
+		t.Fatalf("轮换后的认领应成功并说明重置，实际: %q", got)
+	}
+	admins, err := c.store.ListAdmins(ctx)
+	if err != nil {
+		t.Fatalf("读管理员: %v", err)
+	}
+	if len(admins) != 1 || admins[0].OpenID != "u2" || admins[0].Role != store.RoleOwner {
+		t.Fatalf("应只剩新所有者，实际 %+v", admins)
+	}
+}
+
+// 没有指纹记录的旧库：宁可让运维手工处理，也不让"缺指纹"变成绕过"已认领"的缺口。
+func TestClaimWithoutFingerprintStaysClosed(t *testing.T) {
+	c, f := newStateCore(t)
+	ctx := context.Background()
+	seedAdmin(t, c, "u1", "", store.RoleOwner) // 升级前认领过的库：有 owner、没指纹
+
+	c.Handle(ctx, adminEvent("/claim "+testBotSecret, "u2", "", host.SceneC2C, "u2"))
+	if got := lastReply(t, f); !strings.Contains(got, "已被认领") {
+		t.Fatalf("无指纹时应保持关闭，实际: %q", got)
+	}
+	if n := adminCount(t, c); n != 1 {
+		t.Fatalf("不该改动管理员，实际 %d 条", n)
+	}
+}
