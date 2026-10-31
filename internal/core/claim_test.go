@@ -166,11 +166,15 @@ func TestProcessCommandsRequireCoreOwner(t *testing.T) {
 		t.Fatalf("Bot 所有者不该能用 /bot，实际: %q", got)
 	}
 
-	// Core 所有者（不是这个 Bot 的 admin）发 /bot → 通过，走到 T8 占位回复。
-	c.handleReserved(ctx, adminEvent("/bot status", "core-1", "", host.SceneC2C, "core-1"))
+	// Core 所有者（不是这个 Bot 的 admin）发 /bot → 通过：这个夹具没注入热
+	// 操作入口，所以得到的是"未装配"的明确答复，而不是权限拒绝。
+	c.handleReserved(ctx, adminEvent("/bot list", "core-1", "", host.SceneC2C, "core-1"))
 	got := lastReply(t, f)
-	if strings.Contains(got, "仅 Core 所有者") || !strings.Contains(got, "T8") {
-		t.Fatalf("Core 所有者应能使用 /bot（占位回复），实际: %q", got)
+	if strings.Contains(got, "Core 所有者") {
+		t.Fatalf("Core 所有者应能使用 /bot，实际被拒: %q", got)
+	}
+	if !strings.Contains(got, "未装配") {
+		t.Errorf("没有热操作入口时应明说未装配，实际: %q", got)
 	}
 
 	// 租户（Bot 管理员）发 /reload → 拒；Core 所有者 → 入队。

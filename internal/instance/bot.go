@@ -29,6 +29,11 @@ type botRuntime struct {
 	cfg config.Bot
 	log *slog.Logger
 
+	// ctx 是**这个 Bot 自己的**生命周期：热删/重连只取消它，不碰别人的连接
+	// （#68）。进程关停时它随容器的 ctx 一起取消，所以关停路径不受影响。
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	db *store.DB
 	// plugins 是共享句柄的一份引用（不拥有生命周期），只用于注册/注销与日志。
 	plugins []host.Plugin
@@ -53,6 +58,10 @@ type botRuntime struct {
 	// gwDone 在网关读循环退出时关闭。它退出前已经把 session_id / seq 落盘，
 	// 所以 waitGateway 等它就是在等"状态落盘完成"。
 	gwDone chan struct{}
+
+	// gwLive 表示这个网关是否还算在容器 live 计数里。由容器在 mu 下读写：
+	// 正常退出与热删各可能结算一次，它保证只减一次。
+	gwLive bool
 
 	// err 非 nil 表示这个 Bot 没起来（锁被占、开库失败、插件装配失败…）。
 	// 容器据此把它记进状态并在日志里指名，但不影响其他 Bot。
@@ -104,9 +113,15 @@ type gatewayRunner interface {
 // 一个 Bot 的凭据写错、数据目录没权限、appID 被另一个 Core 占着，都不该让
 // 同一台机器上其他租户跟着下线。
 func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
+	// 每个 Bot 一条自己的 ctx：热删/重连取消的是它，别的 Bot 的网关、
+	// 调度与 GC 都不受影响（#68）。它派生于容器 ctx，所以进程关停照样能
+	// 停掉所有连接。
+	botCtx, cancel := context.WithCancel(ctx)
 	rt := &botRuntime{
 		cfg:      b,
 		log:      c.log.With("bot", b.AppID),
+		ctx:      botCtx,
+		cancel:   cancel,
 		stagger:  c.stagger,
 		gateDone: make(chan struct{}),
 		gwDone:   make(chan struct{}),
@@ -121,11 +136,14 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		if rt.err != nil {
 			// 用脱离取消的短期限：关停信号可能正好落在装配中途，而"放掉
 			// 已经占下的锁与库"不能因为 ctx 已取消就跳过。
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), assemblyCleanupTimeout)
-			defer cancel()
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), assemblyCleanupTimeout)
+			defer cleanupCancel()
 			if err := rt.close(cleanupCtx); err != nil {
 				rt.log.Warn("清理未完成的装配失败", "err", err)
 			}
+			// 收尾之后才取消自己的 ctx：GC 与调度是靠它退出的，先取消会
+			// 让 rt.close 里的"等 GC 退出"变成等一个已经不会写库的空等。
+			cancel()
 		}
 	}()
 	dbPath := c.cfg.BotStorePath(b)
@@ -149,13 +167,13 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		return rt
 	}
 	rt.db = db
-	if err := db.Migrate(ctx); err != nil {
+	if err := db.Migrate(botCtx); err != nil {
 		rt.err = err
 		return rt
 	}
 	// 启动时把库里的状态与配置对齐。走到这里的 Bot 一定是启用状态（停用的
 	// 在 Container.Start 就跳过了），所以这一步只负责把上次的 suspended 解除。
-	if _, err := core.ReconcileBotState(ctx, db, true); err != nil {
+	if _, err := core.ReconcileBotState(botCtx, db, true); err != nil {
 		rt.err = err
 		return rt
 	}
@@ -217,6 +235,9 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 		// 非 nil 时所有 Bot 共享它，并因此各自同时只跑 1 个桶。
 		Jobs:  c.jobs,
 		Quota: &quota,
+		// /bot 系列的热操作入口就是容器本身：核心只认接口，不认装配层
+		// （core 不能 import instance，否则两者互为依赖）。
+		Hot: c,
 	})
 	if err != nil {
 		rt.err = err
@@ -224,7 +245,8 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 	}
 	rt.coreImpl = coreImpl
 
-	if err := coreImpl.Start(ctx); err != nil {
+	// 核心生命周期跟着这个 Bot 自己的 ctx：热删时取消它，GC 与调度一起退。
+	if err := coreImpl.Start(botCtx); err != nil {
 		rt.err = err
 		return rt
 	}
@@ -254,8 +276,8 @@ func (c *Container) startBot(ctx context.Context, b config.Bot) *botRuntime {
 	rt.gw = gw
 	rt.conn = gw
 
-	c.noteGatewayStart()
-	go rt.runGateway(ctx, c)
+	c.noteGatewayStart(rt)
+	go rt.runGateway(botCtx, c)
 	return rt
 }
 
@@ -274,14 +296,14 @@ func (b *botRuntime) runGateway(ctx context.Context, c *Container) {
 	for {
 		err := b.conn.Run(ctx)
 		if ctx.Err() != nil {
-			c.noteGatewayExit(nil)
+			c.noteGatewayExit(b, nil)
 			return
 		}
 		if err != nil {
 			b.log.Error("网关永久性错误，该 Bot 已停止重连，其他 Bot 不受影响", "err", err)
 		}
 		if !b.failing(ctx) {
-			c.noteGatewayExit(err)
+			c.noteGatewayExit(b, err)
 			return
 		}
 		wait := b.backoffFor(failures)
@@ -289,7 +311,7 @@ func (b *botRuntime) runGateway(ctx context.Context, c *Container) {
 		b.log.Warn("Bot 处于 failing，退避后重连",
 			"backoff", wait.String(), "attempt", failures)
 		if !sleepCtx(ctx, wait) {
-			c.noteGatewayExit(nil)
+			c.noteGatewayExit(b, nil)
 			return
 		}
 	}

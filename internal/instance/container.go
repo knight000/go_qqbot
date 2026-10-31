@@ -76,12 +76,18 @@ type Options struct {
 	// ReconnectBackoff 覆盖 failing 态的重连退避序列，末项即上限。nil 用默认的
 	// 1/2/4/8/16 分钟；测试注入毫秒级，否则一个用例要跑十几分钟。
 	ReconnectBackoff []time.Duration
+	// ConfigPath 是配置文件路径：/bot reload 靠它**重读磁盘**（#68）。
+	//
+	// 它必须由调用方给：容器不认识 -c 参数，也不该把"配置文件在哪"这件事
+	// 藏在两个地方。空串表示热重载不可用（/bot reload 会如实报错），
+	// 单测与精简构建走这条路。
+	ConfigPath string
 }
 
 // Container 是进程级容器：持有共享资源，按配置顺序逐个装配 Bot。
 //
-// 它不重启、不重读配置：/reload 仍是整个进程 exec（ADR-0008 决策 15），
-// 单 Bot 热增删改是 #68。
+// 它不重启进程：/reload 仍是整个进程 exec（ADR-0008 决策 15）。单 Bot 的
+// 热增删改走 hot.go 里的五个入口（#68），全局配置仍然只能整机重启。
 type Container struct {
 	cfg *config.Config
 	log *slog.Logger
@@ -95,12 +101,25 @@ type Container struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// hotMu 串行化**结构性**热操作（reload / reload <appid> / purge）与启动、
+	// 关停。它比 mu 粗：一次 reload 要连开关几次连接，中间任何一刻读到半套
+	// 状态都会给出错误的差集。
+	//
+	// 锁序：hotMu → mu。持有 mu 时绝不回头拿 hotMu。
+	hotMu sync.Mutex
+
 	mu sync.Mutex
 	// plugins 是**进程级共享**的插件句柄：启动时加载一次，所有 Bot 共用。
 	// 它们的生命周期不归任何单个 Bot——由 Shutdown 在最后统一关。
 	plugins []host.Plugin
 	// bots 按配置顺序记录每个"启用"的 Bot 的装配结果（失败的也在里面）。
 	bots []*botRuntime
+	// retired 记住"曾经在配置里、现在没了"的条目。
+	//
+	// 为什么需要它：库路径由 appid 推导，但 data_dir 可以被这一条配置覆盖。
+	// 条目删掉之后再想 purge，就得知道它当初用的是哪个目录——否则只会照着
+	// 默认路径找，找不到就报"从没运行过"，而数据其实躺在别处。
+	retired map[string]config.Bot
 	// live 是还没退出的网关数；starting 表示启动循环还没走完。
 	//
 	// 两者只服务一件事：**全部**网关都因永久性错误退出时让进程退出，交给人看
@@ -175,6 +194,12 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 		"bots", len(cfg.Bots), "enabled", enabled,
 		"stagger", c.stagger.Interval().String())
 
+	// 启动全程占住 hotMu：runGateway 在启动循环中途就已经开始投递事件了，
+	// 一条 /bot reload 此刻撞进来会看到"装了一半"的 bots——差集会算错，
+	// 而错的那一半是别人的连接。
+	c.hotMu.Lock()
+	defer c.hotMu.Unlock()
+
 	// 插件只加载一次：一套进程服务所有 Bot（ADR-0008 决策 11）。加载失败是
 	// 整机级失败——没有插件时"启动了但什么都不响应"比报错难查得多。
 	shared, err := c.loadPlugins(runCtx, log)
@@ -200,7 +225,7 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 			log.Info("Bot 已停用，不连接", "appid", b.AppID)
 			// 停用也要落一行状态：库里留着的 failing/active 会让第二天排障的人
 			// 误判成"它自己挂的"，而实际上是人工关的。
-			c.markSuspended(runCtx, b)
+			c.markSuspended(runCtx, b, core.SuspendReasonConfigDisabled)
 			continue
 		}
 		// 关停期间不产生新的 Bot 启动：信号可能正好落在两个 Bot 之间。
@@ -209,7 +234,7 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 			break
 		}
 		rt := c.startBot(runCtx, b)
-		c.bots = append(c.bots, rt)
+		c.addRuntime(rt)
 		if rt.err != nil {
 			log.Error("Bot 未启动，其余 Bot 继续",
 				"appid", b.AppID,
@@ -219,7 +244,7 @@ func Start(ctx context.Context, o Options) (*Container, error) {
 		}
 		started++
 		logBotStarted(rt)
-		go c.pumpRestarts(rt.coreImpl, b.AppID)
+		go c.pumpRestarts(rt.ctx, rt.coreImpl, b.AppID)
 		// 等这个 Bot 的第一次取网关地址落定再装下一个：错峰的意义就是
 		// 让 N 条连接一条一条来（GET /gateway 限 2 QPM）。闸门本身保证
 		// 串行与间隔，这里只是把代价算进启动时长并让日志顺序可读。
@@ -318,14 +343,21 @@ func (c *Container) Stop() { c.cancel() }
 // 两段都并行：各 Bot 彼此独立（各自的库），串行只会让最后一个 Bot 分到的
 // 期限变少。ctx 是整体预算，超时或未按时落盘的 Bot 会被记下来，调用方据此
 // 以非 0 退出（与单 Bot 时代一致）。
+//
+// 全程占住 hotMu：一个正在启停 Bot 的 /bot reload 与关停并发，会得到
+// "被关掉的容器里又起来一个新 Bot"这种没人能复现的状态。
 func (c *Container) Shutdown(ctx context.Context) error {
 	c.Stop()
 
-	errs := c.waitGateways(ctx)
+	c.hotMu.Lock()
+	defer c.hotMu.Unlock()
+
+	bots := c.runtimes()
+	errs := c.waitGateways(ctx, bots)
 
 	var wg sync.WaitGroup
-	results := make([]error, len(c.bots))
-	for i, b := range c.bots {
+	results := make([]error, len(bots))
+	for i, b := range bots {
 		wg.Add(1)
 		go func(i int, rt *botRuntime) {
 			defer wg.Done()
@@ -341,7 +373,10 @@ func (c *Container) Shutdown(ctx context.Context) error {
 
 	// 所有 Core 都收完了才轮到插件：它们到此为止不会再收到任何调用。
 	core.ClosePlugins(ctx, c.log, c.plugins)
+	c.mu.Lock()
 	c.plugins = nil
+	c.bots = nil
+	c.mu.Unlock()
 	return errors.Join(errs...)
 }
 
@@ -350,13 +385,13 @@ func (c *Container) Shutdown(ctx context.Context) error {
 // 必须并行：串行 N×gatewayStopTimeout 会吃光调用方那 10s 的关停预算，
 // 三个 Bot 卡住就让后面几个变成假告警——而它们其实是同时收到取消的，
 // 串行等待多等不到任何东西。ctx 是整体预算，用尽后剩下的不再等。
-func (c *Container) waitGateways(ctx context.Context) []error {
+func (c *Container) waitGateways(ctx context.Context, bots []*botRuntime) []error {
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
 		errs []error
 	)
-	for _, b := range c.bots {
+	for _, b := range bots {
 		if b.gw == nil {
 			continue
 		}
@@ -399,12 +434,55 @@ func (c *Container) Statuses() []Status {
 	return out
 }
 
-// markSuspended 把配置里停用的 Bot 标成 suspended。
+// runtimes 返回当前 bots 的一份快照（调用方拿到的是切片副本）。
+func (c *Container) runtimes() []*botRuntime {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*botRuntime, len(c.bots))
+	copy(out, c.bots)
+	return out
+}
+
+// addRuntime 把一个刚装配好的 Bot 记进名单（按配置顺序追加）。
+func (c *Container) addRuntime(rt *botRuntime) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bots = append(c.bots, rt)
+}
+
+// dropRuntime 把某个 Bot 从名单里摘掉，并结算它的网关计数。
+//
+// 计数必须在这里结算：runGateway 在 ctx 取消时走的是 noteGatewayExit(nil)，
+// 那条分支刻意不递减（关停路径不该参与"全灭"判定）。热删一个 Bot 之后如果
+// 不减，live 就永远停在旧值，"所有连接都没了"再也不会被发现。
+func (c *Container) dropRuntime(rt *botRuntime) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, b := range c.bots {
+		if b == rt {
+			c.bots = append(c.bots[:i], c.bots[i+1:]...)
+			break
+		}
+	}
+	if rt.gwLive {
+		rt.gwLive = false
+		c.live--
+	}
+}
+
+// config 返回当前生效的配置（热重载会换掉它，所以必须走锁）。
+func (c *Container) config() *config.Config {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cfg
+}
+
+// markSuspended 把配置里停用的 Bot 标成 suspended，并记下原因。
 //
 // 只开库写一行就关：不取锁、不装插件、不起核心。状态必须落库——这是"这个
 // Bot 为什么没连"的唯一持久答案，重启之后仍然成立，而日志会被轮转掉。
-func (c *Container) markSuspended(ctx context.Context, b config.Bot) {
-	db, err := store.Open(c.cfg.BotStorePath(b))
+func (c *Container) markSuspended(ctx context.Context, b config.Bot, reason string) {
+	db, err := store.Open(c.config().BotStorePath(b))
 	if err != nil {
 		c.log.Error("停用 Bot 的状态未落库（打开库失败）", "appid", b.AppID, "err", err)
 		return
@@ -419,24 +497,37 @@ func (c *Container) markSuspended(ctx context.Context, b config.Bot) {
 		c.log.Error("停用 Bot 的状态未落库", "appid", b.AppID, "err", err)
 		return
 	}
-	c.log.Info("Bot 状态标记为 suspended", "appid", b.AppID, "state", string(st))
+	if reason != "" {
+		if err := core.SaveSuspendReason(ctx, db, reason); err != nil {
+			c.log.Warn("停用原因未落库", "appid", b.AppID, "reason", reason, "err", err)
+		}
+	}
+	c.log.Info("Bot 状态标记为 suspended", "appid", b.AppID, "state", string(st), "reason", reason)
 }
 
 // noteGatewayStart 记一条活着的网关。启动循环用它判断"启动期就全退了"。
-func (c *Container) noteGatewayStart() {
+//
+// 计数落在 botRuntime 上也有一份（gwLive）：热删一个 Bot 要能结算它，而
+// "这个 Bot 的网关此刻算不算在 live 里"只有一处记账才不会重复递减。
+func (c *Container) noteGatewayStart(rt *botRuntime) {
 	c.mu.Lock()
 	c.live++
+	rt.gwLive = true
 	c.mu.Unlock()
 }
 
 // noteGatewayExit 维护"还有几个 Bot 的网关活着"。runGateway 在退出后调用。
-func (c *Container) noteGatewayExit(err error) {
+func (c *Container) noteGatewayExit(rt *botRuntime, err error) {
 	if err == nil {
-		// 只有 ctx 取消才会返回 nil：关停路径，不参与"全部失联"的判定。
+		// 只有 ctx 取消才会返回 nil：关停/热删路径，不参与"全部失联"的判定，
+		// 计数由 dropRuntime 结算（它对 gwLive 做幂等处理）。
 		return
 	}
 	c.mu.Lock()
-	c.live--
+	if rt.gwLive {
+		rt.gwLive = false
+		c.live--
+	}
 	live, starting := c.live, c.starting
 	c.mu.Unlock()
 	// 启动期不作判定：这时 live 还没数完，早退一个不等于全灭。
@@ -451,10 +542,13 @@ func (c *Container) noteGatewayExit(err error) {
 
 // pumpRestarts 把某个 Bot 的重启请求转发到容器级通道，并补上 Bot 标识：
 // 日志里"谁要重启"是多 Bot 之后第一个要回答的问题。
-func (c *Container) pumpRestarts(cc *core.Core, appid string) {
+//
+// ctx 是这个 Bot 自己的：热删/重连之后旧协程必须退出，否则每重连一次就多
+// 一个永远在等 restart 通道的协程。
+func (c *Container) pumpRestarts(ctx context.Context, cc *core.Core, appid string) {
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		case req := <-cc.RestartRequests():
 			select {

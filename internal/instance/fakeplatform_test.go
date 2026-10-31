@@ -88,6 +88,8 @@ type fakePlatform struct {
 	conns  map[string]*wsConn
 	ready  map[string]chan struct{}
 	closed map[string]bool
+	// readyClosed 保证 ready 只关一次：热重连会让同一个 appid 建第二条连接。
+	readyClosed map[string]bool
 	// gatewayCalls 按请求结束的顺序记录，够断言间隔与串行。
 	gatewayCalls   []gatewayCall
 	gatewayBusy    int
@@ -103,13 +105,14 @@ func newFakePlatform(t *testing.T) *fakePlatform {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &fakePlatform{
-		t:      t,
-		ctx:    ctx,
-		cancel: cancel,
-		conns:  map[string]*wsConn{},
-		ready:  map[string]chan struct{}{},
-		closed: map[string]bool{},
-		seq:    map[string]int{},
+		t:           t,
+		ctx:         ctx,
+		cancel:      cancel,
+		conns:       map[string]*wsConn{},
+		ready:       map[string]chan struct{}{},
+		closed:      map[string]bool{},
+		readyClosed: map[string]bool{},
+		seq:         map[string]int{},
 	}
 	p.srv = httptest.NewTLSServer(http.HandlerFunc(p.handle))
 	t.Cleanup(func() {
@@ -315,7 +318,14 @@ func (p *fakePlatform) serveWS(w http.ResponseWriter, r *http.Request) {
 	if err := ws.write(readyFrame); err != nil {
 		return
 	}
-	close(ready)
+	// 同一个 appid 可能被重连多次（热重连用例），ready 只能关一次：
+	// 第二次连接再去关就会 panic: close of closed channel。
+	p.mu.Lock()
+	if !p.readyClosed[appID] {
+		p.readyClosed[appID] = true
+		close(ready)
+	}
+	p.mu.Unlock()
 	// 读循环只为把连接保持到测试结束；客户端的心跳与关闭都会让它退出。
 	for {
 		if _, _, err := conn.Read(p.ctx); err != nil {

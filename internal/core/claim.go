@@ -94,8 +94,8 @@ func (c *Core) handleReserved(ctx context.Context, ev *host.Event) bool {
 		c.handleUpgrade(ctx, ev)
 		return true
 	case "/bot":
-		// /bot 系列是进程级命令，只认 Core 所有者（ADR-0008 决策 9）。
-		// 命令体在 T8 实现；先占住前缀，避免插件声明 /bot 时被静默遮蔽。
+		// 进程级的 Bot 管理（ADR-0008 决策 9/15）：只认 Core 所有者，
+		// 与 /reset（管一个 Bot 的数据）是两条不相交的线。
 		c.trace.CoreCommand(cmd)
 		c.handleBot(ctx, ev)
 		return true
