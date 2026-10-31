@@ -454,10 +454,13 @@ type startupInfo struct {
 //
 // 数据目录与库路径必须可见：它们由 appid 推导（<datadir>/bots/<appid>/qqbot.db），
 // 备份、迁移、清理都靠这几行确认东西落在哪。永不打印 secret，连长度也不打。
+//
+// 键名用 bot（与 internal/instance 每行那个 `bot=` 同一个键）：多 Bot 之后
+// "这行属于谁"要能一条 grep 全捞出来，而 appid 是配置键名，不是日志键名。
 func logBots(log *slog.Logger, cfg *config.Config) {
 	for _, b := range cfg.Bots {
 		log.Info("Bot 配置",
-			"appid", b.AppID,
+			"bot", b.AppID,
 			"data_dir", cfg.BotDataDir(b),
 			"db", cfg.BotStorePath(b),
 			"cert_type", b.CertType,
