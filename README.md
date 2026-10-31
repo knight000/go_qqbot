@@ -29,7 +29,7 @@ QQ 官方机器人（群 + 消息列表单聊）的 Go 单二进制骨架，按�
 
 插件是**独立进程**（ADR-0005）：核心启动时扫描 `<datadir>/plugins/bin/`，对每个文件跑 `--manifest` 探测，再 spawn 成子进程走 stdio RPC。加插件不用重编译核心，删文件就是卸载。
 
-认证信息按约定写在**本地 config**（默认 `config/config.local.toml`，已 gitignore），不再依赖 `EnvironmentFile`；仍支持 `QQ_APP_ID` / `QQ_APP_SECRET` 覆盖。
+认证信息按约定写在**本地 config**（默认 `config/config.local.toml`，已 gitignore），不再依赖 `EnvironmentFile`；仍支持 `QQ_APP_ID` / `QQ_APP_SECRET` 覆盖（只有单 Bot 的配置能表达，多 Bot 时只覆盖第一个并在启动日志告警）。
 
 ## 首次安装
 
@@ -44,7 +44,7 @@ go run ./tools/build all
 # 2. 生成配置 + 释放四个出厂插件（默认写 config/config.local.toml，已被 gitignore）
 ./bot.exe init
 
-# 3. 填 [app].id / [app].secret（QQ 开放平台 → 机器人 → 开发设置）
+# 3. 填 [[bots]] 里的 appid 与 secret（QQ 开放平台 → 机器人 → 开发设置）
 $EDITOR config/config.local.toml
 
 # 4. 启动（不带 -c 时读同一个默认路径）
@@ -64,19 +64,35 @@ $EDITOR config/config.local.toml
 启动日志里能确认插件真的装上了（这几行都在连网关之前，网关连不上照样打）：
 
 ```text
-[INFO] 发现插件 component=pluginproc plugin=echo version=0.1.0 api_version=12 commands=2 optional=0
-[INFO] 核心已启动 plugins=4 sandbox=true
-[INFO] qqbot 启动完成 config=config/config.local.toml ... version="dev 4a19ec1e" platform=windows/amd64 plugins=4 plugin_names=adminping,bootnotice,echo,md
+[INFO] 发现插件 component=pluginproc plugin=echo version=0.1.0 api_version=14 commands=2 optional=0
+[INFO] 进程级插件已装配 plugins=4 plugin_names=adminping,bootnotice,echo,md
+[INFO] 核心已启动 bot=102xxxxx plugins=4 sandbox=true
+[INFO] Bot 已启动 bot=102xxxxx db=...\bots\102xxxxx\qqbot.db lock=... app_lock=... plugins=4
+[INFO] 共 2 个 Bot：2 个 active、0 个 pending_claim、0 个 failing、0 个 suspended
+[INFO] Bot 启动完成 bots=2 enabled=2 started=2 failed=0 plugins_total=4 elapsed=30.4s
+[INFO] qqbot 启动完成 config=config/config.local.toml ... version="dev 4a19ec1e" platform=windows/amd64 bots=2 started=2
 ```
 
-`plugin_names` 是"哪些插件真的装上了"的唯一权威来源：`bootnotice` 不再报插件清单（插件进程看不到别的插件，契约里也没有这个访问器），启动日志这一行才是事实。
+几处读法：
+
+- **每一行都用 `bot=<appid>` 回答"这行属于谁"**。`appid=` 只出现在配置校验的文案里
+  （那里指的就是 `[[bots]].appid` 这个键）。多 Bot 排队排障时按 `bot=` 一条 grep 即可。
+- `plugin_names` 是"哪些插件真的装上了"的唯一权威来源。插件是**一套进程服务所有 Bot**
+  （ADR-0008 决策 11），所以这行只打一次；`Bot 已启动` 上的 `plugins=` 是该 Bot 的
+  Host 注册数。
+- **状态摘要那一行只打一次**，数值来自各 Bot 库里的 `bot_state`；库里没有行时按
+  `admins` 是否为空推导（与闸门同一口径）。`not_started` 是"配置里有、实际没起来"的数
+  ——锁被占、开库失败这类，它们同时被计入 `failing`。
+- `elapsed` 是启动错峰的代价：`GET /gateway/bot` 限 2 QPM，N 个 Bot 默认串行 + 30s
+  间隔（`[bot].gateway_stagger`）。`plugins_total` 是**插件进程数**，等于插件数，不随
+  Bot 数增长。
 
 `init` 的两个开关：
 
 | 参数 | 用途 |
 |---|---|
 | `--plugins` | 只释放**缺失**的出厂插件，不碰配置。删掉一个插件后补回来就靠它（已存在的文件不覆盖） |
-| `--force` | 覆盖已存在的配置。会丢掉你填过的 `[app].id` / `[app].secret`，只在重来一遍时用 |
+| `--force` | 覆盖已存在的配置。会丢掉你填过的 `[[bots]]` 里的 appid 与 secret，只在重来一遍时用 |
 
 不带 `--force` 时 `init` 拒绝覆盖：`init: 配置文件 ... 已存在，不覆盖（要覆盖请加 --force；只补插件请用 --plugins）`。
 
@@ -110,7 +126,7 @@ sudo systemctl enable --now qqbot
 | `/etc/qqbot/config.toml` | `init` | 0600，属主 qqbot（含 AppSecret） |
 | `/var/lib/qqbot` | 第 1 步 `install -d` | 0750，属主 qqbot |
 | `/var/lib/qqbot/bin/qqbot` | 第 1 步 `install` | 0755（`/upgrade` 会在同目录换盘） |
-| `/var/lib/qqbot/qqbot.db` | 首次启动 `store.Open` | 属主 qqbot |
+| `/var/lib/qqbot/bots/<appid>/qqbot.db` | 首次启动 `store.Open`（每个 Bot 一份） | 属主 qqbot |
 | `/var/lib/qqbot/plugins/bin/*` | `init` | 0755（要能 exec） |
 | `/var/lib/qqbot/upgrade/` | 首次 `/upgrade apply` 或启动时回滚判定 | 属主 qqbot |
 | `/run/qqbot` | systemd `RuntimeDirectory` | 0700 |
@@ -123,6 +139,78 @@ WARN 未检测到管理员，已生成一次性认领令牌 ttl=10m0s token=<64�
 
 在目标群或单聊发送 `/claim <token>` 即成为 owner（一次性、10 分钟过期）。
 之后可用 `/admin add <openid> [备注]` 添加辅助管理员，用 `/ping` 查看运行状态，用 `!ping`、`!echo <文本>` 验证收发链路。
+
+## 多 Bot 部署（一个进程托管 N 个 Bot）
+
+一个进程可以同时跑多个平台 Bot：每个 Bot 各取一把单实例锁、各开一份 SQLite、各连一条
+网关，彼此不共享任何可变状态（ADR-0008）。加一个 Bot 就是加一段 `[[bots]]`，不必为每个号
+再维护一份配置与 systemd unit。平台规则上这也是官方支持的形态（"单机多账号"）。
+
+### 配置分两层
+
+```toml
+[core]
+# 进程级命令（/reload /restart /upgrade /reset all /bot 系列）的唯一授权来源。
+# 填 openid 列表；留空表示这些命令谁都执行不了——这也是"租户重启不了整台机器"的原因。
+owners = ["<你的 openid>"]
+
+[[bots]]
+appid = "102xxxxx"          # 平台侧 appid，同时是数据目录名与锁的维度
+secret = "..."              # AppSecret，明文在文件里，配置文件必须 600
+enabled = true              # false = 不连接，库里的状态落成 suspended
+cert_type = "personal"      # unverified | personal | enterprise
+quota_profile = "default"   # 指向 [quota.<档名>]
+
+[[bots]]
+appid = "102yyyyy"
+secret = "..."
+cert_type = "enterprise"
+quota_profile = "tight"
+```
+
+分工是硬边界：
+
+- **全局管基础设施**：`[core]` `[store]` `[http]` `[log]` `[plugins]` `[quota]` `[upgrade]`
+  这些顶层段是进程级的，同一台机器上的所有 Bot 共用一份。改它们要重启进程（`/reload`）。
+- **每 Bot 只覆盖业务面**：启用哪些插件、人设/前缀、开关默认值——这些存在**该 Bot 自己
+  的库**里，租户自己能改，也碰不到基础设施。
+- 数据落在 `<datadir>/bots/<appid>/qqbot.db`（一 Bot 一库），可用 `[[bots]].data_dir` 把
+  某一户挪到别的盘。库之间没有 `bot_id` 列，隔离靠物理边界。
+
+### 认领：第一个知道 secret 的人成为所有者
+
+1. 配置文件里写 `appid` 与 `secret`（人工开户，没有在线自助注册——secret 本来就是平台
+   线下交付给你的东西）。
+2. 起 Bot。新 Bot 的状态是 `pending_claim`：**除 `/claim` 之外什么都收不到**，被丢弃的
+   消息连库都不进（闸门排在去重之前）。
+3. 用该 Bot **私聊** `/claim <secret>`。常量时间比对成功即绑定为这个 Bot 的所有者，状态
+   转 `active`，从这一刻起才收发普通消息。一次性、不转移；群里发 `/claim` 一律拒绝。
+
+**托管方能解密任何租户的 secret。** 这句话必须写在明面上：secret 防的是第三方冒认
+（别人没有你的 secret 就抢不走这个 Bot），**不防托管方**——配置文件就在托管方手里，
+技术上它能认领任何租户的 Bot。这是 BYOB（bring your own bot）形态的固有代价，别把它
+当成零信任。
+
+### secret 泄露或轮换：顺序不能反
+
+```
+平台重置 secret → 改配置文件 → /bot reload <appid> → （重新）认领
+```
+
+反着做的后果是具体的：
+
+- **先改配置、后重置平台**：reload 之后新值在平台上还不存在，取 token 直接吃
+  `100016`；连续 3 次鉴权类失败会把该 Bot 推进 `failing`，然后按 1/2/4/8/16 分钟退避
+  重连——每一轮撞的都是同一堵墙。
+- **平台重置后不动配置**：旧值在平台上**立即**失效，症状同上（Bot 进 `failing`）。这段
+  时间它不发不收，但库里的群名单、管理员、会话都还在，改完配置 reload 即恢复 `active`。
+- **所有权换人不能只靠重置 secret**：`/claim` 一次性、不转移，库里已有所有者时再发只会
+  回"该 Bot 已被认领"。`/reset` 系列刻意不动 `admins`（删了就永久锁在门外），所以换人
+  目前要连带手工清掉该 Bot 库里的 `admins` 行，或整库重建——这是还没补上的口子。
+
+> 本节引用的 `/claim <secret>` 与 `/bot reload <appid>` 分别由认领改造（#64）与热增删改
+> （#68）提供。本版本（#69 所在的集成分支）启动日志里打的仍是 #64 之前的一次性认领令牌，
+> 用那条令牌 `/claim` 即可。
 
 ## 升级
 
@@ -219,12 +307,16 @@ sudo systemctl start qqbot
 
 ```bash
 sudo systemctl stop qqbot
-sudo cp /var/lib/qqbot/upgrade/snapshots/qqbot-20261023-151230.000.db /var/lib/qqbot/qqbot.db
-sudo rm -f /var/lib/qqbot/qqbot.db-wal /var/lib/qqbot/qqbot.db-shm
+sudo cp /var/lib/qqbot/bots/<appid>/snapshots/qqbot-20261023-151230.000.db \
+        /var/lib/qqbot/bots/<appid>/qqbot.db
+sudo rm -f /var/lib/qqbot/bots/<appid>/qqbot.db-wal /var/lib/qqbot/bots/<appid>/qqbot.db-shm
 sudo systemctl start qqbot
 ```
 
-快照是 `VACUUM INTO` 出来的完整库文件，不是日志；拷回去就等于回到那一刻。
+快照是 `VACUUM INTO` 出来的完整库文件，不是日志；拷回去就等于回到那一刻。**快照按 Bot
+分目录**（`bots/<appid>/snapshots/`，保留 2 份），因为裁剪会让共用目录里的租户互相删备份。
+注意 `/upgrade apply` 只给**发起升级的那个 Bot**拍快照——其余 Bot 的库要还原，得用你自己
+的备份（迁移是逐库跑的，别的库可能已经被新版本改过）。
 
 ## 离线恢复
 
@@ -245,7 +337,7 @@ sudo -u qqbot /var/lib/qqbot/bin/qqbot init --plugins -c /etc/qqbot/config.toml
 
 # 5. 起来，用启动日志确认插件数量
 sudo systemctl start qqbot
-journalctl -u qqbot -n 30 --no-pager | grep '启动完成'
+journalctl -u qqbot -n 40 --no-pager | grep -E 'Bot 已启动|Bot 启动完成'
 ```
 
 第 4 步的语义是「只补缺失」：`plugins/bin/` 里已有的文件一律不动，所以你单独升过的插件不会被降级。删除的后果分两类：**出厂插件**（四个示例）有内嵌副本，启动期会把缺失的文件补回来，所以删掉它们不等于卸载——要停用请写进 `[plugins].disabled`（#52）；**第三方插件**没有副本可补，删掉文件就是卸载，启动期不会自愈。
@@ -451,7 +543,7 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 上次启动 10-17 12:51（2小时5分前）
 ```
 
-正文里**不再有"启用插件 N 个"那份清单**：插件已经是独立进程（ADR-0005），本插件拿不到"核心装了哪些插件"——契约里没有这个访问器，为一行日志加一个访问器要动 `api_version`。要确认装了哪些插件，看核心启动日志的 `plugin_names`（那才是权威来源），或者看 `/ping` 的版本行与插件报错。
+正文里**不再有"启用插件 N 个"那份清单**：插件已经是独立进程（ADR-0005），本插件拿不到"核心装了哪些插件"——契约里没有这个访问器，为一行日志加一个访问器要动 `api_version`。要确认装了哪些插件，看核心启动日志里该 Bot 那行 `Bot 已启动` 的 `plugin_names`（那才是权威来源），或者看 `/ping` 的版本行与插件报错。
 
 主动消息在本项目里是**受控通道**，而不是默认放开的能力：
 
@@ -459,15 +551,25 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 |---|---|---|
 | 总开关 | `[active] enabled` | 关闭后所有 `SendActive` 直接返回 `ErrActiveDisabled` |
 | 插件白名单 | `[active] plugins` | 只有名单内插件能发；插件拿到的 Sender 是带名字的包装 |
-| 每日预算 | `[active] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按调度时区 `Asia/Shanghai` 换桶，与 cron 同源），先扣预算再发 HTTP；平台明确拒绝时归还，网络失败不归还 |
+| 软预算（每分钟） | `[quota.<档名>] single_qpm` / `group_qpm` | Bot 级、按场景的每分钟上限（平台频控的 50%），与每日额度同为库里一次原子 upsert；超限拒发并返回 `ErrActiveQuota`，**不排队、不跨天补发** |
+| 每日预算 | `[quota.<档名>] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按调度时区 `Asia/Shanghai` 换桶，与 cron 同源），先扣预算再发 HTTP；平台明确拒绝时归还，网络失败不归还。`[active] daily_per_peer` 是它的全局临时覆盖（0 = 跟随档位） |
+| 超限通知 | 自动 | 当天首次超限私聊 Bot 所有者一条，之后不重复；通知本身不占软预算，仍受 429 冷却约束 |
 | 重启抑制 | `[plugins.bootnotice] min_interval` | 距上次启动不足该间隔则整轮跳过，防崩溃重启刷屏 |
 | 重试 | `[plugins.bootnotice] retry_delay` | 失败只重试一次；主动消息没有 `msg_id` 幂等键，多试等于重复推送 |
+
+优先级是 **429 冷却 > 软预算**（平台才是真相）：冷却期内一律返回 `ErrRateLimited`。
+被动回复完全不占这套预算，也不受这些闸门影响。
 
 ```toml
 [active]
 enabled = true
 plugins = ["bootnotice"]
-daily_per_peer = 5
+# daily_per_peer = 5   # 0（默认）= 跟随 [quota.<档名>].daily_per_peer
+
+[quota.default]
+single_qpm = 300       # 单聊每分钟（Bot 级）
+group_qpm = 30         # 群聊每分钟（Bot 级）
+daily_per_peer = 500   # 每个（群/用户）每天
 
 [plugins.bootnotice]
 enabled = true
@@ -637,22 +739,25 @@ bot   ：已清空本会话数据：消息 128 条、媒体 6 个（文件 6）�
 | 4009 | 保留 session，下一轮 Resume |
 | 4004 | 作废 access_token 后重连 |
 | 4008 | 至少等 60s，抖动只加长不缩短 |
-| 4001 / 4002 / 4010–4014 / 4914 / 4915 | 永久错误：停止重连，进程以退出码 1 退出，由 systemd `StartLimit` 收敛 |
+| 4001 / 4002 / 4010–4014 / 4914 / 4915 | 永久错误：**只**停这一个 Bot 的重连（日志里点名它的 appid），其余 Bot 不受影响。全部 Bot 都停了才让进程以退出码 1 退出，由 systemd `StartLimit` 收敛 |
 
 表外的关闭码按退避重连、不动 session。握手（Identify/Resume 到 READY/RESUMED）有 30s 截止，等不到就断开重连——否则平台"收下 WS、心跳也 ACK、就是不回 READY"会让读循环永久阻塞。退避只在连接真正稳定后复位：READY 后活过 30s 才回到 1s 起；「连上就断」（READY 后不足 30s）不复位，连续三次寿命 <5s 的连接直接进 60s 冷却。
 
-## 单实例：同一台机器上的同一 bot 只能跑一个进程
+## 单实例：同一台机器上的同一个 bot 只能跑一个进程
 
-启动时按「先 appID、后数据目录」的顺序取两把**操作系统级**文件锁，拿不到就直接退出，不连网关、不开库：
+一个进程托管多少个 Bot 都行（`[[bots]]`），但**每个 Bot 各自**按「先 appID、后数据目录」
+的顺序取两把**操作系统级**文件锁：拿不到的那一个不连网关、不开库，其余 Bot 照常启动，
+进程也不退出（日志里点名是哪个 appid）：
 
 - **appID 维度**：`%TMP%/qqbot-<sha256(appID) 前 16 位>.lock`（可用 `QQBOT_LOCK_DIR` 换目录，见下），约束"这台机器上的这个 bot"——换个数据目录也躲不掉；
-- **数据目录维度**：`<store.path>.lock`，约束"这份 SQLite 只被一个进程打开"。
+- **数据目录维度**：`<datadir>/bots/<appid>/qqbot.db.lock`，约束"这份 SQLite 只被一个进程打开"。
 
 ```
-启动失败: 另一个实例正在运行：appID 102xxxxx 已被占用——pid 20384（D:\vscode\go\qqbot\bot.exe，启动于 2026-10-18 11:52:07，主机 DESKTOP-8H2K）持有锁 C:\Users\knight\AppData\Local\Temp\qqbot-3f2a1c9d4b7e0a15.lock
+[ERROR] Bot 未启动，其余 Bot 继续 appid=102xxxxx db=.../bots/102xxxxx/qqbot.db err=启动失败: 另一个实例正在运行：appID 102xxxxx 已被占用——pid 20384（D:\vscode\go\qqbot\bot.exe，启动于 2026-10-18 11:52:07，主机 DESKTOP-8H2K）持有锁 C:\Users\knight\AppData\Local\Temp\qqbot-3f2a1c9d4b7e0a15.lock
 ```
 
-数据目录冲突的文案会额外点出占用者的 appID，并提示改 `[store].path`——两种冲突该做的事完全不同（去结束那个进程 vs 换一份库），所以错误必须能区分。
+数据目录冲突的文案会额外点出占用者的 appID，并提示改 `[store].path` 或 `[[bots]].data_dir`
+——两种冲突该做的事完全不同（去结束那个进程 vs 换一份库），所以错误必须能区分。
 
 这不是保守限制。两个进程连同一个 appID 会抢同一个网关 session —— 日志里反复出现 `4902 reset by resume`，两边轮流被踢下线；若还共用一份库，同一个 `msg_id` 会被两边各当成一条事件，用户看到重复回复，被动额度翻倍扣。
 
@@ -754,11 +859,15 @@ go run ./tools/build all -target linux/amd64 -o bin/qqbot
 `Manifest.APIVersion` 是**插件编译时所对的契约版本**（一般直接写 `host.APIVersion`），不是「能不能跑」。能不能跑由**使用面**判定：核心取 `(插件编译版本, 核心版本]` 区间内的契约变更，只要有一条非纯增量变更碰到你声明「我用了」的成员，就拒载（`pkg/host/contract.go` 的 `CheckCompat`）。
 
 - 插件编译版本必须 ≤ 核心版本（向前兼容不做）；
-- 区间内 **additive** 的变更整条跳过——v4 / v5 / v6 / v9 / v11 / v13 都是这一类，核心涨版本不逼任何人重编译；
-- **behavioral**（签名不变、语义变了：v7 / v8 / v10）的成员只要出现在 `Manifest.Uses` 里就拒载；
+- 区间内 **additive** 的变更整条跳过——v4 / v5 / v6 / v9 / v11 / v13 / v14 的 `Host.Bot` 都是这一类，核心涨版本不逼任何人重编译；
+- **behavioral**（签名不变、语义变了：v7 / v8 / v10 / v14 的八个 Host 成员）的成员只要出现在 `Manifest.Uses` 里就拒载；
 - **breaking** 里 `Surface` 为 `*` 的条目（v12 的包外置 + 线协议）**与使用面无关，一律拒载**——按 12 之前编译的插件过不了这一关，声明使用面也救不了。
 
 所以只有「你用到的那一小块被改了」才需要动插件，版本号本身不是待办事项。
+
+### 一个插件实例会服务多个 Bot
+
+从 v14 起，一套插件进程服务核心里的**所有 Bot**（ADR-0008 决策 11）：同一个插件实例会**先后收到不同 Bot 的事件**。Bot 上下文只从**当前调用的 ctx** 取——`host.From(ctx).Bot()` 拿 appid 与认证类型，`host.From(ctx).Config()` 读当前 Bot 的业务面配置；不要用包级变量或"当前 Bot"字段缓存它，那会串库。Init 拿到的 `h` 可以照常存进结构体：带 ctx 的调用会自动落到当前事件所属的 Bot 上（`Config()` 例外，它没有 ctx，返回的是本实例绑定的那个 Bot 的配置）。
 
 ### 一条命令生成使用面
 
@@ -814,6 +923,9 @@ go run github.com/knight000/go_qqbot/tools/apisurface@<pin>
 - **搁置**：分片上传。出站图片只支持 ≤ 5 MB 的 base64 直传，更大的图本地直接拒绝；大图请用 `ImageFromURL`，下载发生在平台侧；
 - **在插件仓做**：`plugins/torn` 业务插件与 Torn 限流/缓存分层。核心侧的前置能力（带请求头的 GET、只发一次、按请求放宽超时、按域名分桶、配置解码）已就绪，见 `docs/ARCHITECTURE.md §6` 与插件仓的设计文档；
 - **待做**：多分片（`shard_total > 1`）只做了协议字段，未做多连接编排。
+- **待做**：Bot 所有权转移与「重置 secret 后重新认领」。`/claim` 一次性、不转移，`/reset`
+  系列刻意不动 `admins`，所以换人目前只能手工清掉该 Bot 库里的 `admins` 行（见「多 Bot
+  部署」里那段顺序说明）。
 
 `/grant` / `/revoke` 已删除（不是搁置）：功能由 `/admin add|rm` 取代，指令与保留前缀一并清理。
 
@@ -831,7 +943,7 @@ internal/pluginbundle/ 内嵌的出厂插件副本（dist/<os>_<arch>/），只�
 internal/upgrade/ 自更新：检查、下载、校验、落位、pending 标记与快照
 internal/sysinfo/ 跨平台资源采集（build tag 分 windows / linux）
 internal/store/   schema、迁移、分批 GC、管理员与身份映射
-internal/instance/ 单实例文件锁（flock / CreateFile 独占共享）
+internal/instance/ 进程级容器：按 [[bots]] 逐个取锁、开库、装配插件、起连接；单实例文件锁也在这里（flock / CreateFile 独占共享）
 internal/httpx/   统一出站客户端
 internal/api/     QQ 开放平台 REST 封装
 internal/config/  配置结构、默认值、校验；示例配置 config.example.toml（init 写出的是它的内嵌副本）
@@ -847,9 +959,12 @@ deploy/           systemd 单元
 运行期数据（`<datadir>` = `[store].path` 的目录）：
 
 ```
-<datadir>/qqbot.db                  SQLite（含 -wal / -shm）
-<datadir>/qqbot.db.lock             数据目录维度的单实例锁
+<datadir>/bots/<appid>/qqbot.db      该 Bot 的 SQLite（含 -wal / -shm），一 Bot 一库
+<datadir>/bots/<appid>/qqbot.db.lock 这份库维度的单实例锁
 <datadir>/plugins/bin/<name>        已安装的插件产物（在就是装着，删掉就是卸载）
 <datadir>/upgrade/state.json        pending 升级标记
 <datadir>/upgrade/snapshots/        VACUUM INTO 快照（保留 2 份）
 ```
+
+`[store].path` 现在只提供目录（它指向的那个文件本身不再被打开），每个 Bot 的库在这一层
+之下的 `bots/<appid>/`。备份、迁移、清理单个租户都只碰一个子目录。

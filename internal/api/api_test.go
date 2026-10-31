@@ -255,3 +255,56 @@ func TestScenePath(t *testing.T) {
 		}
 	}
 }
+
+// gateFunc 把函数适配成 Gate，测试里用闭包记录进出顺序。
+type gateFunc func(ctx context.Context, fn func(context.Context) error) error
+
+func (f gateFunc) Do(ctx context.Context, fn func(context.Context) error) error {
+	return f(ctx, fn)
+}
+
+// 取网关地址必须过闸：这是启动错峰唯一的落点。闸门不生效时 N 个 Bot
+// 同时启动会一起撞 GET /gateway 的 2 QPM，而症状只是"偶尔启动失败"。
+func TestGatewayURLGoesThroughGate(t *testing.T) {
+	c, ft := newTestAPI(t, map[string]string{
+		"/gateway/bot": `{"url":"wss://gateway.example.com/ws"}`,
+	})
+	var calls int
+	c.gate = gateFunc(func(ctx context.Context, fn func(context.Context) error) error {
+		calls++
+		return fn(ctx)
+	})
+
+	got, err := c.GatewayURL(context.Background())
+	if err != nil {
+		t.Fatalf("取网关地址: %v", err)
+	}
+	if got != "wss://gateway.example.com/ws" {
+		t.Fatalf("网关地址 = %q", got)
+	}
+	if calls != 1 {
+		t.Fatalf("GatewayURL 应过一次闸，实际 %d 次", calls)
+	}
+	if n := ft.count("/gateway/bot"); n != 1 {
+		t.Fatalf("闸门放行后应请求一次 /gateway/bot，实际 %d 次", n)
+	}
+}
+
+// 闸门自己报错（例如等间隔时收到关停信号）时必须原样返回，且不再发请求：
+// 否则取消之后仍然打一次平台接口，关停就变成了"再多撞一次配额"。
+func TestGatewayURLGateErrorSkipsRequest(t *testing.T) {
+	c, ft := newTestAPI(t, map[string]string{
+		"/gateway/bot": `{"url":"wss://gateway.example.com/ws"}`,
+	})
+	blocked := errors.New("正在错峰")
+	c.gate = gateFunc(func(context.Context, func(context.Context) error) error {
+		return blocked
+	})
+
+	if _, err := c.GatewayURL(context.Background()); !errors.Is(err, blocked) {
+		t.Fatalf("闸门错误应原样返回，实际: %v", err)
+	}
+	if n := ft.count("/gateway/bot"); n != 0 {
+		t.Fatalf("闸门拒绝后不该再请求 /gateway/bot，实际 %d 次", n)
+	}
+}

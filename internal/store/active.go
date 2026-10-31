@@ -70,3 +70,66 @@ func (db *DB) RefundActiveBudget(ctx context.Context, key ActiveUsageKey) error 
 	}
 	return nil
 }
+
+// ActiveRateKey 是主动消息**每分钟**额度的维度：一分钟、一个场景。
+//
+// 没有 peer：平台频控是 Bot 级的（群聊 60 qpm、单聊 10 qps 都是整个 Bot 的
+// 合计），按会话建桶等于把平台的额度乘以会话数——那正好是超发。
+type ActiveRateKey struct {
+	// Minute 是调度时区的分钟键（YYYY-MM-DDTHH:MM）：与日额度同源，
+	// 所以跨时区部署不会在"哪一分钟"上分叉。
+	Minute string
+	Scene  string
+}
+
+// TakeActiveRate 原子地占一格分钟额度，返回 false 表示这一分钟已满。
+//
+// 与 TakeActiveBudget 完全同构（同一把"检查 + 自增"的 upsert、同一个
+// RowsAffected 判据），理由是两条额度必须共享同一套并发语义：
+// 先 SELECT 再 UPDATE 会让 N 个协程读到同一个 used，各自发一条。
+func (db *DB) TakeActiveRate(ctx context.Context, key ActiveRateKey, limit int) (bool, error) {
+	if limit <= 0 {
+		return false, nil
+	}
+	res, err := db.w.ExecContext(ctx,
+		`INSERT INTO active_rate(minute, scene, used) VALUES(?, ?, 1)
+		 ON CONFLICT(minute, scene) DO UPDATE SET used = used + 1 WHERE used < ?`,
+		key.Minute, key.Scene, limit)
+	if err != nil {
+		return false, fmt.Errorf("占用主动消息分钟额度: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("读取主动消息分钟额度结果: %w", err)
+	}
+	return n == 1, nil
+}
+
+// RefundActiveRate 归还一格分钟额度，语义与 RefundActiveBudget 一致：
+// 只给"平台明确拒绝"用，used > 0 兜住账本为负。
+func (db *DB) RefundActiveRate(ctx context.Context, key ActiveRateKey) error {
+	_, err := db.w.ExecContext(ctx,
+		`UPDATE active_rate SET used = used - 1
+		 WHERE minute = ? AND scene = ? AND used > 0`,
+		key.Minute, key.Scene)
+	if err != nil {
+		return fmt.Errorf("归还主动消息分钟额度: %w", err)
+	}
+	return nil
+}
+
+// PurgeActiveRate 清掉早于 before 的分钟桶（同一格式的分钟键）。
+//
+// 分钟桶只有一分钟的生命周期，留着只会在库里越积越多。清掉是安全的：
+// 过期桶的下一次写入会新建一行 used=1，与"保留后被跨分钟复用"等价。
+func (db *DB) PurgeActiveRate(ctx context.Context, before string) (int64, error) {
+	res, err := db.w.ExecContext(ctx, `DELETE FROM active_rate WHERE minute < ?`, before)
+	if err != nil {
+		return 0, fmt.Errorf("清理主动消息分钟额度: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清理结果: %w", err)
+	}
+	return n, nil
+}

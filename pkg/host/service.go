@@ -52,6 +52,9 @@ type HTTPBackend interface {
 type Options struct {
 	Name   string
 	Config Params
+	// Bot 是这份 Host 归属的 Bot。进程内插件（随核心一起编译）靠它回答
+	// Host.Bot()：它们跑在自己的 Core 里，永远只服务一个 Bot。
+	Bot    BotInfo
 	Sender Sender
 	KV     KVBackend
 	DB     QueryBackend
@@ -72,6 +75,7 @@ type Options struct {
 type Service struct {
 	name      string
 	cfg       Params
+	bot       BotInfo
 	kv        *kvStore
 	kvBackend KVBackend
 	query     *queryStore
@@ -92,6 +96,7 @@ func NewService(o Options) *Service {
 	return &Service{
 		name:      o.Name,
 		cfg:       o.Config,
+		bot:       o.Bot,
 		kv:        &kvStore{db: o.KV, plugin: o.Name},
 		kvBackend: o.KV,
 		query:     &queryStore{db: o.DB},
@@ -107,6 +112,7 @@ func NewService(o Options) *Service {
 
 func (s *Service) Plugin() string       { return s.name }
 func (s *Service) Config() Params       { return s.cfg }
+func (s *Service) Bot() BotInfo         { return s.bot }
 func (s *Service) Sender() Sender       { return s.sender }
 func (s *Service) KV() KV               { return s.kv }
 func (s *Service) Query() QueryStore    { return s.query }

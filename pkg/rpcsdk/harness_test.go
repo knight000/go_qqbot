@@ -38,6 +38,9 @@ var errPassiveExhausted = errors.New("被动回复窗口已用尽（测试哨兵
 type harness struct {
 	reg  *rpc.Registry
 	host *host.Service
+	// bot 是这台"最小核心"服务的 Bot。共享插件进程之后每条 host.* 调用都
+	// 要带 bot_id，替身里用同一个值即可。
+	bot host.BotInfo
 
 	mu    sync.Mutex
 	kv    map[string][]byte
@@ -50,9 +53,10 @@ func newHarness(t *testing.T) *harness {
 	if err := reg.Register(rpc.CodeImplBase, errPassiveExhausted); err != nil {
 		t.Fatalf("注册实现自定义码: %v", err)
 	}
-	h := &harness{reg: reg, kv: make(map[string][]byte)}
+	h := &harness{reg: reg, kv: make(map[string][]byte), bot: host.BotInfo{AppID: "bot-test", CertType: "personal"}}
 	h.host = host.NewService(host.Options{
 		Name: "testplugin",
+		Bot:  h.bot,
 		// 与夹具的 ConfigSchema 对应：声明即必填，值必须都在。
 		Config:   host.NewParams("testplugin", map[string]any{"greeting": "hi", "n": int64(7)}),
 		Sender:   fakeSender{},
@@ -226,6 +230,7 @@ func fixtureBinary(t *testing.T) string {
 type plugin struct {
 	t        *testing.T
 	conn     *rpc.Conn
+	bot      host.BotInfo
 	manifest host.Manifest
 	optional []string
 	cmd      *exec.Cmd
@@ -269,7 +274,12 @@ func startPlugin(t *testing.T, h *harness) *plugin {
 	}
 
 	conn := rpc.NewConn(stdout, stdin, rpc.Options{Registry: h.reg})
-	if err := rpc.ServeHost(conn, h.host); err != nil {
+	if err := rpc.ServeHost(conn, func(botID string) (host.Host, error) {
+		if botID != h.bot.AppID {
+			return nil, fmt.Errorf("未知的 Bot %q", botID)
+		}
+		return h.host, nil
+	}); err != nil {
 		t.Fatalf("挂载 host.*: %v", err)
 	}
 	go func() { _ = conn.Run() }()
@@ -292,10 +302,10 @@ func startPlugin(t *testing.T, h *harness) *plugin {
 	if err != nil {
 		t.Fatalf("握手: %v", err)
 	}
-	if err := conn.CallInit(ctx, "testplugin", map[string]any{"greeting": "hi", "n": int64(7)}); err != nil {
+	if err := conn.CallInit(ctx, h.bot, "testplugin", map[string]any{"greeting": "hi", "n": int64(7)}); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	return &plugin{t: t, conn: conn, manifest: m, optional: optional, cmd: cmd, stderr: &stderr}
+	return &plugin{t: t, conn: conn, bot: h.bot, manifest: m, optional: optional, cmd: cmd, stderr: &stderr}
 }
 
 // event 造一条进站消息。Command / Args 由核心在路由阶段填好（契约 8），
@@ -324,7 +334,7 @@ func (p *plugin) send(command, args string) *host.Reply {
 	p.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	reply, err := p.conn.CallHandle(ctx, p.event(command, args))
+	reply, err := p.conn.CallHandle(ctx, p.bot, p.event(command, args))
 	if err != nil {
 		p.t.Fatalf("%s: %v", command, err)
 	}
@@ -336,7 +346,7 @@ func (p *plugin) sendErr(command string) error {
 	p.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	_, err := p.conn.CallHandle(ctx, p.event(command, ""))
+	_, err := p.conn.CallHandle(ctx, p.bot, p.event(command, ""))
 	return err
 }
 

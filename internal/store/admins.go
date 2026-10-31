@@ -152,8 +152,43 @@ func (db *DB) DeleteAdmin(ctx context.Context, ident string) (removed, owners in
 	return removed, owners, nil
 }
 
-// AdminTargets 汇总启动通知的收件人，尽量解析出可用的单聊 openid。
+// ReplaceAdmins 把整张 admins 表换成"只剩这一个 owner"。
 //
+// 唯一调用点是**配置里的 secret 变过之后的重新认领**（ADR-0008 决策 4 的
+// 所有权重置路径）：平台重置 secret 会让旧值立即失效，Bot 进 failing，而
+// admins 非空又挡着 /claim——不给这条路，所有权就永久锁死，只能手工改库。
+//
+// 调用方必须先证明"secret 确实变了"（比对记录下来的指纹），这里的删除才是
+// 安全的：知道新 secret 的人本来就有权处置这个 Bot。这也是它与 /admin 的
+// 分界——/admin 永远不删 owner，因为它没有这个证明。
+//
+// 事务内先删后插：中途失败不能留下"既没有旧 owner 也没有新 owner"的库。
+func (db *DB) ReplaceAdmins(ctx context.Context, a Admin) (removed int64, err error) {
+	tx, err := db.w.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("开始事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM admins`)
+	if err != nil {
+		return 0, fmt.Errorf("清空管理员: %w", err)
+	}
+	removed, _ = res.RowsAffected()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO admins(openid, union_openid, role, note, granted_by, source_scene, created_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		a.OpenID, a.UnionID, a.Role, a.Note, a.GrantedBy, a.SourceScene, nowUnix()); err != nil {
+		return 0, fmt.Errorf("写入新所有者: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("提交事务: %w", err)
+	}
+	return removed, nil
+}
+
+// AdminTargets 汇总启动通知的收件人，尽量解析出可用的单聊 openid。
 // 解析顺序：identities 里记录的单聊身份 → 授权自身的 openid（openid 跨场景同值，
 // 实测如此）。解析错了只会让主动私聊失败并留下一条 warn，不会误发给别人。
 func (db *DB) AdminTargets(ctx context.Context) ([]AdminTarget, error) {

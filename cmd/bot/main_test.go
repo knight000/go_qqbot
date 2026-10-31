@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/core"
 	"github.com/knight000/go_qqbot/pkg/host"
 )
@@ -39,39 +42,59 @@ func TestFormatDomainLimits(t *testing.T) {
 	}
 }
 
-// 启动日志必须打印插件名：只报数量时，"新插件没编进二进制"与"插件进去了
-// 但没注册"在日志里完全一样（P3-17）。
-func TestLogStartupListsPluginNames(t *testing.T) {
+// 启动完成那一行只报进程级事实：库路径、两把锁与插件清单都是每 Bot 一份，
+// 逐个打在容器自己的"Bot 已启动"里。全局行混进一个 db= 会让人以为只有一个库。
+func TestLogStartupReportsProcessLevelFacts(t *testing.T) {
 	var buf bytes.Buffer
 	logStartup(slog.New(slog.NewTextHandler(&buf, nil)), startupInfo{
-		Version: "v0.0.0-test",
-		Plugins: []host.Plugin{fakePlugin{name: "echo"}, fakePlugin{name: "adminping"}},
+		ConfigPath: "config.toml",
+		DataDir:    "data",
+		Version:    "v0.0.0-test",
+		Bots:       2,
+		Started:    1,
 	})
 
 	out := buf.String()
-	if !strings.Contains(out, "plugins=2") {
-		t.Fatalf("启动日志应带插件数量，实际: %s", out)
+	for _, want := range []string{"config=config.toml", "datadir=data", "bots=2", "started=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("启动日志缺少 %q：%s", want, out)
+		}
 	}
-	i := strings.Index(out, "plugin_names=")
-	if i < 0 {
-		t.Fatalf("启动日志缺 plugin_names，实际: %s", out)
-	}
-	field := out[i:]
-	ai, ei := strings.Index(field, "adminping"), strings.Index(field, "echo")
-	if ai < 0 || ei < 0 {
-		t.Fatalf("plugin_names 应包含全部插件名，实际: %s", field)
-	}
-	if ai > ei {
-		t.Fatalf("插件名应按字典序输出，实际: %s", field)
+	if strings.Contains(out, "db=") {
+		t.Errorf("全局启动行不该出现单数 db=（每 Bot 各一份）：%s", out)
 	}
 }
 
-type fakePlugin struct{ name string }
+// 每个 Bot 的数据目录必须在启动日志里可见：它由 appid 推导，备份、迁移、
+// 清理都靠这一行确认"东西到底落在哪"。secret 一个字节都不许出现。
+func TestLogBotsPrintsDataDirAndNeverSecret(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		Store: config.Store{Path: "data/qqbot.db"},
+		Bots: []config.Bot{
+			{AppID: "102000001", Secret: "super-secret"},
+			{AppID: "102000002", Secret: "another-secret", DataDir: "/srv/qqbot/manual"},
+		},
+	}
+	logBots(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
 
-func (f fakePlugin) Manifest() host.Manifest             { return host.Manifest{Name: f.name} }
-func (fakePlugin) Init(context.Context, host.Host) error { return nil }
-func (fakePlugin) Handle(context.Context, *host.Event) (*host.Reply, error) {
-	return nil, nil
+	out := buf.String()
+	if got := strings.Count(out, "Bot 配置"); got != 2 {
+		t.Fatalf("应每个 Bot 一行，实际 %d 行:\n%s", got, out)
+	}
+	for _, want := range []string{
+		"data_dir=", "bot=102000001", "bot=102000002",
+		"data_dir=/srv/qqbot/manual",
+		// 库路径也必须是推导结果：运维照着这一行去备份，不能是 [store].path。
+		"db=" + filepath.Join("data", "bots", "102000001", "qqbot.db"),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("启动日志缺少 %q：\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "super-secret") || strings.Contains(out, "another-secret") {
+		t.Errorf("启动日志泄露了 secret：\n%s", out)
+	}
 }
 
 // 退出信号与 /reload 同时就绪时 select 随机选，选中请求就会把 Ctrl-C 变成重启。
@@ -84,27 +107,35 @@ func TestWaitExitDropsRestartAfterSignal(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		req, _, gwFatal := waitExit(ctx, restarts, make(chan struct{}), make(chan error, 1))
+		req, _, fatalErr := waitExit(ctx, restarts, make(chan error, 1))
 		if req != nil {
 			t.Fatalf("第 %d 轮：退出信号已到，却返回了重启请求 %+v", i, req)
 		}
-		if gwFatal != nil {
-			t.Fatalf("第 %d 轮：网关没有退出，不该有 fatal 错误: %v", i, gwFatal)
+		if fatalErr != nil {
+			t.Fatalf("第 %d 轮：没有 fatal 错误: %v", i, fatalErr)
 		}
 	}
 
 	// 正常情况：没有退出信号时请求照常生效，且不算被丢弃。
 	restarts := make(chan core.RestartRequest, 1)
 	restarts <- core.RestartRequest{By: "owner", Role: "owner"}
-	req, dropped, gwFatal := waitExit(context.Background(), restarts, make(chan struct{}), make(chan error, 1))
+	req, dropped, fatalErr := waitExit(context.Background(), restarts, make(chan error, 1))
 	if req == nil || req.By != "owner" {
 		t.Fatalf("没有退出信号时应返回重启请求，实际 %+v", req)
 	}
 	if dropped != nil {
 		t.Fatalf("没有退出信号时不该标记丢弃，实际 %+v", dropped)
 	}
-	if gwFatal != nil {
-		t.Fatalf("网关没有退出，不该有 fatal 错误: %v", gwFatal)
+	if fatalErr != nil {
+		t.Fatalf("没有 fatal 错误: %v", fatalErr)
+	}
+
+	// 全部网关都停了：进程必须以非 0 退出（单 Bot 时代这条也有）。
+	fatal := make(chan error, 1)
+	fatal <- errors.New("网关永久性错误")
+	_, _, fatalErr = waitExit(context.Background(), make(chan core.RestartRequest), fatal)
+	if fatalErr == nil {
+		t.Fatal("fatal 通道有错误时 waitExit 必须交出来")
 	}
 }
 
@@ -124,8 +155,7 @@ func TestSignalRegistrationPrecedesSlowStartup(t *testing.T) {
 		"cfg, err := config.Load(",
 		"notifyShutdown(context.Background())",
 		"render.LoadFonts()",
-		"store.Open(",
-		"db.Migrate(",
+		"instance.Start(ctx, instance.Options{",
 	}
 	prev, prevAt := "", -1
 	for _, marker := range order {
@@ -139,3 +169,12 @@ func TestSignalRegistrationPrecedesSlowStartup(t *testing.T) {
 		prev, prevAt = marker, at
 	}
 }
+
+// fakePlugin 是只带名字的插件替身：够 loadedPlugins 与启动日志的断言。
+type fakePlugin struct{ name string }
+
+func (f fakePlugin) Manifest() host.Manifest { return host.Manifest{Name: f.name} }
+func (fakePlugin) Init(context.Context, host.Host) error {
+	return nil
+}
+func (fakePlugin) Handle(context.Context, *host.Event) (*host.Reply, error) { return nil, nil }

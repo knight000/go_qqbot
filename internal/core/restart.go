@@ -46,7 +46,7 @@ type RestartRequest struct {
 var ErrRestartPending = errors.New("已有重启请求在处理")
 
 const reloadUsage = `用法：
-/reload [说明]   重启进程，加载磁盘上的新二进制（管理员）
+/reload [说明]   重启进程，加载磁盘上的新二进制（仅 Core 所有者）
 /restart [说明]   同上
 
 重启前会先回这条消息，随后进程退出并重新执行自己。
@@ -67,10 +67,11 @@ func (c *Core) requestRestart(req RestartRequest) error {
 
 func (c *Core) handleReload(ctx context.Context, ev *host.Event) {
 	p := c.authorize(ctx, ev)
-	if !p.IsBotAdmin() {
-		// 与 adminping 的静默策略不同：/reload 属于核心指令，
-		// 明确回一句比让发送者以为"没反应"更好，也不泄露任何机器信息。
-		c.replyText(ctx, ev, "该指令仅管理员可用。")
+	// /reload 重启的是**整个进程**：机器上所有租户的 Bot 都会断一遍。
+	// 所以它只认 Core 所有者，Bot 管理员不够（ADR-0008 决策 9）。
+	coreOwner := c.isCoreOwner(ev)
+	if !coreOwner {
+		c.replyText(ctx, ev, "该指令仅 Core 所有者可用。")
 		return
 	}
 
@@ -116,13 +117,13 @@ func (c *Core) handleReload(ctx context.Context, ev *host.Event) {
 	// 先发回复再入队：被动回复窗口在重启后就不存在了，顺序反了这条消息必丢。
 	c.replyText(ctx, ev, b.String())
 
-	req := RestartRequest{By: ev.SenderID, Role: string(p.Role), Scene: ev.Scene, Reason: reason, At: time.Now()}
+	req := RestartRequest{By: ev.SenderID, Role: actorLabel(p, coreOwner), Scene: ev.Scene, Reason: reason, At: time.Now()}
 	if err := c.requestRestart(req); err != nil {
 		c.log.Warn("重启请求未入队", "by", ev.SenderID, "err", err)
 		return
 	}
 	c.log.Warn("收到 /reload，准备重启",
-		"by", ev.SenderID, "role", p.Role, "scene", ev.Scene, "reason", reason, "exe", exe)
+		"by", ev.SenderID, "role", actorLabel(p, coreOwner), "scene", ev.Scene, "reason", reason, "exe", exe)
 }
 
 // isGoRunBinary 判断当前二进制是不是 go run 的临时产物。

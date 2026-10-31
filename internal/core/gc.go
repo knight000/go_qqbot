@@ -62,17 +62,36 @@ func (c *Core) runGC(ctx context.Context) {
 	if err != nil {
 		c.log.Warn("清理过期会话失败", "err", err)
 	}
+	// 分钟额度桶只有一分钟的生命期（#67）。保留 2 小时足够覆盖任何在途
+	// 请求与时钟偏差，再早的桶不会有人读——不清理等于每天多 2880 行垃圾。
+	rateN, err := c.store.PurgeActiveRate(ctx,
+		now.In(c.rateLocation()).Add(-2*time.Hour).Format(rateMinuteFormat))
+	if err != nil {
+		c.log.Warn("清理过期分钟额度失败", "err", err)
+	}
 
-	if msgN+evtN+runN+mediaN+kvN+sessN > 0 {
+	if msgN+evtN+runN+mediaN+kvN+sessN+rateN > 0 {
 		if err := c.store.IncrementalVacuum(ctx); err != nil {
 			c.log.Warn("incremental_vacuum 失败", "err", err)
 		}
 		c.log.Info("GC 完成",
-			"messages", msgN, "events", evtN, "job_runs", runN, "media", mediaN, "kv", kvN, "sessions", sessN)
+			"messages", msgN, "events", evtN, "job_runs", runN, "media", mediaN, "kv", kvN, "sessions", sessN, "rates", rateN)
 	}
 	if expN > 0 {
 		c.log.Debug("已把过期的待确认重置标记为 expired", "count", expN)
 	}
+}
+
+// rateLocation 返回分钟桶的切桶时区，与 Sender 的日/分钟账本同源。
+//
+// 不从 c.sched 取：单测会手工构造 Core（没有调度器），而这里只是清垃圾，
+// 时区差一小时不影响正确性；生产路径 sender 一定存在且 loc 非 nil
+// （NewSender 对 nil 直接 panic）。
+func (c *Core) rateLocation() *time.Location {
+	if c.sender != nil && c.sender.loc != nil {
+		return c.sender.loc
+	}
+	return time.Local
 }
 
 func (c *Core) purgeLoop(ctx context.Context, table string, before int64) int64 {

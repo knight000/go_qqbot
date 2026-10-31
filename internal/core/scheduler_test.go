@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/store"
 	"github.com/knight000/go_qqbot/pkg/host"
 )
@@ -277,7 +278,10 @@ func TestFirstGroupMessageExpandsPerPeerJobs(t *testing.T) {
 // 用来验证"按插件分桶串行、桶间并行"的语义。
 type probeRunner struct {
 	plugin string
+	// global 是本组（一个 Bot）的账本；also 是可选第二本账，用来同时记
+	// 「本 Bot 内」与「整进程」两个并行峰值。
 	global *globalProbe
+	also   *globalProbe
 
 	mu       sync.Mutex
 	inflight int
@@ -307,9 +311,15 @@ func (r *probeRunner) RunJob(ctx context.Context, spec host.JobSpec) error {
 	if r.global != nil {
 		r.global.enter()
 	}
+	if r.also != nil {
+		r.also.enter()
+	}
 	defer func() {
 		if r.global != nil {
 			r.global.leave()
+		}
+		if r.also != nil {
+			r.also.leave()
 		}
 		r.mu.Lock()
 		r.inflight--
@@ -782,5 +792,99 @@ func benchRunDue(b *testing.B, plugins, jobsPerPlugin int, work time.Duration) {
 		if !s.Wait(runCtx) {
 			b.Fatal("任务未在期限内收尾")
 		}
+	}
+}
+
+// 进程级共享池：全局并行仍是 4，但每个 Bot 同时只跑 1 个桶。
+//
+// 各 Core 自建容量 4 的池时，N 个 Bot 的并行度其实是 4×N——内存上限是按
+// cgroup 整体算的，那是 4 倍的内存压力；而"每 Bot 1 个桶"是为了让慢任务
+// 只推迟自己。两条断言一起看：全局峰值 4、每个 Bot 的峰值 1。
+func TestSharedJobPoolCapsGlobalAndSerializesPerBot(t *testing.T) {
+	pool := NewJobPool()
+	global := &globalProbe{}
+	const bots = jobParallel + 2
+
+	scheds := make([]*Scheduler, 0, bots)
+	perBot := make([]*globalProbe, 0, bots)
+	runners := make([][]*probeRunner, 0, bots)
+	for i := 0; i < bots; i++ {
+		db, err := store.Open(filepath.Join(t.TempDir(), "sched.db"))
+		if err != nil {
+			t.Fatalf("打开测试库: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		if err := db.Migrate(context.Background()); err != nil {
+			t.Fatalf("迁移: %v", err)
+		}
+		s := newScheduler(db, slog.New(slog.DiscardHandler), pool)
+		mine := &globalProbe{}
+		var mineRunners []*probeRunner
+		for j := 0; j < 2; j++ {
+			plugin := "p" + strconv.Itoa(i) + "-" + strconv.Itoa(j)
+			r := &probeRunner{plugin: plugin, global: mine, also: global, delay: 60 * time.Millisecond}
+			s.Bind(plugin, r)
+			registerPerPeer(t, s, db, plugin, "tick", []string{"g" + strconv.Itoa(i) + "-" + strconv.Itoa(j)})
+			mineRunners = append(mineRunners, r)
+		}
+		scheds = append(scheds, s)
+		perBot = append(perBot, mine)
+		runners = append(runners, mineRunners)
+	}
+
+	for _, s := range scheds {
+		s.runDue()
+	}
+	for _, s := range scheds {
+		waitScheduler(t, s)
+	}
+
+	if got := global.max(); got != jobParallel {
+		t.Fatalf("全局并行度应为 %d（共享池），实际 %d", jobParallel, got)
+	}
+	for i, bp := range perBot {
+		if got := bp.max(); got != 1 {
+			t.Fatalf("第 %d 个 Bot 同时在跑 %d 个桶，应为 1", i, got)
+		}
+	}
+	for i, rs := range runners {
+		for _, r := range rs {
+			if len(r.ran()) != 1 {
+				t.Fatalf("第 %d 个 Bot 的 %s 没跑完（跑了 %v）", i, r.plugin, r.ran())
+			}
+		}
+	}
+}
+
+// core.Options.Jobs 必须真的接到调度器上，且接上就意味着"每 Bot 1 个桶"。
+//
+// 这条只看接线：并行度的行为在 TestSharedJobPoolCapsGlobalAndSerializesPerBot
+// 里验。分开的理由是——接线漏了不会报错，只会静默退回 4×N。
+func TestCoreSharesInjectedJobPool(t *testing.T) {
+	pool := NewJobPool()
+	shared, err := New(Options{Config: &config.Config{}, Jobs: pool})
+	if err != nil {
+		t.Fatalf("构造 Core: %v", err)
+	}
+	if shared.sched.slots != pool.slots {
+		t.Fatal("注入的池没有接到调度器上（并行度会退回 4×N）")
+	}
+	if shared.sched.serial == nil {
+		t.Fatal("共享池必须同时启用每 Bot 1 个桶的闸门")
+	}
+
+	// 不注入时保持单 Bot 行为：自建一份容量 4 的池，不按 Bot 串行。
+	own, err := New(Options{Config: &config.Config{}})
+	if err != nil {
+		t.Fatalf("构造 Core: %v", err)
+	}
+	if own.sched.slots == pool.slots {
+		t.Fatal("未注入时不该使用别人的池")
+	}
+	if own.sched.serial != nil {
+		t.Fatal("未注入时不该按 Bot 串行（单 Bot 的并行度不该被砍到 1）")
+	}
+	if got := cap(own.sched.slots); got != jobParallel {
+		t.Fatalf("自建的池容量应为 %d，实际 %d", jobParallel, got)
 	}
 }

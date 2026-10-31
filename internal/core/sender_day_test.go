@@ -37,6 +37,14 @@ func (r *recordingUsage) RefundActiveBudget(_ context.Context, key store.ActiveU
 	return nil
 }
 
+// 分钟账本：这两个用例只测切日口径，策略里没设每分钟上限，
+// 所以 TakeActiveRate 不会被调用；实现出来只为满足接口。
+func (r *recordingUsage) TakeActiveRate(context.Context, store.ActiveRateKey, int) (bool, error) {
+	return true, nil
+}
+
+func (r *recordingUsage) RefundActiveRate(context.Context, store.ActiveRateKey) error { return nil }
+
 // 日预算的切日必须与 cron 用同一个时区来源。
 //
 // 部署单元在 UTC 机器上跑（Debian 12 默认 UTC），cron 却按 Asia/Shanghai

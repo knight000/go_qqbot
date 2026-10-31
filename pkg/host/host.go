@@ -102,8 +102,19 @@ import (
 // 同期还加了 Manifest.Uses（插件自报的使用面，#55/#56），零值同样安全——
 // 没写就是空使用面，判定退化为「api_version 必须与核心相等」。两项都是纯增量。
 //
+// 版本 14：插件进程从「每 Bot 一套」变成「一套服务所有 Bot」（ADR-0008 决策 11）。
+//   - 新增 Host.Bot()（appid + 认证类型），给需要区分 Bot 的插件用——纯增量；
+//   - **行为变更**：同一个插件实例会收到来自不同 Bot 的事件，于是
+//     Host.Config / KV / PeerKV / Query / IsAdmin / Admins / Sender / Session
+//     的返回值都开始取决于「当前这次调用属于哪个 Bot」。签名一个字没变，所以
+//     没有编译期信号，插件必须自己保证「状态按 Bot 隔离」：
+//     · 带 ctx 的调用一律用调用参数里的 ctx（`host.From(ctx)` 取当前 Bot 的
+//     Host），不要把 Init 拿到的 Host 当成"当前 Bot"存进包级变量；
+//     · 需要 Bot 身份时读 `host.From(ctx).Bot()`，不要缓存。
+//     只用 Host.Log 的插件确实不受影响，所以分级表按成员逐个点名，不用 "*"。
+//
 // 历史与完整差异见 ARCHITECTURE.md §3.2「契约版本历史」。
-const APIVersion = "13"
+const APIVersion = "14"
 
 // MaxRawBytes 是 Event.Raw 的长度上限（32 KiB）。
 //
@@ -323,10 +334,12 @@ type Reply struct {
 // 判别一律用哨兵，网络失败与其它本地校验失败不属于任何一类，保持 Go 的原始
 // 错误语义（如 context.DeadlineExceeded）。
 var (
-	// ErrActiveQuota 是本地主动消息日预算用尽。平台每（群/用户）每天上限
-	// 1000 条，本地把预算压到个位数并**落库**（active_usage）：重启不清零，
-	// 否则"重启循环不会烧额度"只是注释里的一句空话。
-	// 日预算账本不可用时也返回它（fail-closed）：对调用方来说"这条不能发"是
+	// ErrActiveQuota 是本地主动消息软预算用尽——每分钟（Bot 级、按场景）或
+	// 每（群/用户）每天任一维触顶。两个维度都**落库**（active_rate /
+	// active_usage）：重启不清零，否则"重启循环不会烧额度"只是注释里的一句空话。
+	// 档位取平台值的 50%，可按 Bot 用 [quota.<档名>] 调（#67）。
+	// 不排队、不跨天补发：零点尖峰正撞平台频控，实际可用性更差。
+	// 额度账本不可用时也返回它（fail-closed）：对调用方来说"这条不能发"是
 	// 同一件事，差别只在日志里。
 	ErrActiveQuota = errors.New("主动消息本地额度已用尽")
 	// ErrActiveDisabled 是主动消息总开关关闭，或本插件不在 [active].plugins
@@ -451,6 +464,16 @@ type Host interface {
 	Config() Params
 	Sender() Sender
 	KV() KV
+	// Bot 返回**本次调用所属的 Bot**（appid + 认证类型）。
+	//
+	// 共享插件进程之后（ADR-0008 决策 11），同一个插件实例会服务多个 Bot：
+	// 这个方法存在的意义就是让插件能区分"这次是谁的事件"。它读的是
+	// 调用参数里的 ctx（`host.From(ctx).Bot()`），不是某个可变的"当前 Bot"
+	// 字段——并发下没有"当前"，只有每个调用自己的 ctx。
+	//
+	// 进程级路径（没有 Bot 上下文）返回零值并记一条 warn，不 panic；
+	// 用 IsZero 判断即可。
+	Bot() BotInfo
 	// PeerKV 返回该会话私有的 KV 命名空间。会话状态写这里，
 	// `/reset session`（R1）才清得掉；写在 KV() 里等于宣布"重置永远清不掉它"。
 	PeerKV(peer string) KV

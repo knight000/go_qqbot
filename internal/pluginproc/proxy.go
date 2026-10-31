@@ -48,9 +48,17 @@ type proxy struct {
 	// probe 是 `--manifest` 的期限，热升级要用它验新产物的身份。
 	probe time.Duration
 
-	mu   sync.Mutex
-	host host.Host
-	cfg  map[string]any
+	mu sync.Mutex
+	// hosts 是「哪个 Bot 用哪一份 Host」：共享进程下（ADR-0008 决策 11）
+	// 一个插件实例服务 N 个 Bot，host.* 的每条调用都靠 bot_id 在这里选。
+	hosts map[string]host.Host
+	// botInfos 是每个 Bot 的 host.BotInfo（appid + 认证类型）。插件进程崩溃
+	// 重启后要重放 init，而重放必须带上认证类型——只传 appid 会让插件侧
+	// Host.Bot() 返回空 CertType，插件据此做的分档（限额、提示）就全错了。
+	botInfos map[string]host.BotInfo
+	// cfgs 是每个 Bot 的配置快照（`[plugins.<name>]` 的原始 map）。配置是
+	// 业务面的、按 Bot 不同（决策 10），所以按 Bot 各存一份、各 init 一次。
+	cfgs map[string]map[string]any
 	// cur 是当前活着的那个进程。nil 表示还没起、正在退避、或已被停用。
 	cur *runtimeProc
 	// closing 之后不再重启：关停与 /reload 都走 Close，那时"进程退出"是
@@ -63,9 +71,9 @@ type proxy struct {
 	// 不再起进程，调用一律立刻失败。
 	failures int
 	disabled bool
-	// started 记录核心调过 Start：重启之后要把 Start 补上，否则新进程只是
-	// "能接 handle"，后台协程/定时器一个都没起（插件自己不知道被重启过）。
-	started bool
+	// started 记录核心为哪些 Bot 调过 Start：重启之后要把 Start 补上，否则新
+	// 进程只是"能接 handle"，后台协程/定时器一个都没起（插件自己不知道被重启过）。
+	started map[string]bool
 }
 
 // newProxy 用探测结果造一个还没起进程的 proxy。
@@ -85,6 +93,10 @@ func newProxy(pr probeResult, o Options) host.Plugin {
 		log:       o.logger().With("plugin", name),
 		backoff:   o.backoff(),
 		probe:     o.probeTimeout(),
+		hosts:     make(map[string]host.Host),
+		botInfos:  make(map[string]host.BotInfo),
+		cfgs:      make(map[string]map[string]any),
+		started:   make(map[string]bool),
 	}
 }
 
@@ -109,21 +121,32 @@ func (p *proxy) Manifest() host.Manifest {
 // 里的文件名只是标签——只有 proxy 自己知道这一份到底叫什么。
 func (p *proxy) BinPath() string { return p.bin }
 
-// Init 起子进程、把 host.* 挂到连接上、把配置快照交给插件。
+// Init 为**一个 Bot** 装上这个插件：登记它的 Host，然后（必要时起进程并）
+// 发一次 plugin.init。
 //
-// 这是「装上」与「能路由」的分界线：Init 返回之后插件才可能被投递事件。
-// 配置取自装配期的快照（`[plugins.<name>]` 的原始 map）：插件自己也拿不到
-// 配置，这套快照是它唯一的来源（ADR-0005「本 ADR 不做」一节：不做热更新）。
+// 这是「这个 Bot 的插件」与「能路由」的分界线：Init 返回之后核心才会为这个
+// Bot 投递事件。共享进程下每个 (Bot, 插件) 各调一次，进程只在第一个 Bot 时
+// 起——这就是「一套进程服务所有 Bot」的落点（ADR-0008 决策 11）。
+//
+// 哪个 Bot 由 ctx 里的 host.BotOf 决定（host.Plugin.Init 的签名里没有 bot
+// 参数，见 core.Start）。
 func (p *proxy) Init(ctx context.Context, h host.Host) error {
-	p.mu.Lock()
-	if p.host != nil {
-		p.mu.Unlock()
-		return fmt.Errorf("pluginproc: 插件 %s 已经初始化过（Init 只调用一次）", p.name)
+	bot, ok := host.BotOf(ctx)
+	if !ok || bot.IsZero() {
+		return fmt.Errorf("pluginproc: 插件 %s 的 Init 缺少 Bot 上下文", p.name)
 	}
-	p.host, p.cfg = h, p.configFor(p.name)
+	p.mu.Lock()
+	if _, dup := p.hosts[bot.AppID]; dup {
+		p.mu.Unlock()
+		return fmt.Errorf("pluginproc: 插件 %s 已经为 Bot %s 初始化过（Init 每个 Bot 只调用一次）", p.name, bot.AppID)
+	}
+	p.hosts[bot.AppID] = h
+	p.botInfos[bot.AppID] = bot
+	p.cfgs[bot.AppID] = p.configFor(p.name)
+	alive := p.cur != nil
 	p.mu.Unlock()
 
-	err := p.start(ctx)
+	err := p.initBot(ctx, bot, alive)
 	if err == nil {
 		return nil
 	}
@@ -135,14 +158,59 @@ func (p *proxy) Init(ctx context.Context, h host.Host) error {
 	return fmt.Errorf("初始化插件 %s: %w", p.name, err)
 }
 
+// initBot 让插件为某个 Bot 完成一次握手。进程不在时先起一个（第一个 Bot
+// 顺便把 host.* 的服务端挂上），在的时候直接发这次 init。
+func (p *proxy) initBot(ctx context.Context, bot host.BotInfo, alive bool) error {
+	if !alive {
+		return p.startAll(ctx)
+	}
+	r := p.running()
+	if r == nil {
+		// 正在退避/停用：Init 不失败，等重启时 startAll 会把每个 Bot 都补上
+		// （与"启动即崩"同一条口径）。
+		return nil
+	}
+	cfg := p.configOf(bot.AppID)
+	if err := r.conn.CallInit(ctx, bot, p.name, cfg); err != nil {
+		return &startFailure{err: err, transport: errors.Is(err, rpc.ErrConnClosed)}
+	}
+	return nil
+}
+
+func (p *proxy) configOf(botID string) map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cfg := p.cfgs[botID]; cfg != nil {
+		return cfg
+	}
+	return map[string]any{}
+}
+
+// botOf 取本次调用属于哪个 Bot。共享进程下这是唯一的分发依据——没有它
+// 就只能猜，而猜错就是跨租户串库。
+func (p *proxy) botOf(ctx context.Context) (host.BotInfo, error) {
+	bot, ok := host.BotOf(ctx)
+	if !ok || bot.IsZero() {
+		return host.BotInfo{}, fmt.Errorf("%w: %s 的调用缺少 Bot 上下文", ErrUnavailable, p.name)
+	}
+	return bot, nil
+}
+
 // Handle 把一条事件投给插件。超时口径由 rpc.CallHandle 兜底（3 秒），
 // 与进程内插件完全一致——进程边界不是放宽语义的理由（决策 7）。
+//
+// 事件属于哪个 Bot 由 ctx 决定（core 的 Dispatcher 在 invoke 时标好），
+// 插件侧据此拿到那个 Bot 的 Host。
 func (p *proxy) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error) {
+	bot, err := p.botOf(ctx)
+	if err != nil {
+		return nil, err
+	}
 	r := p.running()
 	if r == nil {
 		return nil, fmt.Errorf("%w: %s", ErrUnavailable, p.name)
 	}
-	reply, err := r.conn.CallHandle(ctx, ev)
+	reply, err := r.conn.CallHandle(ctx, bot, ev)
 	if err != nil {
 		// 只有超时算"这次插件不行"；插件自己返回的业务错误是正常输出，
 		// 计入熔断会让一个爱报错的插件被当成坏产物停掉。
@@ -161,11 +229,15 @@ func (p *proxy) Handle(ctx context.Context, ev *host.Event) (*host.Reply, error)
 // 时由 rpc.CallRunJob 按 JobTimeout 兜底。两个数字都只写在 pkg/rpc 一处，
 // 这里不另拍一个"跨进程更宽松"的值（决策 7）。
 func (p *proxy) RunJob(ctx context.Context, spec host.JobSpec) error {
+	bot, err := p.botOf(ctx)
+	if err != nil {
+		return err
+	}
 	r := p.running()
 	if r == nil {
 		return fmt.Errorf("%w: %s", ErrUnavailable, p.name)
 	}
-	err := r.conn.CallRunJob(ctx, spec)
+	err = r.conn.CallRunJob(ctx, bot, spec)
 	if errors.Is(err, context.DeadlineExceeded) {
 		p.noteFailure("run_job 超时")
 	} else if err == nil {
@@ -220,25 +292,31 @@ func (p *proxy) noteFailure(reason string) {
 	}
 }
 
-// Start 转发 plugin.start。插件没实现时是空操作：核心对每个 proxy 都会调它
-// （proxy 这个类型永远实现了 Starter），"实现没实现"由 manifest 的 optional
-// 说了算（pkg/rpc 的 capabilitiesOf 保证探测到的与注册的方法来自同一份断言）。
+// Start 转发 plugin.start，**按 Bot 各起一次**：插件若起后台协程，必须每个
+// Bot 一个（不允许用包级变量存"当前 Bot"，ADR-0008 决策 11）。插件没实现时
+// 是空操作：核心对每个 proxy 都会调它（proxy 这个类型永远实现了 Starter），
+// "实现没实现"由 manifest 的 optional 说了算（pkg/rpc 的 capabilitiesOf 保证
+// 探测到的与注册的方法来自同一份断言）。
 //
 // 进程此刻不在（启动即崩，正在退避）时也返回 nil：这不是"启动失败"，退避
-// 重启之后的 Init 会再把 Start 补上。
+// 重启之后的 startAll 会把每个 Bot 的 Start 补上。
 func (p *proxy) Start(ctx context.Context) error {
+	bot, err := p.botOf(ctx)
+	if err != nil {
+		return err
+	}
 	if !p.optional[rpc.OptionalStart] {
 		return nil
 	}
 	p.mu.Lock()
-	p.started = true
+	p.started[bot.AppID] = true
 	p.mu.Unlock()
 
 	r := p.running()
 	if r == nil {
 		return nil
 	}
-	return r.conn.CallStart(ctx)
+	return r.conn.CallStart(ctx, bot)
 }
 
 // Close 走三级关闭：RPC close → （断连接等 EOF）→ 终止信号 → Kill。
@@ -356,7 +434,7 @@ func (p *proxy) ReplaceBinary(newPath string) error {
 		p.mu.Unlock()
 		return fmt.Errorf("pluginproc: 插件 %s 已有一个替换在进行中", p.name)
 	}
-	if p.host == nil {
+	if len(p.hosts) == 0 {
 		p.mu.Unlock()
 		return fmt.Errorf("pluginproc: 插件 %s 还没初始化过，不能替换二进制", p.name)
 	}
@@ -420,9 +498,21 @@ func (p *proxy) replace(newPath string) error {
 		return p.keepServing(fmt.Errorf("替换 %s: %w", p.bin, err))
 	}
 
-	// 5. 起新进程，5 秒内完成 init 握手即为成功。
+	// 5. 起新进程并让**每个已登记的 Bot** 重新握手，5 秒内完成即为成功。
+	//
+	//    清单与可选接口先换：它们决定要不要给各 Bot 补 Start，也决定核心看到
+	//    的版本。握手失败时连它们一起回滚——否则核心会以为跑的是新版本。
+	p.mu.Lock()
+	before, beforeOpts := p.manifest, p.optional
+	p.manifest = m
+	p.optional = make(map[string]bool, len(opts))
+	for _, name := range opts {
+		p.optional[name] = true
+	}
+	p.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), replaceInitTimeout)
-	r, err := p.spawn(ctx)
+	err = p.startAll(ctx)
 	cancel()
 	if err != nil {
 		// 文件与进程两样都要回到旧版本，顺序不能反：先换文件再起进程，
@@ -430,39 +520,23 @@ func (p *proxy) replace(newPath string) error {
 		if rerr := renameFile(backup, p.bin); rerr != nil {
 			return fmt.Errorf("新版本握手失败（%v），回滚文件也失败: %w", err, rerr)
 		}
-		if rerr := p.start(context.Background()); rerr != nil {
+		p.mu.Lock()
+		p.manifest, p.optional = before, beforeOpts
+		p.mu.Unlock()
+		if rerr := p.startAll(context.Background()); rerr != nil {
 			return fmt.Errorf("新版本握手失败（%v），重启旧版本也失败: %w", err, rerr)
 		}
 		return fmt.Errorf("新版本 %s 内没有完成握手，已回滚并重启旧版本: %w", replaceInitTimeout, err)
 	}
 
 	p.mu.Lock()
-	p.cur = r
 	p.failures = 0
 	// 新产物等于一次干净的起跑：之前那个版本崩出来的"连续失败"不该跟着它。
 	p.disabled = false
-	before := p.manifest
-	p.manifest = m
-	// 可选接口也以新产物为准：它决定 Start/Close 会不会真的过通道，
-	// 拿旧产物的能力表去调新进程只会得到"方法未注册"。
-	p.optional = make(map[string]bool, len(opts))
-	for _, name := range opts {
-		p.optional[name] = true
-	}
-	needStart := p.started && p.optional[rpc.OptionalStart]
 	p.mu.Unlock()
-	go p.supervise(r)
 
 	if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
 		p.log.Warn("删除旧版本备份失败", "path", backup, "err", err)
-	}
-	if needStart {
-		// 核心只在启动时调一次 Start；新进程要自己把后台协程起起来。
-		// 失败不算替换失败：插件已经在服务，缺的只是一代 Start——与崩溃
-		// 重启后"补 Start 失败"同一条口径。
-		if err := p.Start(context.Background()); err != nil {
-			p.log.Error("插件升级后 Start 失败", "err", err)
-		}
 	}
 	// 路由表是启动时一次性建好的（ADR-0005 决策 3），热替换不重建它。
 	// 命令集变了必须说出来：否则现场是"插件声明了 /x，敲 /x 却没反应"。
@@ -478,7 +552,7 @@ func (p *proxy) replace(newPath string) error {
 // keepServing 用于"还没换成就失败了"的分支：文件已经回到旧版本（或本来
 // 就没动），这里保证还有进程在服务，再把原因原样往上抛。
 func (p *proxy) keepServing(cause error) error {
-	if err := p.start(context.Background()); err != nil {
+	if err := p.startAll(context.Background()); err != nil {
 		return fmt.Errorf("%w（旧版本也没能重新拉起: %v）", cause, err)
 	}
 	return cause
@@ -534,34 +608,119 @@ func sameCommands(a, b host.Manifest) bool {
 	return true
 }
 
-// spawn 起一个进程并完成握手。
+// spawn 起一个进程并挂好 host.* 的服务端，但**不**做 init 握手：握手是
+// 按 Bot 的，见 startAll。
 //
 // 失败分两类（见 startFailure 的注释）：进程侧起不来/中途死了属于崩溃，由
 // 调用方转成退避重启；其余（含插件在 init 里报的错）原样上抛。
 func (p *proxy) spawn(ctx context.Context) (*runtimeProc, error) {
-	p.mu.Lock()
-	h, cfg := p.host, p.cfg
-	p.mu.Unlock()
-
 	r, err := startProcess(p.bin, p.reg, p.log)
 	if err != nil {
 		return nil, &startFailure{err: err, transport: true}
 	}
 	// host.* 必须在 Run 之前挂上：插件在 Init 里就会调 Host（Config() 不过
 	// 通道，但 SendActive / Scheduler 会），那时代码已经在读这条连接了。
-	if err := rpc.ServeHost(r.conn, h); err != nil {
+	// 解析函数按 bot_id 查表——一个进程服务 N 个 Bot，这里就是那张表的入口。
+	if err := rpc.ServeHost(r.conn, p.resolveHost); err != nil {
 		r.shutdown()
 		return nil, err
 	}
 	go func() { _ = r.conn.Run() }()
-
-	if err := r.conn.CallInit(ctx, p.name, cfg); err != nil {
-		r.shutdown()
-		// 连接已关＝插件在 init 之前/之中就没了（崩溃）；其余是插件**答了**
-		// "我初始化失败"——那是配置写错，按既有口径让启动失败（决策 6）。
-		return nil, &startFailure{err: err, transport: errors.Is(err, rpc.ErrConnClosed)}
-	}
 	return r, nil
+}
+
+// resolveHost 是 host.* 服务端的 resolver：按 bot_id 找该 Bot 的 Host。
+//
+// 找不到必须报错而不是回落到"唯一的那一个"：装配缺陷下多一条显式的失败，
+// 比把 A 的 KV 写进 B 的库好得多。
+func (p *proxy) resolveHost(botID string) (host.Host, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if h, ok := p.hosts[botID]; ok && h != nil {
+		return h, nil
+	}
+	return nil, fmt.Errorf("插件 %s 没有 Bot %s 的 Host", p.name, botID)
+}
+
+// startAll 起一代进程，并把它与**每个已登记的 Bot** 重新接上：先各发一次
+// plugin.init，再给调过 Start 的 Bot 补一次 plugin.start。
+//
+// 为什么重启要重放全部 init：Init 之后进程才可能被投递事件，而新进程对
+// 任何一个 Bot 都是一张白纸——只接手"当前那个 Bot"会让别的租户从此收不到
+// 事件，且没有任何报错。
+func (p *proxy) startAll(ctx context.Context) error {
+	r, err := p.spawn(ctx)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.cur = r
+	started := make(map[string]bool, len(p.started))
+	for id, ok := range p.started {
+		started[id] = ok
+	}
+	supportsStart := p.optional[rpc.OptionalStart]
+	p.mu.Unlock()
+	go p.supervise(r)
+
+	for _, bot := range p.registeredBots() {
+		if err := r.conn.CallInit(ctx, bot, p.name, p.configOf(bot.AppID)); err != nil {
+			r.shutdown()
+			p.mu.Lock()
+			if p.cur == r {
+				p.cur = nil
+			}
+			p.mu.Unlock()
+			// 连接已关＝插件在 init 之前/之中就没了（崩溃）；其余是插件**答了**
+			// "我初始化失败"——那是配置写错，按既有口径让启动失败（决策 6）。
+			return &startFailure{err: err, transport: errors.Is(err, rpc.ErrConnClosed)}
+		}
+	}
+	if supportsStart {
+		for _, bot := range p.registeredBots() {
+			if !started[bot.AppID] {
+				continue
+			}
+			if err := r.conn.CallStart(ctx, bot); err != nil {
+				// 失败不算起进程失败：插件已经在服务，缺的只是一代 Start——
+				// 与崩溃重启后"补 Start 失败"同一条口径。
+				p.log.Error("插件重启后 Start 失败", "bot", bot.AppID, "err", err)
+			}
+		}
+	}
+	return nil
+}
+
+// registeredBots 返回已登记 Host 的 Bot（顺序无关：每个都是独立的握手）。
+func (p *proxy) registeredBots() []host.BotInfo {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]host.BotInfo, 0, len(p.hosts))
+	for id := range p.hosts {
+		if info, ok := p.botInfos[id]; ok {
+			out = append(out, info)
+			continue
+		}
+		// 没有记录（不该发生）时退回只有 appid 的形态：插件仍能工作，只是
+		// 拿不到认证类型——比不初始化这个 Bot 好。
+		out = append(out, host.BotInfo{AppID: id})
+	}
+	return out
+}
+
+// UnregisterBotHost 摘掉某个 Bot 的 Host：这个 Bot 已经不在本进程里了
+// （热删、或该 Bot 的 Core 已关停），它的 host.* 调用不该再被服务——留着
+// 表项等于让一条迟到的调用写进一个正在关闭的库。
+//
+// 它是 internal/instance 的容器在 Bot 退出时调的入口（ADR-0008 决策 15 的
+// 热增删也走这里）。进程级的 Close 不受影响：插件进程仍服务其余 Bot。
+func (p *proxy) UnregisterBotHost(botID string) {
+	p.mu.Lock()
+	delete(p.hosts, botID)
+	delete(p.botInfos, botID)
+	delete(p.cfgs, botID)
+	delete(p.started, botID)
+	p.mu.Unlock()
 }
 
 // startFailure 区分两种"起不来"。
@@ -581,19 +740,6 @@ func (e *startFailure) Unwrap() error { return e.err }
 func isTransport(err error) bool {
 	var f *startFailure
 	return errors.As(err, &f) && f.transport
-}
-
-// start 起一代进程：握手成功就接管为当前进程，并派一个监工盯着它的退出。
-func (p *proxy) start(ctx context.Context) error {
-	r, err := p.spawn(ctx)
-	if err != nil {
-		return err
-	}
-	p.mu.Lock()
-	p.cur = r
-	p.mu.Unlock()
-	go p.supervise(r)
-	return nil
 }
 
 // supervise 盯这一代进程的结局。
@@ -658,22 +804,14 @@ func (p *proxy) restart() {
 	if closing || disabled || replacing {
 		return
 	}
-	if err := p.start(context.Background()); err != nil {
+	if err := p.startAll(context.Background()); err != nil {
 		p.log.Error("插件重启失败", "err", err)
 		p.noteExit(err)
 		return
 	}
-	p.log.Info("插件已重启", "failures", p.failureCount())
-
-	// 核心只会在启动时调一次 Start；重启出来的是新进程，后台协程要重新起。
-	p.mu.Lock()
-	needStart := p.started && p.optional[rpc.OptionalStart]
-	p.mu.Unlock()
-	if needStart {
-		if err := p.Start(context.Background()); err != nil {
-			p.log.Error("插件重启后 Start 失败", "err", err)
-		}
-	}
+	// startAll 已经把每个 Bot 的 init（与该补的 Start）都重放过了：新进程对
+	// 每个租户都要重新接上，只接一个会让其余租户从此静默收不到事件。
+	p.log.Info("插件已重启", "failures", p.failureCount(), "bots", len(p.registeredBots()))
 }
 
 func (p *proxy) failureCount() int {

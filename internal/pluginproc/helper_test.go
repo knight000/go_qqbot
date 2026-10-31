@@ -221,6 +221,14 @@ func appendMarker(line string) {
 
 // helperPlugin 是一个真正实现了 host.Plugin 三个必选接口 + 三个可选接口的
 // 插件；每个角色的差别只在 manifest 与几处行为开关。
+// testBot 是 pluginproc 测试里唯一的 Bot。共享插件进程之后，每个 per-Bot 的
+// 调用（Init / Start / Handle / RunJob）都必须由 ctx 标注它属于谁——那是
+// proxy 分发到正确 Host 的唯一依据。
+var testBot = host.BotInfo{AppID: "bot-test", CertType: "personal"}
+
+// testBotCtx 给没有其它诉求的调用一个带 Bot 的 ctx。
+func testBotCtx() context.Context { return host.WithBot(context.Background(), testBot) }
+
 type helperPlugin struct {
 	mode string
 	ver  string

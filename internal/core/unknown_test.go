@@ -53,6 +53,7 @@ func TestUnknownEventNeverRoutesOrStores(t *testing.T) {
 	disp.trace = tr
 
 	c := &Core{store: db, log: log, trace: tr, router: router, dispatch: disp}
+	markActive(t, db)
 	c.Handle(ctx, &host.Event{
 		Kind:      host.KindUnknown,
 		Name:      "SOME_FUTURE_EVENT",
@@ -97,6 +98,7 @@ func TestMessageStoresPlatformMsgType(t *testing.T) {
 	}
 	disp := NewDispatcher(router, NewSender(&fakeAPI{}, log, ActivePolicy{}, nil, time.Local), log, time.Second)
 	c := &Core{store: db, log: log, router: router, dispatch: disp}
+	markActive(t, db)
 
 	c.Handle(ctx, &host.Event{
 		ID: "e-1", Kind: host.KindMessage, Name: "GROUP_MESSAGE_CREATE",

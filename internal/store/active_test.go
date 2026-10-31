@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -174,5 +176,141 @@ func TestResetLevelsAndActiveBudget(t *testing.T) {
 	}
 	if !take("g1") {
 		t.Fatal("R3 应清空全部预算")
+	}
+}
+
+// ---- 分钟维度（#67）----
+
+// 分钟桶是 (分钟, 场景)：换一分钟、换一个场景都是新桶；同一分钟的并发
+// 占格必须收敛到 limit，不能"都读到同一个 used 然后各发一条"。
+func TestTakeActiveRateStopsAtLimitUnderConcurrency(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	key := ActiveRateKey{Minute: "2026-10-30T12:00", Scene: "group"}
+
+	const limit = 8
+	const workers = 16
+	var wg sync.WaitGroup
+	var granted int64
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := db.TakeActiveRate(ctx, key, limit)
+			if err != nil {
+				t.Errorf("并发占额度: %v", err)
+				return
+			}
+			if ok {
+				atomic.AddInt64(&granted, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if granted != limit {
+		t.Fatalf("16 个并发里应恰好放行 %d 个，实际 %d", limit, granted)
+	}
+	var used int
+	if err := db.r.QueryRowContext(ctx,
+		`SELECT used FROM active_rate WHERE minute = ? AND scene = ?`,
+		key.Minute, key.Scene).Scan(&used); err != nil {
+		t.Fatalf("读分钟账本: %v", err)
+	}
+	if used != limit {
+		t.Fatalf("账本用量应恰好等于上限 %d，实际 %d", limit, used)
+	}
+
+	// 换分钟 / 换场景是新桶，不受上一格影响。
+	for _, k := range []ActiveRateKey{
+		{Minute: "2026-10-30T12:01", Scene: "group"},
+		{Minute: "2026-10-30T12:00", Scene: "c2c"},
+	} {
+		if ok, err := db.TakeActiveRate(ctx, k, 1); err != nil || !ok {
+			t.Fatalf("新桶 %v 应可占额度: ok=%v err=%v", k, ok, err)
+		}
+	}
+}
+
+func TestRefundActiveRateReturnsOneSlot(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	key := ActiveRateKey{Minute: "2026-10-30T12:00", Scene: "c2c"}
+
+	if ok, err := db.TakeActiveRate(ctx, key, 1); err != nil || !ok {
+		t.Fatalf("首次应可占额度: ok=%v err=%v", ok, err)
+	}
+	if err := db.RefundActiveRate(ctx, key); err != nil {
+		t.Fatalf("归还: %v", err)
+	}
+	if ok, err := db.TakeActiveRate(ctx, key, 1); err != nil || !ok {
+		t.Fatalf("归还后应能再占一格: ok=%v err=%v", ok, err)
+	}
+}
+
+// limit<=0 与日额度同一条判据：不能因为 upsert 的 INSERT 分支绕过 WHERE
+// 就把"没配额度"错读成"放开"。
+func TestTakeActiveRateNonPositiveLimitRefuses(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for _, limit := range []int{0, -1} {
+		ok, err := db.TakeActiveRate(ctx, ActiveRateKey{Minute: "2026-10-30T12:00", Scene: "c2c"}, limit)
+		if err != nil || ok {
+			t.Fatalf("limit=%d 必须拒发: ok=%v err=%v", limit, ok, err)
+		}
+	}
+}
+
+func TestPurgeActiveRateDropsOldMinutes(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for _, m := range []string{"2026-10-30T11:58", "2026-10-30T12:00"} {
+		if ok, err := db.TakeActiveRate(ctx, ActiveRateKey{Minute: m, Scene: "group"}, 1); err != nil || !ok {
+			t.Fatalf("占 %s: ok=%v err=%v", m, ok, err)
+		}
+	}
+	n, err := db.PurgeActiveRate(ctx, "2026-10-30T12:00")
+	if err != nil {
+		t.Fatalf("清理: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("应只清掉更早的那一分钟，实际清了 %d 行", n)
+	}
+}
+
+// ClaimStateValue 是"每天最多一次"的原子判据：并发下只能有一个人拿到 true。
+func TestClaimStateValueOnlyFirstWins(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	var wins int64
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			first, err := db.ClaimStateValue(ctx, "notice_day", "2026-10-30")
+			if err != nil {
+				t.Errorf("认领: %v", err)
+				return
+			}
+			if first {
+				atomic.AddInt64(&wins, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("并发认领应只有 1 个成功，实际 %d", wins)
+	}
+
+	first, err := db.ClaimStateValue(ctx, "notice_day", "2026-10-30")
+	if err != nil || first {
+		t.Fatalf("同一天再次认领不该成功: first=%v err=%v", first, err)
+	}
+	first, err = db.ClaimStateValue(ctx, "notice_day", "2026-10-31")
+	if err != nil || !first {
+		t.Fatalf("换一天应重新成功: first=%v err=%v", first, err)
 	}
 }

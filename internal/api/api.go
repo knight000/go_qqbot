@@ -93,6 +93,20 @@ func decodeEnvelope(raw json.RawMessage, out any) error {
 	return nil
 }
 
+// Gate 串行化并间隔化一次「取网关地址」的调用。
+//
+// 为什么在 api 层而不是网关层：限的是 `GET /gateway/bot` 这个接口（2 QPM），
+// 不是"连接"这个动作。放在网关层就等于每个 Bot 自己数自己的，跨 Bot 撞配额
+// 依旧发生；而平台的计量口径（按 AppID 还是按 IP）至今没有说明。
+//
+// 接口只有 Do：实现在 internal/instance（进程级共享一份），api 不认识
+// 间隔、排队与 Bot 列表，只负责"这次取地址先过闸"。
+type Gate interface {
+	// Do 必须在 fn 返回之后才允许下一次调用进入，且两次 fn 之间至少间隔
+	// 实现自己定义的时长；ctx 取消时立刻返回，不执行 fn。
+	Do(ctx context.Context, fn func(context.Context) error) error
+}
+
 type Client struct {
 	hc       *httpx.Client
 	hcSlow   *httpx.Client // 共享连接池与限流器，只放宽超时
@@ -102,6 +116,7 @@ type Client struct {
 	secret   string
 	state    StateStore
 	log      *slog.Logger
+	gate     Gate
 
 	mu    sync.Mutex
 	token string
@@ -121,6 +136,9 @@ type Options struct {
 	Secret   string
 	State    StateStore
 	Log      *slog.Logger
+	// Gate 非空时，每次 GatewayURL 都先过它（启动错峰，见 Gate）。
+	// 其余接口不过闸：限的是取地址这一个调用，不是整个出站。
+	Gate Gate
 }
 
 func New(o Options) *Client {
@@ -142,6 +160,7 @@ func New(o Options) *Client {
 		secret:   o.Secret,
 		state:    o.State,
 		log:      logger,
+		gate:     o.Gate,
 	}
 }
 
@@ -309,13 +328,29 @@ type gatewayResponse struct {
 }
 
 // GatewayURL 取 WSS 接入地址。
+//
+// 整段在闸门里，**包括首次调用顺带发生的那次取 token**（token 是 c.Get 内部
+// 惰性取的）。不把 token 摘出来：限的是 `GET /gateway/bot` 的 2 QPM，token
+// 走的是 bots.qq.com 另一个接口、不占这份配额，摘出来只省下一次亚秒级往返，
+// 代价是把 doAuthed 剖成两段——而"一次取地址就是一个操作、闸门只有一个入口"
+// 更容易守住。
 func (c *Client) GatewayURL(ctx context.Context) (string, error) {
 	var resp gatewayResponse
-	if err := c.Get(ctx, "/gateway/bot", &resp); err != nil {
-		return "", err
+	fetch := func(ctx context.Context) error {
+		if err := c.Get(ctx, "/gateway/bot", &resp); err != nil {
+			return err
+		}
+		if resp.URL == "" {
+			return fmt.Errorf("网关地址为空")
+		}
+		return nil
 	}
-	if resp.URL == "" {
-		return "", fmt.Errorf("网关地址为空")
+	if c.gate != nil {
+		if err := c.gate.Do(ctx, fetch); err != nil {
+			return "", err
+		}
+	} else if err := fetch(ctx); err != nil {
+		return "", err
 	}
 	return resp.URL, nil
 }

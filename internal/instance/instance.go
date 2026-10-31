@@ -6,10 +6,14 @@
 // 幂等表，业务上已经是错的。SQLite 的 WAL 虽然支持多进程，但那不是让两个 bot
 // 共用一份库的理由——消息表与幂等表会混在一起，排查时无从下手。
 //
-// 所以锁分两个维度，按宽到窄的顺序取：
+// 本包还有第二个职责：进程级容器（container.go）。它按 [[bots]] 把每个 Bot
+// 的锁、库、插件与连接逐个装起来，关停时按「等网关落盘 → 关核心/插件 →
+// 关库 → 放锁」的顺序放掉。一 Bot 一库的全部含义都落在这一层。
+//
+// 锁分两个维度，按宽到窄的顺序取：
 //
 //  1. appID 维度：%TMP%/qqbot-<sha256(appID)[:16]>.lock。约束的是"这台机器上的
-//     同一个 bot"。同一 appID 配两份数据目录（测试库与正式库并存，或换了目录但
+//     同一个 bot"（多 Bot 时每个 Bot 各一把）。同一 appID 配两份数据目录（测试库与正式库并存，或换了目录但
 //     旧进程还在）时，靠它挡住第二条 WS。锁文件必须放在系统临时目录：它跟数据
 //     目录在哪无关，放在库旁边就又会退化成"换个目录就能双开"。
 //  2. 数据目录维度：<store.path>.lock。约束的是一份 SQLite。
@@ -80,8 +84,11 @@ func lockDir() string {
 	return tempDir()
 }
 
-// Options 描述一次加锁。
-type Options struct {
+// LockOptions 描述一次加锁。
+//
+// 名字带 Lock 是因为本包还有一个进程级容器（Container）的 Options：两处
+// 都叫 Options 会撞名，而"加锁参数"与"启动整个 Core 的参数"确实是两件事。
+type LockOptions struct {
 	// AppID 是网关 session 的归属，同一 appID 全机只允许一个进程。必填：
 	// 为空时直接报错，静默退化成"只锁数据目录"正是被修掉的那个缺陷。
 	AppID string
@@ -231,7 +238,7 @@ func (e *LockedError) Unwrap() error { return ErrLocked }
 //
 // 锁被占用时返回的错误满足 errors.Is(err, ErrLocked)，可断言为 *LockedError
 // 读取持有者信息。
-func Acquire(opts Options) (*Lock, error) {
+func Acquire(opts LockOptions) (*Lock, error) {
 	if strings.TrimSpace(opts.AppID) == "" {
 		return nil, errors.New("单实例锁需要 appID：缺了它就只能按数据目录划分，同一 bot 换个目录仍会双开")
 	}
@@ -263,7 +270,7 @@ func Acquire(opts Options) (*Lock, error) {
 //   - 占着的 appID 就是自己 → 真的双开，报错。
 //
 // 三条合起来保证：同一个 appID 无论走哪个文件，全机只有一个进程能拿到它。
-func acquireApp(opts Options) (*fileLock, error) {
+func acquireApp(opts LockOptions) (*fileLock, error) {
 	appID := opts.AppID
 	primary, full := appLockPaths(appID)
 	lock, err := acquireFile(primary, ScopeAppID, opts)
@@ -299,7 +306,7 @@ func appLockPaths(appID string) (primary, full string) {
 
 // acquireFile 在 path 上取独占锁并在拿到后写入持有者信息。
 // scope 只用于冲突时把"哪一把锁挡住的"写进错误文案。
-func acquireFile(path string, scope Scope, opts Options) (*fileLock, error) {
+func acquireFile(path string, scope Scope, opts LockOptions) (*fileLock, error) {
 	// 转成绝对路径：错误消息里出现 "./data/qqbot.db.lock" 这种相对路径时，
 	// 用户还得先猜是相对于谁——报错文案的价值就在于能直接照着去查。
 	if abs, err := filepath.Abs(path); err == nil {

@@ -167,6 +167,30 @@ func TestDisabledIssueNoRequests(t *testing.T) {
 
 // 验收 1 后半（upgrade 侧）：apply 完成落位，给出换盘计划。
 // 此时 exe 必须**还没**变——换盘发生在关停之后。
+// 快照必须落在 SnapshotRoot 指定的目录里：裁剪只留 2 份，多 Bot 共用
+// `<datadir>/upgrade/snapshots` 会让两个租户互相删备份。pending 标记相反——
+// 它是进程级的（回滚要重新 exec 整个二进制），必须留在 DataDir 下。
+func TestSnapshotRootKeepsTenantsApart(t *testing.T) {
+	f := newFakeRelease(t, "1.2.4", peHeader("new"))
+	root := filepath.Join(t.TempDir(), "bots", "102000001")
+	u, _ := newTestUpgrader(t, f, "1.2.3", func(o *Options) { o.SnapshotRoot = root })
+
+	plan, err := u.Apply(context.Background())
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	wantPrefix := filepath.Join(root, "snapshots")
+	if !strings.HasPrefix(plan.Snapshot, wantPrefix) {
+		t.Errorf("快照应在 %s 下，实际 %s", wantPrefix, plan.Snapshot)
+	}
+	if _, err := os.Stat(plan.Snapshot); err != nil {
+		t.Errorf("快照文件不存在: %v", err)
+	}
+	if plan.StateDir != StateDir(u.opt.DataDir) {
+		t.Errorf("pending 标记目录应仍是 %s，实际 %s", StateDir(u.opt.DataDir), plan.StateDir)
+	}
+}
+
 func TestApplyStagesAndWritesPending(t *testing.T) {
 	f := newFakeRelease(t, "1.2.4", peHeader("new"))
 	u, exe := newTestUpgrader(t, f, "1.2.3", nil)

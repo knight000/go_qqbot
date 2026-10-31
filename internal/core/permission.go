@@ -60,3 +60,38 @@ func (c *Core) authorize(ctx context.Context, ev *host.Event) host.Principal {
 	c.resolveActor(ctx, ev)
 	return ev.Actor
 }
+
+// isCoreOwner 判断发送者是不是配置里的 Core 所有者（`[core].owners`）。
+//
+// 这是**进程级身份**，与面前这个 Bot 库里的 admins 表无关，因此在任意一个
+// Bot 里都成立，不需要先认领那个 Bot（ADR-0008 决策 9）。判定顺序上先看它，
+// 再看本 Bot 管理员：不分区的话，任何一个租户都能重启整台机器上所有人的 Bot。
+//
+// 只比 openid、不做前缀/模糊匹配：openid 是平台下发的标识，宽松匹配等于把
+// 进程级权限开给一批不相干的人。
+func (c *Core) isCoreOwner(ev *host.Event) bool {
+	if ev == nil || ev.SenderID == "" || c.cfg == nil {
+		return false
+	}
+	for _, id := range c.cfg.Core.Owners {
+		if id != "" && id == ev.SenderID {
+			return true
+		}
+	}
+	return false
+}
+
+// coreOwnerLabel 是 Core 所有者的身份口径：它来自配置文件，不在 admins 表里，
+// 所以任何日志与请求都不能写成 admins 的 owner，否则事后审计会翻不到人。
+const coreOwnerLabel = "core_owner"
+
+// actorLabel 是日志与重启请求里的身份口径。
+//
+// Core 所有者的身份来自配置文件，与 admins 表无关；直接写 p.Role 会显示成
+// user（他可能确实不是这个 Bot 的管理员），让事后审计误判成越权。
+func actorLabel(p host.Principal, coreOwner bool) string {
+	if coreOwner {
+		return coreOwnerLabel
+	}
+	return string(p.Role)
+}

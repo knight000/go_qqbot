@@ -55,11 +55,10 @@ type UpgradeService interface {
 }
 
 func (c *Core) handleUpgrade(ctx context.Context, ev *host.Event) {
-	p := c.authorize(ctx, ev)
-	if p.Role != host.RoleOwner {
-		// 与 /reload 一致：核心指令明确回一句，而不是静默，
-		// 也不泄露可用版本、源地址之类任何信息。
-		c.replyText(ctx, ev, "该指令仅所有者可用。")
+	// 换二进制等于远程代码执行（ADR-0006 决策 2）：只认 Core 所有者，
+	// Bot 所有者也不够——它换的是整台机器上所有 Bot 共用的一份程序。
+	if !c.isCoreOwner(ev) {
+		c.replyText(ctx, ev, "该指令仅 Core 所有者可用。")
 		return
 	}
 
@@ -171,9 +170,11 @@ func (c *Core) upgradeApply(ctx context.Context, ev *host.Event) {
 	// 先回消息，再入队：顺序反了这条回复必丢。
 	c.replyText(ctx, ev, b.String())
 
+	// 口径与 /reload 一致：/upgrade 的每条子命令都只认 Core 所有者（决策 9），
+	// 能走到这里的必然是 core_owner，不该再写成 admins 里的 owner。
 	req := RestartRequest{
 		By:     ev.SenderID,
-		Role:   string(ev.Actor.Role),
+		Role:   coreOwnerLabel,
 		Scene:  ev.Scene,
 		Reason: "upgrade " + plan.From + " -> " + plan.To,
 		At:     time.Now(),

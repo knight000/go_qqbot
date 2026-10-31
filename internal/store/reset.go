@@ -261,6 +261,11 @@ func (db *DB) ClearAllData(ctx context.Context) (ResetCounts, error) {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM active_usage`); err != nil {
 		return c, fmt.Errorf("清空 active_usage: %w", err)
 	}
+	// 分钟账本同样清空（#67）。它没有 peer 维度，R2 不碰它——按 peer 重置
+	// 时删整个分钟桶等于给别人凭空多出一份额度。R3 是全量重来，这里该清。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM active_rate`); err != nil {
+		return c, fmt.Errorf("清空 active_rate: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return c, fmt.Errorf("提交清理事务: %w", err)

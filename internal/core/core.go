@@ -20,11 +20,18 @@ import (
 )
 
 type Options struct {
-	Store   *store.DB
-	API     *api.Client
-	HTTP    *httpx.Client
-	Log     *slog.Logger
-	Config  *config.Config
+	Store  *store.DB
+	API    *api.Client
+	HTTP   *httpx.Client
+	Log    *slog.Logger
+	Config *config.Config
+	// Bot 是本 Core 服务的那个 Bot。多 Bot 之后一个进程里有 N 个 Core，
+	// 而插件进程只有一套——这个标识是「这次调用属于谁」的唯一来源
+	// （ADR-0008 决策 11）。
+	Bot host.BotInfo
+	// Plugins 是**进程级共享**的插件句柄，不在本 Core 的生命周期里：
+	// 它们由装配层（internal/instance 的容器）加载一次、最后统一关闭。
+	// 本 Core 只按 Bot 调用它们的 Init / Start / Handle / RunJob。
 	Plugins []host.Plugin
 	// Renderer 是插件可见的渲染能力。Core 只认 host.Renderer 接口，
 	// 不 import 任何渲染实现，测试才能注入 fake、不依赖真字体。
@@ -35,14 +42,39 @@ type Options struct {
 	// Upgrade 是 /upgrade 依赖的升级能力。nil 表示本进程没有装配自更新
 	// （单测、或未来某个只要网关的精简构建）。
 	Upgrade UpgradeService
+	// BotID 是平台侧的 AppID。它只用于日志与状态（"哪个 Bot 变了状态"），
+	// 不参与鉴权、不落业务表——数据隔离靠一 Bot 一库，不靠这个字段。
+	BotID string
+	// Secret 是该 Bot 在配置文件里的 AppSecret，也是 /claim 的唯一凭证
+	// （ADR-0008 决策 4）。由装配层从 config.Bot 传入：核心不生成、不派发、
+	// 不打印任何凭据。空串表示这个 Bot 无法认领。
+	Secret string
+	// Jobs 是本 Core 的调度器要用的并行额度池。多 Bot 装配时由调用方建
+	// **一份**注入所有 Core：全局并行 4 不随 Bot 数增长，每个 Bot 同时只跑
+	// 1 个桶（ADR-0008 决策 13）。nil 表示自建一份容量 4 的池、不按 Bot 串行
+	// ——单 Bot 与测试保持原行为。
+	Jobs *JobPool
+	// Quota 是这个 Bot 解析后的主动消息软预算（纯数字，档名在 config 层
+	// 就解析掉了）。nil 表示按 [quota.default] / [active].daily_per_peer
+	// 推导——单 Bot 与测试走这条路。
+	Quota *config.QuotaProfile
+	// Hot 是装配层提供的热操作入口（/bot 系列）。nil 表示本进程没有装配
+	// 热操作（单测、精简构建），此时 /bot 如实回答"未装配"而不是假装成功。
+	//
+	// 它是接口而不是 *instance.Container：core 不能 import 装配层，否则
+	// 两者互为依赖。接口只声明核心需要的最小面（见 BotHotService）。
+	Hot BotHotService
 }
 
 type Core struct {
-	store   *store.DB
-	cfg     *config.Config
-	api     groupInfoSource
-	http    *httpx.Client
-	log     *slog.Logger
+	store *store.DB
+	cfg   *config.Config
+	api   groupInfoSource
+	http  *httpx.Client
+	log   *slog.Logger
+	// bot 是本 Core 服务的那个 Bot，会随每次插件调用进 ctx。
+	bot host.BotInfo
+	// plugins 是共享句柄：Core 不拥有它们的生命周期（见 Options.Plugins）。
 	plugins []host.Plugin
 	trace   *Trace
 	render  host.Renderer
@@ -55,9 +87,8 @@ type Core struct {
 	dispatch *Dispatcher
 	sched    *Scheduler
 
-	claimMu    sync.Mutex
-	claimToken string
-	claimExp   time.Time
+	// claimMu 串行化认领：两个用户同时通过"admins 为空"检查会双双成为 owner。
+	claimMu sync.Mutex
 
 	startedAt time.Time
 	// restart 只缓冲一条：重复的 /reload 直接返回 ErrRestartPending，
@@ -82,6 +113,24 @@ type Core struct {
 	// upgrade 是 /upgrade 的升级能力（见 UpgradeService）。nil 时命令仍然
 	// 被核心消费（否则会落到插件路由），回复"未装配"。
 	upgrade UpgradeService
+
+	// botID 是平台侧 AppID，只用于日志与状态变更。
+	botID string
+
+	// secret 是配置文件里这个 Bot 的 AppSecret，也是 /claim 的唯一凭证。
+	// 它只在认领比对时被读取，绝不出现在日志、轨迹或错误串里。
+	secret string
+
+	// hot 是 /bot 系列的热操作入口（装配层注入，见 Options.Hot）。
+	hot BotHotService
+
+	// stateMu 保护 Bot 状态机的全部可变部分：缓存状态、连续鉴权失败计数、
+	// 按状态的丢弃计数。它们都在 Handle 的热路径上，必须一把锁、不能查库。
+	stateMu    sync.Mutex
+	state      BotState
+	stateKnown bool
+	authFails  int
+	dropped    map[BotState]int64
 }
 
 func New(o Options) (*Core, error) {
@@ -128,14 +177,22 @@ func New(o Options) (*Core, error) {
 		session = sessionBackend{db: o.Store, router: router, log: logger.With("component", "session")}
 		sessionRowsSrc = sessionRows{o.Store}
 	}
-	sched := NewScheduler(o.Store, logger.With("component", "scheduler"))
+	sched := newScheduler(o.Store, logger.With("component", "scheduler"), o.Jobs)
 	// 日预算的切日与 cron 必须同源：都由调度器的 location 决定。
-	sender := NewSender(o.API, logger.With("component", "sender"), activePolicy(o.Config), usage, sched.Location())
+	policy := activePolicy(o.Config, o.Quota)
+	sender := NewSender(o.API, logger.With("component", "sender"), policy, usage, sched.Location())
+	// 超限通知要读"谁是 Bot 所有者"与"今天通知过没有"；nil 的 *store.DB
+	// 装进接口会是个非 nil 接口，所以显式判空。
+	if o.Store != nil {
+		sender.notices = o.Store
+	}
 	sender.trace = trace
 	dispatch := NewDispatcher(router, sender, logger.With("component", "dispatch"), 3*time.Second)
 	dispatch.trace = trace
+	dispatch.bot = o.Bot
 	dispatch.denyReply = o.Config.Permission.DenyReply
 	dispatch.sessions = sessionRowsSrc
+	sched.bot = o.Bot
 
 	// 显式判空再赋给接口：把 nil 的 *api.Client 存进接口会得到一个
 	// 非 nil 接口，后续 `c.api == nil` 就永远不成立。
@@ -144,12 +201,13 @@ func New(o Options) (*Core, error) {
 		info = o.API
 	}
 
-	return &Core{
+	c := &Core{
 		store:     o.Store,
 		cfg:       o.Config,
 		api:       info,
 		http:      o.HTTP,
 		log:       logger,
+		bot:       o.Bot,
 		plugins:   o.Plugins,
 		trace:     trace,
 		render:    o.Renderer,
@@ -162,7 +220,18 @@ func New(o Options) (*Core, error) {
 		restart:   make(chan RestartRequest, 1),
 		gcDone:    make(chan struct{}),
 		upgrade:   o.Upgrade,
-	}, nil
+		botID:     o.BotID,
+		secret:    o.Secret,
+		hot:       o.Hot,
+		dropped:   make(map[BotState]int64, 4),
+	}
+	// 出站成败必须回灌到状态机：连续鉴权类失败是"这个 Bot 的身份已不可用"的
+	// 唯一信号（平台没有状态查询接口）。包一层而不是在三个发送出口各写一次，
+	// 否则漏掉一条通道就等于漏掉那条通道的鉴权失败。
+	if o.API != nil {
+		sender.api = stateTrackingAPI{inner: o.API, notify: c.noteSendResult}
+	}
+	return c, nil
 }
 
 // 插件装配阶段的期限。Init 与 Start 都是一次请求-应答握手，插件不回帧时
@@ -185,7 +254,7 @@ const (
 )
 
 // Start 依次完成：校验插件配置 → 绑定任务执行者 → 插件 Init（注册 Job）
-// → 启动调度 → 启动插件 → 生成认领令牌。
+// → 启动调度 → 启动插件 → 提示认领入口。
 func (c *Core) Start(ctx context.Context) error {
 	// 配置校验整体先于任何 Init：Manifest.config_schema 是「声明即必填」的契约
 	// （评审 §4.1）。放到各自 Init 之前逐个做也不行——先校验先 Init 的话，后面
@@ -208,6 +277,7 @@ func (c *Core) Start(ctx context.Context) error {
 		m := p.Manifest()
 		svc := host.NewService(host.Options{
 			Name:     m.Name,
+			Bot:      c.bot,
 			Config:   host.NewParams(m.Name, c.cfg.Plugin(m.Name)),
 			Sender:   c.sender.ForPlugin(m.Name),
 			KV:       c.store,
@@ -219,8 +289,10 @@ func (c *Core) Start(ctx context.Context) error {
 			Renderer: c.render,
 			Session:  c.session,
 		})
-		if err := withPluginTimeout(ctx, pluginInitTimeout, "初始化", m.Name, func(c context.Context) error {
-			return p.Init(c, svc)
+		// Init 带着 Bot 上下文：共享句柄（一个进程服务 N 个 Bot）靠它知道
+		// 这次初始化属于谁。ctx 里的 Bot 与 svc.Bot() 是同一个值，两条路都通。
+		if err := withPluginTimeout(ctx, pluginInitTimeout, "初始化", m.Name, func(pctx context.Context) error {
+			return p.Init(host.WithBot(pctx, c.bot), svc)
 		}); err != nil {
 			return err
 		}
@@ -232,20 +304,22 @@ func (c *Core) Start(ctx context.Context) error {
 
 	for _, p := range c.plugins {
 		if st, ok := p.(host.Starter); ok {
-			if err := withPluginTimeout(ctx, pluginStartTimeout, "启动", p.Manifest().Name, st.Start); err != nil {
+			if err := withPluginTimeout(ctx, pluginStartTimeout, "启动", p.Manifest().Name, func(pctx context.Context) error {
+				return st.Start(host.WithBot(pctx, c.bot))
+			}); err != nil {
 				return err
 			}
 		}
 	}
 
-	if err := c.ensureOwner(ctx); err != nil {
+	if err := c.announceClaimState(ctx); err != nil {
 		return err
 	}
 	c.logGroupGateState(ctx)
 	c.gcStarted = true
 	go c.gcLoop(ctx)
 
-	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.App.Sandbox)
+	c.log.Info("核心已启动", "plugins", len(c.plugins), "sandbox", c.cfg.SandboxEnabled())
 	return nil
 }
 
@@ -284,7 +358,11 @@ func (c *Core) hostHTTPBackend(domains []string) host.HTTPBackend {
 }
 
 // Shutdown 按固定顺序收尾：停调度 → 等调度收尾 → 等 Dispatcher 排空 →
-// 等 GC 退出 → 关插件。
+// 等 GC 退出。
+//
+// **不关插件**：插件进程是进程级共享的（一套服务 N 个 Bot），一个 Bot 退出
+// 就关掉它等于把别人正在用的插件带走。关闭由装配层在所有 Core 收完之后、
+// 关库之前统一做（internal/instance 的容器，ADR-0008 决策 11）。
 //
 // 返回非 nil 表示有一步没在期限内退出：此时调用方**不能**当成优雅关闭——
 // 关库很可能与在途写并发，必须以非 0 退出，让 systemd 的 Restart=on-failure
@@ -293,9 +371,10 @@ func (c *Core) hostHTTPBackend(domains []string) host.HTTPBackend {
 func (c *Core) Shutdown(ctx context.Context) error {
 	var errs []error
 
-	// 先停调度并等任务收尾，再关插件：任务运行在插件的 JobRunner 里，先 Close
-	// 插件等于让任务往已经关掉的东西里写。Stop 是必需的——/reload 路径下 main
-	// 不会取消 Start 收到的 ctx，只停信号监听；不主动 Stop 就会在关库之后继续起新桶。
+	// 先停调度并等任务收尾，再让装配层关插件：任务运行在插件的 JobRunner 里，
+	// 先 Close 插件等于让任务往已经关掉的东西里写。Stop 是必需的——/reload
+	// 路径下 main 不会取消 Start 收到的 ctx，只停信号监听；不主动 Stop 就会在
+	// 关库之后继续起新桶。
 	if c.sched != nil {
 		c.sched.Stop()
 		if !c.sched.Wait(ctx) {
@@ -315,15 +394,25 @@ func (c *Core) Shutdown(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
-	for i := len(c.plugins) - 1; i >= 0; i-- {
-		p := c.plugins[i]
-		if cl, ok := p.(host.Closer); ok {
-			if err := cl.Close(ctx); err != nil {
-				c.log.Warn("关闭插件失败", "plugin", p.Manifest().Name, "err", err)
-			}
+	return errors.Join(errs...)
+}
+
+// ClosePlugins 逆序关闭一组插件：后启动的先关，失败只 Warn 不中断。
+//
+// 由**装配层**调用（internal/instance 的容器在关停最后一步统一关）：插件进程
+// 是进程级共享的，任何单个 Core 都没有资格关它。这里集中一份实现，避免
+// "关了两遍"或"谁都没关"这类只在异常路径出现的分叉。
+func ClosePlugins(ctx context.Context, log *slog.Logger, plugins []host.Plugin) {
+	for i := len(plugins) - 1; i >= 0; i-- {
+		p := plugins[i]
+		cl, ok := p.(host.Closer)
+		if !ok {
+			continue
+		}
+		if err := cl.Close(ctx); err != nil {
+			log.Warn("关闭插件失败", "plugin", p.Manifest().Name, "err", err)
 		}
 	}
-	return errors.Join(errs...)
 }
 
 // waitGCLoop 等 GC 协程真正退出。它每 10 分钟才醒一次，ctx 取消后能立刻
@@ -341,7 +430,13 @@ func (c *Core) waitGCLoop(ctx context.Context) error {
 	}
 }
 
-// Handle 是接入层唯一入口：群准入 → 去重 → 落库 → 核心保留指令 → 路由。
+// Handle 是接入层唯一入口，顺序固定为：
+//
+//	Bot 闸门 → 去重 → 群准入 → 生命周期 → 权限 → 路由
+//
+// 顺序本身就是需求（ADR-0008 决策 7）：闸门在去重之前，才能保证非 active 的
+// 事件**连幂等表都不进**——pending_claim 的 Bot 收到多少条消息，库里都该是
+// 零行，否则一次认领之前的推送会在表里留下永久噪音。
 func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 	if ev == nil {
 		c.log.Warn("丢弃空事件")
@@ -367,23 +462,18 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		return
 	}
 
-	// 群准入：在去重与落库之前判定，未授权的群不会留下任何业务数据。
-	// 两个例外：
-	//   - Bot 管理员的 /group 指令，否则新群无法在群内自助接入；
-	//   - 群生命周期通知（入群/退群），见下。
-	//
-	// 生命周期通知不走闸门：它们描述的是机器人自身的状态变化，不是群里的消息。
-	// 新群此刻必然还没被放行，走闸门就会被丢掉，结果是"被谁拉进了哪个群"
-	// 永远没人知道。它们照样参与后面的去重。
-	if ev.Notice == host.NoticeNone {
-		if allowed, g, reason := c.groupAccess(ctx, ev); !allowed {
-			if !c.groupControlExempt(ctx, ev, g) {
-				c.trace.GroupDropped(ev, reason)
-				c.log.Debug("群未放行，丢弃事件",
-					"peer", ev.PeerID, "mode", g.Mode, "reason", reason)
-				return
-			}
-		}
+	// 第一道闸门只判 Bot 状态。非 active 的事件在这里终止：不落库、不进幂等表、
+	// 不进权限判定、不到插件。
+	if !c.botGate(ctx, ev) {
+		return
+	}
+
+	// /claim 只对私聊生效（ADR-0008 决策 4/5）。群里的认领必须在**去重之前**
+	// 就拒掉：进了幂等表就等于承认这条消息被处理过，而它连一条消息都不该算。
+	if isClaimCommand(ev) && ev.Scene != host.SceneC2C {
+		c.trace.CoreCommand("/claim")
+		c.replyText(ctx, ev, claimGroupReject)
+		return
 	}
 
 	seen, err := c.store.MarkEventSeen(ctx, ev.ID)
@@ -396,6 +486,35 @@ func (c *Core) Handle(ctx context.Context, ev *host.Event) {
 		c.trace.Duplicate(ev)
 		c.log.Debug("重复事件，忽略", "event", ev.ID)
 		return
+	}
+
+	// 认领是控制动作，不是消息（ADR-0008 决策 5）：拦截点排在去重之后、落库
+	// 之前——平台重投同一条消息只认领一次，secret 也永远不会躺进 messages 表。
+	// 处理完就地终止：不进群准入、不进插件路由。
+	if isClaimCommand(ev) {
+		c.trace.CoreCommand("/claim")
+		c.handleClaim(ctx, ev)
+		return
+	}
+
+	// 群准入：排在去重之后、落库之前。未授权的群不会留下任何业务数据；
+	// 它们会进幂等表，这是刻意的——平台重投同一条未放行事件时不该重复判定。
+	// 两个例外：
+	//   - Bot 管理员的 /group 指令，否则新群无法在群内自助接入；
+	//   - 群生命周期通知（入群/退群），见下。
+	//
+	// 生命周期通知不走群准入：它们描述的是机器人自身的状态变化，不是群里的消息。
+	// 新群此刻必然还没被放行，走准入就会被丢掉，结果是"被谁拉进了哪个群"
+	// 永远没人知道。它们照样受 Bot 闸门约束——Bot 停摆时连"被拉群"都不该记账。
+	if ev.Notice == host.NoticeNone {
+		if allowed, g, reason := c.groupAccess(ctx, ev); !allowed {
+			if !c.groupControlExempt(ctx, ev, g) {
+				c.trace.GroupDropped(ev, reason)
+				c.log.Debug("群未放行，丢弃事件",
+					"peer", ev.PeerID, "mode", g.Mode, "reason", reason)
+				return
+			}
+		}
 	}
 
 	// 生命周期处理必须排在去重之后：平台重投同一条入群事件时，
@@ -445,19 +564,37 @@ func (c *Core) replyText(ctx context.Context, ev *host.Event, text string) {
 
 // PrintRaw 让接入层把平台原始 JSON 回吐到同一条调试轨迹上（[debug].raw=true）。
 // 放在 Core 上而不是 gateway 里，是为了与消息轨迹共用一把锁、输出不交错。
-func (c *Core) PrintRaw(typ string, raw []byte) { c.trace.Raw(typ, raw) }
+//
+// 原文里带着每条消息的 content，所以先抹掉认领凭证：这条路径不经过
+// bodyForTrace，是 /claim 正文仅剩的泄露面。
+func (c *Core) PrintRaw(typ string, raw []byte) { c.trace.Raw(typ, c.redactSecret(raw)) }
 
 // activePolicy 把配置转成 Sender 用的闸门。白名单为空表示谁都不能发主动消息。
-func activePolicy(cfg *config.Config) ActivePolicy {
+//
+// quota 为 nil 时按默认档推导（单 Bot 与测试）；非 nil 时用装配层解析好的
+// 那几个数字，core 因此不需要认识档名。
+func activePolicy(cfg *config.Config, quota *config.QuotaProfile) ActivePolicy {
 	allowed := make(map[string]bool, len(cfg.Active.Plugins))
 	for _, name := range cfg.Active.Plugins {
 		allowed[name] = true
 	}
-	return ActivePolicy{
+	q := cfg.QuotaFor(config.Bot{})
+	if quota != nil {
+		q = *quota
+	}
+	p := ActivePolicy{
 		Enabled:      cfg.ActiveEnabled(),
 		Plugins:      allowed,
-		DailyPerPeer: cfg.Active.DailyPerPeer,
+		DailyPerPeer: q.DailyPerPeer,
+		GroupPerMin:  q.GroupQPM,
+		SinglePerMin: q.SingleQPM,
 	}
+	// [active].daily_per_peer 是全局的临时覆盖（0 = 跟随档位）。它排在档位
+	// 之后：档位是每 Bot 的长期策略，这个键是"今天全局收紧一点"的运维动作。
+	if cfg.Active.DailyPerPeer > 0 {
+		p.DailyPerPeer = cfg.Active.DailyPerPeer
+	}
+	return p
 }
 
 // peerScope 决定一条授权的有效范围：群内授权只在那个群生效，单聊授权全局（仅单聊）。

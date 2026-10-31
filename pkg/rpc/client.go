@@ -16,18 +16,29 @@ import (
 // 会话冲突全在核心侧，插件绕过客户端也绕不过核心（§3.3 的隔离靠位置，
 // 不靠插件自觉）。
 //
+// 一个 HostClient 绑定一个 Bot（Init 时由核心告知）。共享插件进程之后同一个
+// 插件实例会有多个绑定，所以每个方法在执行时都先问 ctx：`host.From(ctx)`
+// 若是另一个绑定的 HostClient，就按它的 Bot 发这条 RPC（ADR-0008 决策 11）。
+// 于是插件把 Init 拿到的 h 存进结构体、在 Handle 里 `h.KV().Set(ctx, …)`，
+// 写进的是**当前事件所属 Bot** 的库——插件无感，而且并发安全：这里没有任何
+// "当前 Bot"的可变字段。
+//
 // 三个访问器是本地值（Plugin / Config / Log），理由见 method.go 的说明。
+// Config 是例外中的例外：它没有 ctx，所以永远返回**本绑定**的配置；要读别的
+// Bot 的配置就用 `host.From(ctx).Config()`。
 type HostClient struct {
 	conn *Conn
 	name string
 	cfg  host.Params
+	bot  host.BotInfo
 	log  *slog.Logger
 }
 
 var _ host.Host = (*HostClient)(nil)
 
-// NewHostClient 构造插件侧宿主视图。name 与 cfg 来自核心的握手（plugin.init）。
-func NewHostClient(c *Conn, name string, cfg map[string]any) *HostClient {
+// NewHostClient 构造插件侧宿主视图。name 与 cfg 来自核心的握手（plugin.init），
+// bot 是这次握手所属的 Bot（plugin.init 的 bot_id + cert_type）。
+func NewHostClient(c *Conn, name string, cfg map[string]any, bot host.BotInfo) *HostClient {
 	if cfg == nil {
 		cfg = map[string]any{}
 	}
@@ -35,12 +46,32 @@ func NewHostClient(c *Conn, name string, cfg map[string]any) *HostClient {
 	if name != "" {
 		logger = logger.With("plugin", name)
 	}
-	return &HostClient{conn: c, name: name, cfg: host.NewParams(name, cfg), log: logger}
+	if !bot.IsZero() {
+		logger = logger.With("bot", bot.AppID)
+	}
+	return &HostClient{conn: c, name: name, cfg: host.NewParams(name, cfg), bot: bot, log: logger}
 }
 
 func (h *HostClient) Plugin() string      { return h.name }
 func (h *HostClient) Config() host.Params { return h.cfg }
 func (h *HostClient) Log() *slog.Logger   { return h.log }
+func (h *HostClient) Bot() host.BotInfo   { return h.bot }
+
+// botFor 解析「这次调用属于哪个 Bot」。
+//
+// ctx 里带着另一个绑定的 HostClient（核心在投递时放进来的当前 Bot 的那份）
+// 就用它；否则用自己创建时的绑定。这是插件无感的关键：存进结构体的 h 在
+// Handle 里被调用时，作用域由调用参数决定，而不是由 h 自身决定。
+//
+// 只认 *HostClient：ctx 里若是别的 Host 实现（进程内插件、测试替身），本方法
+// 没有它的线协议可用，回落到自己的绑定——那是唯一正确的做法，插件本来也只
+// 该在收到的那份 Host 上调。
+func (h *HostClient) botFor(ctx context.Context) host.BotInfo {
+	if o, ok := host.From(ctx).(*HostClient); ok && !o.bot.IsZero() {
+		return o.bot
+	}
+	return h.bot
+}
 
 func (h *HostClient) Sender() host.Sender         { return senderClient{h} }
 func (h *HostClient) KV() host.KV                 { return kvClient{h, ""} }
@@ -62,7 +93,9 @@ func ctxOr(ctx context.Context) context.Context {
 }
 
 func (h *HostClient) IsAdmin(ctx context.Context, id host.Identity) (bool, error) {
-	res, err := h.conn.Call(ctxOr(ctx), MethodHostIsAdmin, isAdminParams{ID: toIdentityDTO(id)})
+	res, err := h.conn.Call(ctxOr(ctx), MethodHostIsAdmin, isAdminParams{
+		Bot: h.botFor(ctx).AppID, ID: toIdentityDTO(id),
+	})
 	if err != nil {
 		return false, err
 	}
@@ -80,7 +113,7 @@ type senderClient struct{ h *HostClient }
 func (s senderClient) Reply(ctx context.Context, ev *host.Event, msg host.Reply) error {
 	dto, body := encodeReply(&msg)
 	_, err := s.h.conn.CallBody(ctxOr(ctx), MethodHostReply, replyParams{
-		Event: toEventDTO(ev), Msg: dto,
+		Bot: s.h.botFor(ctx).AppID, Event: toEventDTO(ev), Msg: dto,
 	}, body)
 	return err
 }
@@ -88,7 +121,7 @@ func (s senderClient) Reply(ctx context.Context, ev *host.Event, msg host.Reply)
 func (s senderClient) SendActive(ctx context.Context, scene host.Scene, peerID string, msg host.Reply) error {
 	dto, body := encodeReply(&msg)
 	_, err := s.h.conn.CallBody(ctxOr(ctx), MethodHostSendActive, sendActiveParams{
-		Scene: string(scene), Peer: peerID, Msg: dto,
+		Bot: s.h.botFor(ctx).AppID, Scene: string(scene), Peer: peerID, Msg: dto,
 	}, body)
 	return err
 }
@@ -103,7 +136,9 @@ type kvClient struct {
 }
 
 func (k kvClient) Get(ctx context.Context, key string) ([]byte, bool, error) {
-	res, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVGet, kvParams{Peer: k.peer, Key: key})
+	res, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVGet, kvParams{
+		Bot: k.h.botFor(ctx).AppID, Peer: k.peer, Key: key,
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -116,13 +151,15 @@ func (k kvClient) Get(ctx context.Context, key string) ([]byte, bool, error) {
 
 func (k kvClient) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
 	_, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVSet, kvSetParams{
-		Peer: k.peer, Key: key, Value: val, TTL: int64(ttl),
+		Bot: k.h.botFor(ctx).AppID, Peer: k.peer, Key: key, Value: val, TTL: int64(ttl),
 	})
 	return err
 }
 
 func (k kvClient) Delete(ctx context.Context, key string) error {
-	_, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVDelete, kvParams{Peer: k.peer, Key: key})
+	_, err := k.h.conn.Call(ctxOr(ctx), MethodHostKVDelete, kvParams{
+		Bot: k.h.botFor(ctx).AppID, Peer: k.peer, Key: key,
+	})
 	return err
 }
 
@@ -131,7 +168,9 @@ func (k kvClient) Delete(ctx context.Context, key string) error {
 type queryClient struct{ h *HostClient }
 
 func (q queryClient) Query(ctx context.Context, query string, args ...any) ([]host.Row, error) {
-	res, err := q.h.conn.Call(ctxOr(ctx), MethodHostQuery, queryParams{Query: query, Args: args})
+	res, err := q.h.conn.Call(ctxOr(ctx), MethodHostQuery, queryParams{
+		Bot: q.h.botFor(ctx).AppID, Query: query, Args: args,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +198,7 @@ func (c httpClient) WithTimeout(d time.Duration) host.HTTP {
 }
 
 func (c httpClient) GetJSON(ctx context.Context, url string, out any) error {
-	return c.call(ctx, MethodHostHTTPGet, httpParams{URL: url, Timeout: int64(c.timeout)}, out)
+	return c.call(ctx, MethodHostHTTPGet, c.params(ctx, url), out)
 }
 
 func (c httpClient) PostJSON(ctx context.Context, url string, in, out any) error {
@@ -167,15 +206,27 @@ func (c httpClient) PostJSON(ctx context.Context, url string, in, out any) error
 	if err != nil {
 		return err
 	}
-	return c.call(ctx, MethodHostHTTPPost, httpParams{URL: url, In: raw, Timeout: int64(c.timeout)}, out)
+	p := c.params(ctx, url)
+	p.In = raw
+	return c.call(ctx, MethodHostHTTPPost, p, out)
 }
 
 func (c httpClient) GetJSONWithHeader(ctx context.Context, url string, header map[string]string, out any) error {
-	return c.call(ctx, MethodHostHTTPGetHeader, httpParams{URL: url, Header: header, Timeout: int64(c.timeout)}, out)
+	p := c.params(ctx, url)
+	p.Header = header
+	return c.call(ctx, MethodHostHTTPGetHeader, p, out)
 }
 
 func (c httpClient) GetJSONOnce(ctx context.Context, url string, header map[string]string, out any) error {
-	return c.call(ctx, MethodHostHTTPGetOnce, httpParams{URL: url, Header: header, Timeout: int64(c.timeout)}, out)
+	p := c.params(ctx, url)
+	p.Header = header
+	return c.call(ctx, MethodHostHTTPGetOnce, p, out)
+}
+
+// params 把「谁 + 打哪 + 超时」这三件每次调用都要带的信息装好。四个方法
+// 的公共部分各写一遍只会让漏填 Bot 的概率变成四倍。
+func (c httpClient) params(ctx context.Context, url string) httpParams {
+	return httpParams{Bot: c.h.botFor(ctx).AppID, URL: url, Timeout: int64(c.timeout)}
 }
 
 // call 把上游正文原样带回来再解进 out，与进程内的路径逐字一致
@@ -203,10 +254,15 @@ type schedClient struct{ h *HostClient }
 
 // Register 没有 ctx（契约如此）。给个上限而不是 Background：核心卡住时
 // 插件该在启动期就失败，而不是永远停在 Init 里。
+//
+// 没有 ctx 也就没有"当前 Bot"：这里用本绑定的 Bot——这正是 Init 里注册任务
+// 的那个 Bot，语义正确。
 func (s schedClient) Register(spec host.JobSpec) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := s.h.conn.Call(ctx, MethodHostSchedule, scheduleParams{Spec: toJobSpecDTO(spec)})
+	_, err := s.h.conn.Call(ctx, MethodHostSchedule, scheduleParams{
+		Bot: s.h.bot.AppID, Spec: toJobSpecDTO(spec),
+	})
 	return err
 }
 
@@ -215,7 +271,7 @@ func (s schedClient) Register(spec host.JobSpec) error {
 type adminDirClient struct{ h *HostClient }
 
 func (a adminDirClient) Targets(ctx context.Context) ([]host.AdminTarget, error) {
-	res, err := a.h.conn.Call(ctxOr(ctx), MethodHostAdminTargets, nil)
+	res, err := a.h.conn.Call(ctxOr(ctx), MethodHostAdminTargets, botParams{Bot: a.h.botFor(ctx).AppID})
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +296,9 @@ type rendererClient struct{ h *HostClient }
 // Markdown 的返回值可能带 1–3 MB 的 PNG，它走应答帧的正文槽
 // （单帧往返、不 base64，见 frame.go）。
 func (r rendererClient) Markdown(ctx context.Context, src string) (host.Image, error) {
-	res, err := r.h.conn.Call(ctxOr(ctx), MethodHostRender, renderParams{Src: src})
+	res, err := r.h.conn.Call(ctxOr(ctx), MethodHostRender, renderParams{
+		Bot: r.h.botFor(ctx).AppID, Src: src,
+	})
 	if err != nil {
 		return host.Image{}, err
 	}
@@ -257,7 +315,7 @@ type sessionClient struct{ h *HostClient }
 
 func (s sessionClient) Await(ctx context.Context, ev *host.Event, state []byte, ttl time.Duration) error {
 	_, err := s.h.conn.Call(ctxOr(ctx), MethodHostSessionAwait, sessionAwaitParams{
-		Event: toEventDTO(ev), State: state, TTL: int64(ttl),
+		Bot: s.h.botFor(ctx).AppID, Event: toEventDTO(ev), State: state, TTL: int64(ttl),
 	})
 	return err
 }

@@ -36,7 +36,7 @@ func newIntentCore(t *testing.T, bits uint64, intents ...string) (*Core, *bytes.
 	c, err := New(Options{
 		Store:   db,
 		Log:     logger,
-		Config:  &config.Config{Bot: config.Bot{Intents: bits}},
+		Config:  &config.Config{Bot: config.BotOptions{Intents: bits}},
 		Plugins: []host.Plugin{p},
 	})
 	if err != nil {

@@ -294,6 +294,7 @@ func TestResetCodeBoundToActorPeerLevel(t *testing.T) {
 	c, f := newAdminCore(t)
 	seedAdmin(t, c, "owner-1", "", store.RoleOwner)
 	seedAdmin(t, c, "admin-2", "", store.RoleAdmin)
+	seedCoreOwners(c, "owner-1")
 	ctx := context.Background()
 
 	resetCall(t, c, f, ctx, "/reset data", "owner-1", host.SceneGroup, "g1")
@@ -340,6 +341,7 @@ func TestResetCooldownBlocksRepeat(t *testing.T) {
 func TestResetAllRequiresPhrase(t *testing.T) {
 	c, f := newAdminCore(t)
 	seedAdmin(t, c, "owner-1", "", store.RoleOwner)
+	seedCoreOwners(c, "owner-1")
 	ctx := context.Background()
 	if err := c.store.SetGroupMode(ctx, "g1", store.GroupModeAllow); err != nil {
 		t.Fatal(err)
@@ -385,8 +387,15 @@ func TestResetAllAdminRejected(t *testing.T) {
 	seedAdmin(t, c, "admin-1", "", store.RoleAdmin)
 
 	got := resetCall(t, c, f, context.Background(), "/reset all", "admin-1", host.SceneC2C, "admin-1")
-	if !strings.Contains(got, "仅 Bot 所有者") {
-		t.Fatalf("R3 应仅限所有者，实际: %q", got)
+	if !strings.Contains(got, "仅 Core 所有者") {
+		t.Fatalf("R3 是进程级操作，Bot 管理员应被拒绝，实际: %q", got)
+	}
+
+	// Bot 所有者也不够：R3 清的是整个 Bot，授权来源是 [core].owners。
+	seedAdmin(t, c, "bot-owner", "", store.RoleOwner)
+	got = resetCall(t, c, f, context.Background(), "/reset all", "bot-owner", host.SceneC2C, "bot-owner")
+	if !strings.Contains(got, "仅 Core 所有者") {
+		t.Fatalf("R3 不该开放给 Bot 所有者，实际: %q", got)
 	}
 }
 
@@ -440,6 +449,7 @@ func TestResetDataForExplicitGroup(t *testing.T) {
 func TestResetGlobalLevelRejectsTarget(t *testing.T) {
 	c, f := newAdminCore(t)
 	seedAdmin(t, c, "owner-1", "", store.RoleOwner)
+	seedCoreOwners(c, "owner-1")
 
 	const gid = "0123456789abcdef0123456789abcdef"
 	got := resetCall(t, c, f, context.Background(), "/reset all "+gid, "owner-1", host.SceneC2C, "owner-1")

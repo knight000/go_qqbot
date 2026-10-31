@@ -9,6 +9,10 @@ import (
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
+// testBot 是用例里唯一的 Bot。共享插件进程之后每个 per-Bot 调用都要带它，
+// 单 Bot 用例用一个固定值即可。
+var testBot = host.BotInfo{AppID: "bot-test", CertType: "personal"}
+
 // fakePlugin 是驱动 pluginServer 的最小实现：只覆盖三条主路径
 // （正常初始化、Init panic、Handle 卡住），不模拟真实插件的业务。
 type fakePlugin struct {
@@ -59,12 +63,12 @@ func TestInitPanicClosesGate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := a.CallInit(ctx, "boom", nil); !errors.Is(err, ErrHandlerPanic) {
+	if err := a.CallInit(ctx, testBot, "boom", nil); !errors.Is(err, ErrHandlerPanic) {
 		t.Fatalf("CallInit err = %v，期望 ErrHandlerPanic", err)
 	}
 
 	start := time.Now()
-	_, err := a.CallHandle(ctx, &host.Event{ID: "e1"})
+	_, err := a.CallHandle(ctx, testBot, &host.Event{ID: "e1"})
 	elapsed := time.Since(start)
 	if !errors.Is(err, ErrHandlerPanic) {
 		t.Fatalf("CallHandle err = %v，期望 ErrHandlerPanic（而不是超时）", err)
@@ -72,6 +76,18 @@ func TestInitPanicClosesGate(t *testing.T) {
 	// 走 gate 的路径应当立刻返回；真等满 3 s 说明 gate 没关。
 	if elapsed > time.Second {
 		t.Fatalf("CallHandle 花了 %s，gate 没在 Init 失败后关闭", elapsed)
+	}
+}
+
+// initBot 让插件为 testBot 完成一次初始化。
+//
+// 共享插件进程之后 handle / start / run_job 都是 per-Bot 的，投递前必须先
+// init（核心的启动顺序保证了这一点）；没 init 就投递是协议错误，会立刻报错
+// 而不是等超时。
+func initBot(t *testing.T, c *Conn) {
+	t.Helper()
+	if err := c.CallInit(context.Background(), testBot, "slow", nil); err != nil {
+		t.Fatalf("CallInit: %v", err)
 	}
 }
 
@@ -85,9 +101,10 @@ func TestCallHandleDefaultTimeout(t *testing.T) {
 	})
 	// 注册在 newPair 的清理之后 → LIFO 先跑：先放行 handler，再断连接。
 	t.Cleanup(func() { close(hang) })
+	initBot(t, a)
 
 	start := time.Now()
-	_, err := a.CallHandle(context.Background(), &host.Event{ID: "slow"})
+	_, err := a.CallHandle(context.Background(), testBot, &host.Event{ID: "slow"})
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -112,11 +129,12 @@ func TestCallHandleKeepsCallerDeadline(t *testing.T) {
 		hang:     hang,
 	})
 	t.Cleanup(func() { close(hang) })
+	initBot(t, a)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := a.CallHandle(ctx, &host.Event{ID: "slow"})
+	_, err := a.CallHandle(ctx, testBot, &host.Event{ID: "slow"})
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.DeadlineExceeded) {

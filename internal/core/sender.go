@@ -23,12 +23,28 @@ import (
 // 返回 *host.Reply），没有插件会拿到它，唯一的消费方是核心自身（#36）。
 var ErrPassiveExhausted = errors.New("被动回复次数已用尽")
 
-// ActivePolicy 是主动消息的本地闸门：总开关 + 插件白名单 + 每 peer 每日预算。
+// ActivePolicy 是主动消息的本地闸门：总开关 + 插件白名单 + 软预算。
 // 平台侧没有额度查询接口，只能靠本地记账（见 README「频控边界」）。
+//
+// 三个额度都是**数字**：档名（`[quota.<档名>]`）由装配层解析，核心不认它
+// ——否则 core 就得知道配置表的形状，而档位是运维数据（#67）。
 type ActivePolicy struct {
 	Enabled      bool
 	Plugins      map[string]bool
 	DailyPerPeer int
+	// GroupPerMin / SinglePerMin 是 Bot 级每分钟上限（按场景，跨会话合计）。
+	// 0 或负数表示这一维不限：单测与"仅按天记账"的旧用法保持原行为，
+	// 真实装配永远由配置填上具体数字。
+	GroupPerMin  int
+	SinglePerMin int
+}
+
+// perMinuteLimit 返回该场景的每分钟上限；<=0 表示不限。
+func (p ActivePolicy) perMinuteLimit(scene host.Scene) int {
+	if scene == host.SceneGroup {
+		return p.GroupPerMin
+	}
+	return p.SinglePerMin
 }
 
 // messageAPI 抽出来是为了让频控与发图逻辑可单测（fake 掉 HTTP）。
@@ -49,6 +65,23 @@ type activeUsageStore interface {
 	TakeActiveBudget(ctx context.Context, key store.ActiveUsageKey, limit int) (bool, error)
 	// RefundActiveBudget 归还一格：只在平台明确拒绝（err_code 非 0）时调用。
 	RefundActiveBudget(ctx context.Context, key store.ActiveUsageKey) error
+	// TakeActiveRate 原子地占一格**这一分钟**的额度；false 表示这一分钟已满。
+	// 与日额度同一套原子性要求（#67）：单独一张 active_rate 表，
+	// 不把分钟键塞进 active_usage。
+	TakeActiveRate(ctx context.Context, key store.ActiveRateKey, limit int) (bool, error)
+	// RefundActiveRate 归还一格分钟额度，调用时机与 RefundActiveBudget 一致。
+	RefundActiveRate(ctx context.Context, key store.ActiveRateKey) error
+}
+
+// quotaNoticeStore 是"当天首次超限通知所有者"需要的两件库能力。
+//
+// 单独一个接口而不是塞进 activeUsageStore：账本与通知是两件事，测试里
+// 常常只关心前者（nil 表示不通知，单测与精简构建都走这条路）。
+type quotaNoticeStore interface {
+	// AdminTargets 给出可以私聊到的管理员；通知只取 role=owner 的那一条。
+	AdminTargets(ctx context.Context) ([]store.AdminTarget, error)
+	// ClaimStateValue 原子地认领一个"当期值"；true 表示这是本期的第一次。
+	ClaimStateValue(ctx context.Context, key, value string) (bool, error)
 }
 
 // Sender 负责 passive/active 两类出站。
@@ -81,6 +114,9 @@ type Sender struct {
 	// 而每撞一次都会把惩罚窗口续期、再烧一格域名桶的令牌、甚至挤掉同域的
 	// 群名刷新。冷却期内直接返回 host.ErrRateLimited、不出网，比"退避后重试"正确。
 	cooldowns map[string]time.Time
+	// notices 提供超限通知需要的读写（谁是所有者、今天是否已通知）。
+	// nil 表示不通知：单测与精简构建不需要这两张表。
+	notices quotaNoticeStore
 }
 
 type passiveWindow struct {
@@ -568,17 +604,35 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 		return fmt.Errorf("%w（额度记账失败，按保守策略拒发；%s %s）: %v", host.ErrActiveQuota, scene, peerID, err)
 	}
 	if !ok {
-		return fmt.Errorf("%w（%s %s）", host.ErrActiveQuota, scene, peerID)
+		return s.quotaExceeded(ctx, scene, peerID, "当日每会话额度已用尽")
+	}
+
+	// 分钟维度（#67）：平台频控是 Bot 级的（群 60 qpm、单聊 10 qps），
+	// 与哪位收件人无关，所以这一格的 key 只有 (分钟, 场景)。它和日额度
+	// 一样是库里的一次原子 upsert——重启不清零，并发也不会超发。
+	//
+	// 顺序是"先日额度、后分钟"：日额度更稀缺，它已满时连分钟格都不必占。
+	// 反过来则要为每一条被日额度挡下的消息归还一格分钟额度。
+	rateKey, ok, err := s.takeActiveRate(ctx, scene)
+	if err != nil {
+		// 这一条还没出网，占掉的日额度要还回去，否则账本坏一次就白扣一格。
+		s.refundDaily(ctx, key, scene, peerID)
+		return fmt.Errorf("%w（每分钟额度记账失败，按保守策略拒发；%s %s）: %v", host.ErrActiveQuota, scene, peerID, err)
+	}
+	if !ok {
+		s.refundDaily(ctx, key, scene, peerID)
+		return s.quotaExceeded(ctx, scene, peerID,
+			fmt.Sprintf("每分钟额度已用尽（%s 上限 %d 条/分钟）", scene, s.active.perMinuteLimit(scene)))
 	}
 
 	body, err := s.bodyFor(ctx, scene, peerID, msg)
 	if err != nil {
-		// 上传被平台拒绝时消息还没发出去，那一格预算不该记在账上。
-		s.refundActiveBudgetOnBusinessError(ctx, key, scene, peerID, err)
+		// 上传被平台拒绝时消息还没发出去，那两格预算都不该记在账上。
+		s.refundActiveOnBusinessError(ctx, key, rateKey, scene, peerID, err)
 		return err
 	}
 	if err := s.api.SendMessage(ctx, string(scene), peerID, body); err != nil {
-		s.refundActiveBudgetOnBusinessError(ctx, key, scene, peerID, err)
+		s.refundActiveOnBusinessError(ctx, key, rateKey, scene, peerID, err)
 		if httpx.IsStatus(err, 429) {
 			wait := httpx.RetryAfter(err)
 			s.startCooldown(scene, peerID, wait)
@@ -589,23 +643,35 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 	return nil
 }
 
-// refundActiveBudgetOnBusinessError 在平台明确拒绝时归还一格主动消息日预算。
+// refundActiveOnBusinessError 在平台明确拒绝时归还两格主动消息预算
+// （日额度与分钟额度各一格）。
 //
 // 只认业务错误：网络失败/超时时消息可能已经发出，归还等于超发。这是既定
-// 取舍——宁可少发一条，也不能把平台每天 1000 条的配额当成无限量烧掉。
+// 取舍——宁可少发一条，也不能把平台的配额当成无限量烧掉。
 //
-// key 必须原样来自 takeActiveBudget，不能在这里重算：占格在 23:59、归还
-// 在次日 00:01 时，重算出来的 day 已经是新的一天，那一格会还进一个
-// used==0 的桶里（被 RefundActiveBudget 的 used>0 守卫兜成 no-op），
-// 旧桶则永远记着这笔不存在的消耗。
+// 两个 key 必须原样来自 takeActiveBudget / takeActiveRate，不能在这里重算：
+// 占格在 23:59、归还在次日 00:01 时，重算出来的 day 已经是新的一天，那一格
+// 会还进一个 used==0 的桶里（被 used>0 守卫兜成 no-op），旧桶则永远记着
+// 这笔不存在的消耗。分钟桶同理（跨分钟比跨天常见得多）。
 //
 // 归还本身失败只告警：额度账本坏了是运维问题，不该让一次发送错误再叠一层
 // 无从处理的错误；但必须留日志，否则"账多了/少了"永远查不到原因。
-func (s *Sender) refundActiveBudgetOnBusinessError(ctx context.Context, key store.ActiveUsageKey, scene host.Scene, peerID string, cause error) {
+func (s *Sender) refundActiveOnBusinessError(ctx context.Context, key store.ActiveUsageKey, rateKey store.ActiveRateKey, scene host.Scene, peerID string, cause error) {
 	var be *api.BusinessError
 	if !errors.As(cause, &be) {
 		return
 	}
+	s.refundDaily(ctx, key, scene, peerID)
+	if s.active.perMinuteLimit(scene) <= 0 || s.usage == nil {
+		return
+	}
+	if err := s.usage.RefundActiveRate(ctx, rateKey); err != nil {
+		s.log.Warn("归还主动消息分钟额度失败", "scene", scene, "peer", peerID, "err", err)
+	}
+}
+
+// refundDaily 归还一格日额度（未启用日额度或账本缺失时是 no-op）。
+func (s *Sender) refundDaily(ctx context.Context, key store.ActiveUsageKey, scene host.Scene, peerID string) {
 	if s.active.DailyPerPeer <= 0 || s.usage == nil {
 		return
 	}
@@ -643,4 +709,111 @@ func (s *Sender) takeActiveBudget(ctx context.Context, scene host.Scene, peerID 
 	key := s.usageKey(scene, peerID)
 	ok, err := s.usage.TakeActiveBudget(ctx, key, s.active.DailyPerPeer)
 	return key, ok, err
+}
+
+// rateMinuteFormat 是分钟桶的键格式。与日额度同源（调度时区）：
+// 换一个格式化位置就等于换一套切桶口径。
+const rateMinuteFormat = "2006-01-02T15:04"
+
+// rateKey 是分钟额度的账本坐标。peer 不参与：平台频控是 Bot 级的。
+func (s *Sender) rateKey(scene host.Scene) store.ActiveRateKey {
+	return store.ActiveRateKey{
+		Minute: s.now().In(s.loc).Format(rateMinuteFormat),
+		Scene:  string(scene),
+	}
+}
+
+// takeActiveRate 占一格分钟额度；ok=false 表示这一分钟已满。
+// 返回的 key 是这次占格用的坐标，归还时必须原样带回来。
+func (s *Sender) takeActiveRate(ctx context.Context, scene host.Scene) (store.ActiveRateKey, bool, error) {
+	limit := s.active.perMinuteLimit(scene)
+	if limit <= 0 {
+		return store.ActiveRateKey{}, true, nil
+	}
+	if s.usage == nil {
+		// 与日额度同一条判据：没有账本就不发，默认值不是"放行"。
+		return store.ActiveRateKey{}, false, errors.New("未配置主动消息分钟额度账本")
+	}
+	key := s.rateKey(scene)
+	ok, err := s.usage.TakeActiveRate(ctx, key, limit)
+	return key, ok, err
+}
+
+// quotaExceeded 统一处理"被软预算挡下"：通知所有者（当天首次），再返回
+// 可判定的错误。
+//
+// 复用 host.ErrActiveQuota 而不是新加哨兵：插件对"额度类失败"的处置完全
+// 相同（本轮推送到此为止），区分每分钟/每日只在排障时需要，写进错误串即可。
+// 每加一个哨兵都要抬契约版本、让所有插件重新审视 if/else 链，收益不抵成本。
+func (s *Sender) quotaExceeded(ctx context.Context, scene host.Scene, peerID, reason string) error {
+	s.notifyQuotaExceeded(ctx, scene, peerID, reason)
+	return fmt.Errorf("%w（%s %s：%s）", host.ErrActiveQuota, scene, peerID, reason)
+}
+
+// quotaNoticeStateKey 记录"今天已经通知过超限"。
+//
+// 落 bot_state 而不是内存：进程重启后当天不该重发同一条提醒；跨天自然失效
+// （值就是日期，ClaimStateValue 只在值变化时成功）。
+const quotaNoticeStateKey = "active_quota_notice_day"
+
+// notifyQuotaExceeded 当天首次超限时私聊 Bot 所有者一条，之后不再重复。
+//
+// 三条不变量：
+//   - 通知本身**不走软预算**（正是预算用尽才要通知，走预算就永远发不出去）；
+//   - 但仍受 429 冷却约束——平台罚的是会话，硬挤只会把惩罚窗口续期；
+//   - 对方不可达只 warn：通知是尽力而为，不能反过来影响发送路径的错误语义。
+//
+// 先解析收件人再认领当天的名额：没有可用所有者时不该把"今天已通知"记上，
+// 否则当天即使后来认领了 Bot 也永远收不到这条提醒。
+func (s *Sender) notifyQuotaExceeded(ctx context.Context, scene host.Scene, peerID, reason string) {
+	if s.notices == nil {
+		return
+	}
+	targets, err := s.notices.AdminTargets(ctx)
+	if err != nil {
+		s.log.Warn("查询 Bot 所有者失败，超限通知未发出", "err", err)
+		return
+	}
+	owner := ""
+	for _, t := range targets {
+		if t.Role == store.RoleOwner && t.C2COpenID != "" {
+			owner = t.C2COpenID
+			break
+		}
+	}
+	if owner == "" {
+		s.log.Warn("主动消息超出软预算，但没有可用的 Bot 所有者单聊地址，通知未发出",
+			"scene", scene, "peer", peerID, "reason", reason)
+		return
+	}
+
+	day := s.now().In(s.loc).Format("2006-01-02")
+	first, err := s.notices.ClaimStateValue(ctx, quotaNoticeStateKey, day)
+	if err != nil {
+		s.log.Warn("记录超限通知日期失败", "err", err)
+		return
+	}
+	if !first {
+		return // 今天已经通知过
+	}
+
+	if wait := s.coolingDown(host.SceneC2C, owner); wait > 0 {
+		s.log.Warn("平台限流冷却中，超限通知暂不发送",
+			"owner", owner, "wait", wait.Round(time.Second).String())
+		return
+	}
+
+	nctx, cancel := context.WithTimeout(ctx, replyTextTimeout)
+	defer cancel()
+	text := fmt.Sprintf("主动消息超出本地软预算（%s）：%s %s。今天不再自动发送主动消息，"+
+		"被动回复不受影响；如需放宽请调整 [quota] 档位。", reason, scene, peerID)
+	if err := s.api.SendMessage(nctx, string(host.SceneC2C), owner, api.MessageBody{Content: text}); err != nil {
+		if httpx.IsStatus(err, 429) {
+			s.startCooldown(host.SceneC2C, owner, httpx.RetryAfter(err))
+		}
+		s.log.Warn("主动消息超限通知未送达", "owner", owner, "err", err)
+		return
+	}
+	s.log.Warn("主动消息超出软预算并已通知 Bot 所有者",
+		"scene", scene, "peer", peerID, "reason", reason)
 }
