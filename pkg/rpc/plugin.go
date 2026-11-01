@@ -40,6 +40,8 @@ func ServePlugin(c *Conn, p host.Plugin) error {
 		caps: capabilitiesOf(p),
 		bots: make(map[string]*botState),
 	}
+	// Start 用的进程级 ctx：见字段注释。这里不能复用任何请求的 ctx。
+	s.life, s.cancelLife = context.WithCancel(context.Background())
 
 	methods := map[string]Handler{
 		MethodPluginManifest: s.manifest,
@@ -114,6 +116,17 @@ type pluginServer struct {
 	// closing 在进程级 close 到达后置位：此后再来的 Init 一律拒绝。
 	// 它挡的不是"重复 Init"，而是"插件已在收尾，核心还在装配新 Bot"。
 	closing bool
+
+	// life 是交给 `Start` 的 ctx，**随进程收摊取消**，与任何一次 RPC 无关。
+	//
+	// 为什么不能直接用请求的 ctx：Conn.dispatch 给带期限的请求建了
+	// WithDeadline 并在返回时 cancel，于是「Start 里 go p.run(ctx)」的协程
+	// 会在 plugin.start 应答的同时被掐死——症状是插件一条日志都没有，通知、
+	// 巡检、定时推送统统静默消失（bootnotice 的启动通知就是这样消失的）。
+	// 契约里 Start 存在的意义就是"登记后台协程"，给它一个活不过一次调用的 ctx
+	// 等于让这个接口无法使用。
+	life       context.Context
+	cancelLife context.CancelFunc
 }
 
 // botState 是一个 Bot 在插件侧的全部状态。
@@ -299,6 +312,9 @@ func (s *pluginServer) handle(ctx context.Context, req Request) (Response, error
 
 // start 是 per-Bot 的：后台协程必须按 Bot 各起一个，插件不能用包级变量存
 // "当前 Bot"。入参里的 CertType 让核心侧不必再问一次。
+//
+// ctx 用的是 s.life 而不是请求的 ctx：后者在应答的同时就被 cancel 了（见字段
+// 注释），交给 Start 会让刚起的协程立刻退出。
 func (s *pluginServer) start(ctx context.Context, req Request) (Response, error) {
 	var p botParams
 	if err := decodeJSON(req.Params, &p); err != nil {
@@ -312,7 +328,7 @@ func (s *pluginServer) start(ctx context.Context, req Request) (Response, error)
 	if err != nil {
 		return Response{}, err
 	}
-	hctx := host.WithHost(ctx, s.hostFor(bs, botID, p.CertType))
+	hctx := host.WithHost(s.life, s.hostFor(bs, botID, p.CertType))
 	return Response{}, s.caps.starter.Start(hctx)
 }
 
@@ -334,6 +350,9 @@ func (s *pluginServer) close(ctx context.Context, _ Request) (Response, error) {
 			return Response{}, ctx.Err()
 		}
 	}
+	// 先掐 Start 起的协程，再调 Close：反过来，一个"等后台协程退出"的实现
+	// 会把自己等死（那个协程等的正是它自己要等的 ctx）。
+	s.cancelLife()
 	return Response{}, s.caps.closer.Close(ctx)
 }
 
