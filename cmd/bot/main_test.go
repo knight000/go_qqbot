@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/knight000/go_qqbot/internal/buildinfo"
 	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/core"
 	"github.com/knight000/go_qqbot/pkg/host"
@@ -228,4 +230,30 @@ path = "./data/qqbot.db"
 		t.Fatal(err)
 	}
 	return path
+}
+
+// `qqbot version` 必须在加载配置之前处理（#70）：加子命令之前它会被当成
+// "用默认配置启动"，报的是「配置文件 config/config.local.toml 不存在」——
+// 而查版本恰恰是最该在配置坏掉时也能用的命令。
+func TestSubcommandVersion(t *testing.T) {
+	for _, arg := range []string{"version", "-version", "--version"} {
+		var out bytes.Buffer
+		code, ok := subcommand([]string{arg}, &out, &out)
+		if !ok {
+			t.Fatalf("%q 应被当成子命令", arg)
+		}
+		if code != 0 {
+			t.Errorf("%q 退出码 = %d want 0", arg, code)
+		}
+		if got, want := strings.TrimSpace(out.String()), buildinfo.Get().String(); got != want {
+			t.Errorf("%q 输出 = %q want %q", arg, got, want)
+		}
+	}
+
+	// 其余参数一律落回正常启动：子命令分派不能把 -c 这类启动参数吃掉。
+	for _, args := range [][]string{nil, {"-c", "x.toml"}, {"init2"}, {"-debug"}} {
+		if _, ok := subcommand(args, io.Discard, io.Discard); ok {
+			t.Errorf("%v 不该被当成子命令", args)
+		}
+	}
 }

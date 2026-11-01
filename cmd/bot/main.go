@@ -18,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -59,9 +60,10 @@ const shutdownTimeout = 10 * time.Second
 
 func main() {
 	// 子命令在 flag.Parse 之前分派：`qqbot init -c x` 的 -c 属于 init，
-	// 不能落到启动用的 flag 集合里。不带子命令时完全是原来的启动行为。
-	if len(os.Args) > 1 && os.Args[1] == "init" {
-		os.Exit(runInit(os.Args[2:], os.Stdout, os.Stderr))
+	// 不能落到启动用的 flag 集合里；`qqbot version` 更不能等——它会被当成
+	// "用默认配置启动"，报一句"配置文件不存在"（#70）。
+	if code, ok := subcommand(os.Args[1:], os.Stdout, os.Stderr); ok {
+		os.Exit(code)
 	}
 
 	req, err := run()
@@ -96,15 +98,55 @@ func main() {
 	// /upgrade apply 的换盘就发生在这里：网关已断、session 已落盘、库已关。
 	// 失败时 Commit 会把旧二进制换回来（进程内回滚），我们照样重启——
 	// 重启旧版本总好过让机器人停在这里等人工介入。
+	reason := restartReason(req)
 	if req.Plan != nil {
 		if err := upgrade.Commit(req.Plan, slog.Default()); err != nil {
 			fmt.Fprintln(os.Stderr, "换盘失败，继续重启旧版本:", err)
+			// 换盘没成，落到的还是旧版本：别让新进程的日志说"升级换盘"。
+			reason = buildinfo.RestartRollback
 		}
 	}
-	if err := restartSelf(exe); err != nil {
+	if err := restartSelf(exe, reason); err != nil {
 		fmt.Fprintln(os.Stderr, "重启失败:", err)
 		os.Exit(1)
 	}
+}
+
+// restartReason 把一条重启请求翻译成写进环境变量的原因。
+//
+// 判据是 Plan 而不是文本：Plan 非 nil 就是"这次顺带换盘"（ADR-0006 决策 8），
+// 与 req.Reason 里 owner 随手写的说明无关。
+func restartReason(req *core.RestartRequest) string {
+	if req.Plan != nil {
+		return buildinfo.RestartUpgrade
+	}
+	return buildinfo.RestartReload
+}
+
+// subcommand 分派启动前的子命令。ok=false 表示没有子命令，走正常启动。
+//
+// 返回退出码而不是自己 os.Exit：测试要能断言"版本行打到 stdout、退出码 0"。
+func subcommand(args []string, stdout, stderr io.Writer) (code int, ok bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	switch args[0] {
+	case "init":
+		return runInit(args[1:], stdout, stderr), true
+	case "version", "-version", "--version":
+		return runVersion(stdout), true
+	}
+	return 0, false
+}
+
+// runVersion 打印一行版本标识。
+//
+// 为什么必须有它：查"现在跑的是哪个版本"是升级后的第一步，而 `qqbot version`
+// 在加这个子命令之前会被当成"用默认配置启动"，报的是配置文件不存在（#70）。
+// 输出只有 Version + 短 commit（`0.1.1 4634a818`），方便脚本取第一个字段比对。
+func runVersion(stdout io.Writer) int {
+	fmt.Fprintln(stdout, buildinfo.Get().String())
+	return 0
 }
 
 // run 正常退出时返回 nil；返回非 nil 表示需要由 main 重新执行自身（/reload）。
@@ -165,7 +207,8 @@ func run() (*core.RestartRequest, error) {
 	} else if rolledBack {
 		// Unix 上 exec 成功不返回；Windows 上这是"拉起子进程"，
 		// 本进程随后退出（见 restartSelf 的注释）。
-		if err := restartSelf(exePath); err != nil {
+		// 原因是 rollback：新进程起来时日志要说清"这是回滚，不是谁按了 /reload"。
+		if err := restartSelf(exePath, buildinfo.RestartRollback); err != nil {
 			return nil, fmt.Errorf("回滚后重启失败: %w", err)
 		}
 		return nil, nil
@@ -247,7 +290,7 @@ func run() (*core.RestartRequest, error) {
 		Log:      log,
 		Renderer: renderer,
 		Outbound: hc,
-		LockWait: lockWait(buildinfo.RestartedByReload()),
+		LockWait: lockWait(buildinfo.Restarted()),
 		// /bot reload 靠它重读磁盘（#68）。容器不认识 -c，所以路径必须从
 		// 这里给：否则"配置文件在哪"会有两份互不知情的事实。
 		ConfigPath: *cfgPath,
@@ -312,12 +355,13 @@ func run() (*core.RestartRequest, error) {
 		Version:    bi.String(),
 		Platform:   bi.Platform,
 		GoVersion:  bi.GoVer,
-		Restarted:  buildinfo.RestartedByReload(),
+		Restarted:  buildinfo.Restarted(),
 	})
-	if buildinfo.RestartedByReload() {
-		log.Info("本次启动由 /reload 触发", "version", bi.String())
-	}
-	// 升级通道（#70）：回答"我到底走没走镜像"不该靠翻配置文件。与 /upgrade
+	// 重启原因要能一眼看出：升级换盘与 /reload 走的是同一条路径，
+	// 旧版本在这里只会说 /reload，owner 没法用它确认那次 /upgrade 是否生效（#70）。
+	if reason := buildinfo.RestartReason(); reason != "" {
+		log.Info(restartLine(reason), "reason", reason, "version", bi.String())
+	} // 升级通道（#70）：回答"我到底走没走镜像"不该靠翻配置文件。与 /upgrade
 	// 预览里的那行是同一句文案（assetsrc.ChannelText），两处说法必须一致。
 	// 关掉自更新时照打：那是配置事实，而"关掉了"另有 enabled 这一项可查。
 	log.Info(upgradeChannelLine(cfg))
@@ -498,8 +542,18 @@ func logStartup(log *slog.Logger, in startupInfo) {
 		"restarted", in.Restarted)
 }
 
-// upgradeChannelLine 是启动日志里那行通道说明（#70）。
+// restartLine 是"本次启动由…触发"那句话；不是重启时返回空串。
 //
+// 抽成函数是为了可测：这条日志是 owner 升级后唯一能确认"换盘到底有没有生效"
+// 的现场（换盘走 syscall.Exec，PID 不变、NRestarts 不涨）。
+func restartLine(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	return "本次启动由" + buildinfo.RestartCause(reason) + "触发"
+}
+
+// upgradeChannelLine 是启动日志里那行通道说明（#70）。
 // 抽成函数只为可测：它必须与 /upgrade 预览里的那句逐字一致，而"启动日志与
 // 预览都能看出当前通道"是本票的验收之一。
 func upgradeChannelLine(cfg *config.Config) string {

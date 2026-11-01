@@ -193,9 +193,10 @@ func TestNotifyRetriesOnce(t *testing.T) {
 	}
 }
 
-// /reload 是管理员显式重启，必须发通知：否则"重启后确认更新是否生效"没有回执。
+// 计划内重启（/reload）是管理员显式操作，必须发通知：否则"重启后确认更新
+// 是否生效"没有回执。
 func TestNotifyIgnoresIntervalAfterReload(t *testing.T) {
-	t.Setenv(buildinfo.RestartEnv, "1")
+	t.Setenv(buildinfo.RestartEnv, buildinfo.RestartReload)
 	p, h := newPlugin(t, host.Params{}, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
 	p.delay = 0
 	// 落在 min_interval 窗口内
@@ -206,8 +207,8 @@ func TestNotifyIgnoresIntervalAfterReload(t *testing.T) {
 	if len(h.sender.msgs) != 1 {
 		t.Fatalf("/reload 重启应无视 min_interval，实际 %d 条", len(h.sender.msgs))
 	}
-	if !strings.Contains(h.sender.msgs[0].text, "/reload 重启") {
-		t.Errorf("正文应标注 /reload 重启:\n%s", h.sender.msgs[0].text)
+	if !strings.Contains(h.sender.msgs[0].text, "（/reload）") {
+		t.Errorf("正文应标注 /reload://n%s", h.sender.msgs[0].text)
 	}
 	if !strings.Contains(h.sender.msgs[0].text, "版本") {
 		t.Errorf("正文应带版本，便于确认是否换成了新构建:\n%s", h.sender.msgs[0].text)
@@ -234,5 +235,27 @@ func TestManifestDeclaresNoCommands(t *testing.T) {
 	}
 	if len(m.Commands) != 0 || len(m.Intents) != 0 {
 		t.Fatalf("bootnotice 不应订阅事件或声明命令: %+v", m)
+	}
+}
+
+// 升级换盘后的重启也要发，而且正文必须说"升级换盘"而不是 /reload（#70）：
+// 同一条重启路径，owner 只有靠这句话才能确认那次 /upgrade 生效了。
+func TestNotifyNamesUpgradeAsRestartReason(t *testing.T) {
+	t.Setenv(buildinfo.RestartEnv, buildinfo.RestartUpgrade)
+	p, h := newPlugin(t, host.Params{}, fakeDir{{Role: "owner", C2COpenID: "c2c-owner"}})
+	p.delay = 0
+	h.kv.m[keyLastStart] = []byte(time.Now().Add(-time.Minute).Format(time.RFC3339))
+
+	p.run(context.Background())
+
+	if len(h.sender.msgs) != 1 {
+		t.Fatalf("升级重启应无视 min_interval，实际 %d 条", len(h.sender.msgs))
+	}
+	text := h.sender.msgs[0].text
+	if !strings.Contains(text, "（升级换盘）") {
+		t.Errorf("正文应标注升级换盘:\n%s", text)
+	}
+	if strings.Contains(text, "/reload") {
+		t.Errorf("升级重启不该被写成 /reload://n%s", text)
 	}
 }
