@@ -178,3 +178,54 @@ func (fakePlugin) Init(context.Context, host.Host) error {
 	return nil
 }
 func (fakePlugin) Handle(context.Context, *host.Event) (*host.Reply, error) { return nil, nil }
+
+// 启动日志里那行"升级通道"（#70 验收：启动日志能看出当前通道）。
+//
+// 三档 + token 覆盖各断言一次。文案由 assetsrc.ChannelText 统一给出，
+// 与 /upgrade 预览里的那句逐字一致——两处说不同的话，排查时就得先判断
+// "这两句是不是同一个意思"。
+func TestUpgradeChannelLine(t *testing.T) {
+	cases := []struct {
+		name    string
+		section string
+		want    string
+	}{
+		{"official（默认）", "", "升级通道 source=official"},
+		{"mirror 预设", "source = \"mirror\"", "升级通道 source=mirror preset=gh-proxy"},
+		{"custom 模板", "source = \"custom\"\nasset_url = \"https://cache.example/{asset}\"",
+			"升级通道 source=custom asset_url=https://cache.example/{asset}"},
+		{"token 覆盖 source", "source = \"mirror\"\ntoken = \"ghp_x\"",
+			"升级通道 source=api（配置了 token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := config.Load(writeUpgradeCfg(t, tc.section))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := upgradeChannelLine(cfg); !strings.HasPrefix(got, tc.want) {
+				t.Errorf("通道行 = %q want 前缀 %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// writeUpgradeCfg 写一份最小可启动配置，把 section 拼进 [upgrade] 段。
+func writeUpgradeCfg(t *testing.T, section string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	body := `
+[app]
+id = "1"
+secret = "s"
+
+[store]
+path = "./data/qqbot.db"
+
+[upgrade]
+` + section + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

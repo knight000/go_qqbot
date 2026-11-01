@@ -2,12 +2,15 @@ package upgrade
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/knight000/go_qqbot/internal/assetsrc"
 )
 
 // newTestUpgrader 装配一个把 exe/dataDir 都放进临时目录的会话。
@@ -16,13 +19,15 @@ func newTestUpgrader(t *testing.T, f *fakeRelease, current string, mutate func(*
 	exe := fakeExe(t)
 	dataDir := t.TempDir()
 	o := Options{
-		Enabled:   true,
-		APIBase:   f.api.URL,
-		AssetBase: f.asset.URL,
-		Repo:      "o/r",
-		Exe:       exe,
-		DataDir:   dataDir,
-		Current:   current,
+		Enabled: true,
+		APIBase: f.api.URL,
+		// 三档来源里测试走 custom：假镜像站的地址是 httptest 随机端口，
+		// 只有自定义模板能表达（官方 / 预设都是写死的域名）。
+		AssetSource: assetsrc.AssetSource{Source: assetsrc.SourceCustom, Template: f.assetTemplate()},
+		Repo:        "o/r",
+		Exe:         exe,
+		DataDir:     dataDir,
+		Current:     current,
 		Plugins: []LoadedPlugin{
 			{Name: "echo", Version: "0.1.0"},
 			{Name: "md", Version: "0.2.0"},
@@ -113,6 +118,94 @@ func TestPreviewListsLoadedPluginDeltas(t *testing.T) {
 	}
 }
 
+// #70 可见性：预览里必须能看出"当前走哪条通道"和"用它拼出来的完整地址"。
+// 三档各断言一次——official / mirror 预设 / custom，加上有 token 时的 api 覆盖。
+func TestPreviewShowsChannelAndExampleURL(t *testing.T) {
+	ghProxy := assetsrc.Presets()[0]
+	cases := []struct {
+		name       string
+		mutate     func(*Options)
+		wantChan   string
+		wantURLFmt string // %s = tag，%s = 产物名
+	}{
+		{
+			name:       "official",
+			mutate:     nil, // newTestUpgrader 默认走 custom（假镜像站），这里换回官方
+			wantChan:   "source=official",
+			wantURLFmt: "https://github.com/o/r/releases/download/%s/%s",
+		},
+		{
+			name: "mirror（预设 gh-proxy）",
+			mutate: func(o *Options) {
+				o.AssetSource = assetsrc.AssetSource{Source: assetsrc.SourceMirror, Preset: ghProxy.Name, Template: ghProxy.Template}
+			},
+			wantChan:   "source=mirror preset=gh-proxy",
+			wantURLFmt: "https://gh-proxy.com/https://github.com/o/r/releases/download/%s/%s",
+		},
+		{
+			name: "custom",
+			mutate: func(o *Options) {
+				o.AssetSource = assetsrc.AssetSource{
+					Source:   assetsrc.SourceCustom,
+					Template: "https://cache.example/gh/{owner}/{repo}/{tag}/{asset}",
+				}
+			},
+			wantChan:   "source=custom asset_url=https://cache.example/gh/{owner}/{repo}/{tag}/{asset}",
+			wantURLFmt: "https://cache.example/gh/o/r/%s/%s",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeRelease(t, "1.2.4", peHeader("new"))
+			u, _ := newTestUpgrader(t, f, "1.2.3", func(o *Options) {
+				// 先归到官方，再由用例覆盖：newTestUpgrader 的默认值是 custom。
+				o.AssetSource = assetsrc.AssetSource{Source: assetsrc.SourceOfficial, Template: assetsrc.DefaultTemplate}
+				if tc.mutate != nil {
+					tc.mutate(o)
+				}
+			})
+
+			rep, err := u.Preview(context.Background())
+			if err != nil {
+				t.Fatalf("Preview: %v", err)
+			}
+			wantURL := fmt.Sprintf(tc.wantURLFmt, f.tag, f.coreName)
+			if rep.SourceURL != wantURL {
+				t.Errorf("示例地址 = %q want %q", rep.SourceURL, wantURL)
+			}
+			text := rep.Text()
+			if !strings.Contains(text, "通道 "+tc.wantChan) {
+				t.Errorf("预览正文缺通道行（%s）:\n%s", tc.wantChan, text)
+			}
+			if !strings.Contains(text, wantURL) {
+				t.Errorf("预览正文缺示例地址:\n%s", text)
+			}
+		})
+	}
+}
+
+// 有 token 时三份产物全走 api_base：预览不该展示一个根本不会被请求的
+// 镜像地址（那会让人以为镜像生效了），只说明原因。
+func TestPreviewWithTokenReportsAPIChannel(t *testing.T) {
+	f := newFakeRelease(t, "1.2.4", peHeader("new"))
+	u, _ := newTestUpgrader(t, f, "1.2.3", func(o *Options) {
+		o.Token = "secret"
+		o.AssetSource = assetsrc.AssetSource{Source: assetsrc.SourceMirror, Preset: assetsrc.DefaultMirror, Template: assetsrc.Presets()[0].Template}
+	})
+
+	rep, err := u.Preview(context.Background())
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if rep.SourceURL != "" {
+		t.Errorf("有 token 时不该给出镜像示例地址，实际 %q", rep.SourceURL)
+	}
+	if !strings.Contains(rep.Text(), "source=api") {
+		t.Errorf("有 token 时预览应说明 source 被忽略:\n%s", rep.Text())
+	}
+}
+
 // 已经是最新版本时不提"应用升级"。
 func TestPreviewReportsUpToDate(t *testing.T) {
 	f := newFakeRelease(t, "1.2.3", peHeader("same"))
@@ -127,6 +220,10 @@ func TestPreviewReportsUpToDate(t *testing.T) {
 	}
 	if !strings.Contains(rep.Text(), "已是最新版本") {
 		t.Errorf("正文不对:\n%s", rep.Text())
+	}
+	// "已是最新"那条分支也要带通道行：它同样回答了"我到底走没走镜像"。
+	if !strings.Contains(rep.Text(), "通道 source=custom") {
+		t.Errorf("最新版本的预览也应带通道行:\n%s", rep.Text())
 	}
 }
 
@@ -243,6 +340,33 @@ func TestApplyStagesAndWritesPending(t *testing.T) {
 	}
 	if d.Rollback {
 		t.Fatalf("升级后的第一次启动不该回滚: %+v", d)
+	}
+}
+
+// 镜像投毒：二进制通道回一份与 checksums.txt 对不上的产物（校验和来自官方
+// api_base）。结论必须是"校验失败、落位文件被删、进程没换盘"——镜像能换
+// 字节，换不掉官方通道上的 sha256（ADR-0006 决策 3 的安全边界，本票不放宽）。
+func TestApplyRejectsPoisonedMirrorBinary(t *testing.T) {
+	f := newFakeRelease(t, "1.2.4", peHeader("official"))
+	f.mirrorBinary = peHeader("poisoned")
+	u, exe := newTestUpgrader(t, f, "1.2.3", nil)
+	before := readFile(t, exe)
+
+	_, err := u.Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "校验和不匹配") {
+		t.Fatalf("镜像投毒应因校验和不匹配失败，实际: %v", err)
+	}
+	if _, err := os.Stat(StagedPath(exe)); !os.IsNotExist(err) {
+		t.Error("被投毒的产物必须删掉")
+	}
+	if got := readFile(t, exe); got != before {
+		t.Error("旧二进制被改动")
+	}
+	if _, err := os.Stat(OldPath(exe)); !os.IsNotExist(err) {
+		t.Error("不该产生 .old（进程没换盘）")
+	}
+	if st, err := LoadState(StateDir(u.opt.DataDir)); err != nil || st != nil {
+		t.Errorf("state.json 不该被写: %+v %v", st, err)
 	}
 }
 

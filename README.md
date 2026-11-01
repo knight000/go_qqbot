@@ -223,18 +223,32 @@ quota_profile = "tight"
 | `/upgrade plugin <名称\|all>` | 插件升级：只重启那个插件的子进程，不重启核心，也不需要二次确认 |
 | `/upgrade status` | 当前版本、有没有未确认的升级、上次失败原因 |
 
-配置（四键，`[upgrade]`）：
+配置（`[upgrade]`，整块可直接抄）：
 
 ```toml
 [upgrade]
-enabled    = true                       # false 时连检查都不发请求
-api_base   = "https://api.github.com"   # 元数据：index.json 与 checksums.txt
-asset_base = "https://github.com"       # 二进制；可指向镜像，只在没有 token 时生效
-token      = ""                         # 私有仓：细粒度 token，只需 Contents: read
+enabled  = true                       # false 时连检查都不发请求
+api_base = "https://api.github.com"   # 元数据：index.json 与 checksums.txt
+token    = ""                         # 私有仓：细粒度 token，只需 Contents: read
+
+# 二进制通道三档，切换只改这一段（#70）
+source = "official"                   # official（默认）| mirror | custom
+
+# 或者：内置镜像预设（留空取 gh-proxy；可选 gh-proxy / ghproxy-net）
+# source = "mirror"
+# mirror = "gh-proxy"
+
+# 或者：自定义模板，{asset} 必填
+# source    = "custom"
+# asset_url = "https://cache.example/gh/{owner}/{repo}/{tag}/{asset}"
 ```
 
+- 官方直连在国内机器上常撞上限：腾讯云广州实测 30.7 MB / **14 分 43 秒**（单次传输上限 15 分钟），同一条链路走镜像 **18 秒**。链路再慢 2% 就是整次升级失败。
+- **配错一律启动失败并列出可用项**：`source` 非法、`mirror` 未知名、`custom` 没给模板、模板缺 `{asset}`、模板含未知占位符。**不静默回落官方**——"以为走了镜像、实际在直连"是最坏的失败方式。
+- 老写法 `asset_base` 仍然可用，等价于 `source = "custom"` 且模板为 `{asset_base}/{owner}/{repo}/releases/download/{tag}/{asset}`，拼出的地址与以前逐字相同。
+- 当前通道不必翻配置文件：启动日志有 `升级通道 source=mirror preset=gh-proxy`，`/upgrade` 预览里也有一行「通道 …｜示例 <完整地址>」。
 - **校验和与二进制分两个通道**是结构约束：`checksums.txt` / `index.json` 永远从 `api_base` 取，镜像被投毒时二进制变了、校验和对不上。
-- **填了 `token` 之后三份产物全部走 `api_base`**（私有仓的发布资产在镜像上匿名取不到），`asset_base` 随之失效；`Authorization` 头只发给 `api_base` 的主机，绝不发给用户可配置的镜像。
+- **填了 `token` 之后三份产物全部走 `api_base`**（私有仓的发布资产在镜像上匿名取不到），`source` 随之失效并在启动日志里写明原因；`Authorization` 头只发给 `api_base` 的主机，绝不发给用户可配置的镜像。
 - 校验只比 SHA-256：覆盖传输损坏、截断、镜像投毒；**不覆盖**上游仓库或账号被 takeover。
 - `version` 是 `dev` 时拒绝升级——本地 `go build` 的产物没有可比对的版本号（`/ping` 首行能看到当前版本）。
 - 同一时刻只允许一次升级；`/upgrade apply` 进行中再敲会得到「已有一个升级在进行中」。
@@ -246,6 +260,7 @@ token      = ""                         # 私有仓：细粒度 token，只需 C
 当前 0.3.1｜linux/amd64
 最新 0.4.0（v0.4.0）
 核心产物 qqbot-0.4.0-linux-amd64（31.0 MiB）
+通道 source=official｜示例 https://github.com/knight000/go_qqbot/releases/download/v0.4.0/qqbot-0.4.0-linux-amd64
 插件（只列已加载的插件）
   echo 0.1.0 → 0.1.1  升
   md 0.3.0 → 0.3.0  跳过（已是最新）

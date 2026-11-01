@@ -16,7 +16,7 @@ import (
 )
 
 // fakeRelease 是一份「发布」的替身：两个 httptest 服务器分别扮演
-// api_base（元数据通道）与 asset_base（镜像通道）。
+// api_base（元数据通道）与二进制通道（这里扮演镜像站）。
 //
 // 它的存在就是为了把两条通道分开：任何「元数据从镜像取」或「token 发给
 // 镜像」的实现错误都能被命中计数抓住，而不用读代码确认。
@@ -43,6 +43,10 @@ type fakeRelease struct {
 	// blobTags 记录每个产物登记在哪个 tag 上：镜像通道只在该 tag 的路径下
 	// 提供它，拿当前 tag 去拼地址会 404（正是 #52 要防的那个错）。
 	blobTags map[string]string
+
+	// mirrorBinary 非 nil 时二进制通道回这份字节（模拟镜像投毒）：校验和仍
+	// 来自 api_base 上的 checksums.txt，两边对不上才是这条通道的安全边界。
+	mirrorBinary []byte
 
 	api   *httptest.Server
 	asset *httptest.Server
@@ -184,13 +188,27 @@ func newFakeRelease(t *testing.T, version string, binary []byte) *fakeRelease {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = w.Write(f.binary)
+		body := f.binary
+		if f.mirrorBinary != nil {
+			body = f.mirrorBinary
+		}
+		_, _ = w.Write(body)
 	})
 	// 上游仓的产物直链：/owner/repo/releases/download/<tag>/<asset>。
 	amux.HandleFunc("/", f.serveUpstreamAsset)
 	f.asset = httptest.NewServer(amux)
 	t.Cleanup(f.asset.Close)
 	return f
+}
+
+// assetTemplate 是假镜像站的模板形状：与官方通道同形，只把 https://github.com
+// 换成 httptest 的地址。
+//
+// 客户端现在持有的是**模板**而不是前缀（#70）：测试里的"镜像"就是"换前缀"，
+// 其余路径逐字不变——这恰好也是 gh-proxy 那种"把整个 github 地址塞进路径"
+// 的镜像要的形状，只是前缀长得不一样。
+func (f *fakeRelease) assetTemplate() string {
+	return f.asset.URL + "/{owner}/{repo}/releases/download/{tag}/{asset}"
 }
 
 // addUpstream 让假 API 扮演一个上游仓库（另一个 owner/repo）。

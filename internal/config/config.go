@@ -63,39 +63,12 @@ type Config struct {
 	Log        Log                     `toml:"log"`
 	Debug      Debug                   `toml:"debug"`
 	Plugins    Plugins                 `toml:"plugins"`
-	Upgrade    Upgrade                 `toml:"upgrade"`
+	// Upgrade 是自更新配置，见 upgrade.go（#70 起二进制通道分三档）。
+	Upgrade Upgrade `toml:"upgrade"`
 	// Warnings 是 Load 收集的"这份配置能用，但有一处写法必须让人知道"的提示。
 	// 启动期原样打 warn（见 cmd/bot/main.go）。它不进 TOML、不参与校验：
 	// 一旦变成错误，用户会在升级机器人的路上被一条风格问题拦住。
 	Warnings []string `toml:"-"`
-}
-
-// Upgrade 是自更新配置（ADR-0006 决策 2/3）。
-//
-// 两个地址分开不是可选项：「校验和与二进制不同通道」是结构约束，不是约定。
-// index.json 与 checksums.txt 永远从 api_base 取；二进制默认从 asset_base 取
-// （可指向镜像），设了 token 之后三份产物全走 api_base——私有仓的资产无法在
-// 镜像上匿名取，而 token 绝不能发给用户可配置的镜像主机。
-type Upgrade struct {
-	// Enabled 是总开关，默认 true。关掉之后连检查都不发请求，
-	// 不是"检查了但不下载"。
-	Enabled *bool `toml:"enabled"`
-	// APIBase 是元数据通道（GitHub API 端点），默认 https://api.github.com。
-	APIBase string `toml:"api_base"`
-	// AssetBase 是二进制通道，默认 https://github.com；可指向镜像。
-	// 只在没有 token 时生效。
-	AssetBase string `toml:"asset_base"`
-	// Token 是私有仓凭据（细粒度 token，只需 contents:read）。
-	// 它在文件里就是明文——与 [[bots]].secret 是同一类东西，配置本身要 600。
-	Token string `toml:"token"`
-}
-
-// UpgradeEnabled 返回自更新开关的最终值（默认 true）。
-func (c *Config) UpgradeEnabled() bool {
-	if c.Upgrade.Enabled == nil {
-		return true
-	}
-	return *c.Upgrade.Enabled
 }
 
 // Plugins 是 `[plugins]` 表：既有核心侧的停用名单，也有各插件的配置段。
@@ -832,13 +805,12 @@ func (c *Config) applyDefaults() {
 	if c.Log.Format == "" {
 		c.Log.Format = "text"
 	}
-	// 自更新两个地址的默认值必须在这里（而不是空串让 upgrade 包兜）：
-	// /ping 与启动日志里要能看到实际生效的地址，空白的配置项看不出用的是哪一个。
+	// 自更新的二进制通道（#70）：source / mirror / asset_url / asset_base
+	// 四个字段在这里解析成一个模板。解析失败留给 Validate 报——配错一律
+	// 启动失败，不静默回落官方。
+	c.applyUpgradeSource()
 	if c.Upgrade.APIBase == "" {
 		c.Upgrade.APIBase = "https://api.github.com"
-	}
-	if c.Upgrade.AssetBase == "" {
-		c.Upgrade.AssetBase = "https://github.com"
 	}
 }
 
@@ -985,6 +957,9 @@ func (c *Config) Validate() error {
 	if c.Debug.Raw && strings.EqualFold(c.Debug.Level, DebugPlugin) {
 		problems = append(problems, "debug.raw 需要 level=full：plugin 级别不输出原始事件")
 	}
+	// 自更新的二进制通道：五类配错都在这里拦下（#70）。放在最后是因为它的
+	// 文案自带可用项，比其他"某个值非法"的条目长。
+	problems = append(problems, c.upgradeSourceProblems()...)
 	if len(problems) > 0 {
 		return fmt.Errorf("配置校验失败:\n  - %s", strings.Join(problems, "\n  - "))
 	}

@@ -165,16 +165,40 @@ notify = "owner"
 enabled = true
 # 元数据通道：index.json 与 checksums.txt **永远**从这里取（GitHub API 端点）。
 api_base = "https://api.github.com"
-# 二进制通道：可指向镜像站。只在没有 token 时生效。
-# 校验和与二进制分两个通道是结构约束，不是约定：镜像被投毒时二进制变了、
-# 校验和没变，sha256 必然对不上。
-asset_base = "https://github.com"
+# 二进制通道（#70）：三档来源，切换只改 source 一行。
+#
+#   official  官方直连（默认）。腾讯云广州实测 30.7 MB 用了 14 分 43 秒，
+#             离单次传输的 15 分钟上限只差 2%——链路再慢一点就整次失败。
+#   mirror    内置镜像预设，用 mirror 选哪一项（留空 = gh-proxy）。
+#             同一条链路实测 30.7 MB / 18 秒。
+#   custom    自定义 URL 模板，写 asset_url，支持 {owner} {repo} {tag} {asset}。
+#
+# 配错（source 拼错、mirror 不认识、custom 没给模板、模板缺 {asset}、模板里有
+# 未知占位符）一律**启动失败并列出可用项**，绝不静默回落官方：以为走了镜像、
+# 实际在直连，是最坏的失败方式——它只在升级慢到撞上限时暴露。
+#
+# 校验和与二进制分两个通道是结构约束，不是约定：index.json 与 checksums.txt
+# **永远**从 api_base 取，镜像被投毒时二进制变了、校验和没变，sha256 必然对不上。
+source = "official"
+
+# source = "mirror" 时选预设，留空取 gh-proxy。
+# 可选：gh-proxy / ghproxy-net（两项均 2026-11-01 实测可用；失效就换一个）。
+# mirror = "gh-proxy"
+
+# source = "custom" 时的完整模板，{asset} 必填。
+# 注意主流镜像要的是把整个 https://github.com 塞进路径，只填域名是 404：
+# asset_url = "https://gh-proxy.com/https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}"
+
+# 老写法 asset_base（#70 之前）仍然可用，等价于 source = "custom" 且模板为
+# "{asset_base}/{owner}/{repo}/releases/download/{tag}/{asset}"：
+# asset_base = "https://github.com"
+
 # 私有仓凭据（细粒度 token，只需 Contents: read）。留空表示仓库匿名可读。
 #
 # 设了它之后三份产物（index.json / checksums.txt / 二进制）全部改走 api_base
-# 的 release asset 端点，因为私有资产无法在镜像上匿名取。反过来，token
-# **绝不会**发给 asset_base 的主机——那是用户可配置的镜像，把 GitHub 凭据
-# 送过去等于泄露（ADR-0006 决策 13）。
+# 的 release asset 端点，因为私有资产无法在镜像上匿名取——此时 source 被忽略，
+# 启动日志会写明原因。反过来，token **绝不会**发给二进制通道的主机：那是用户
+# 可配置的镜像，把 GitHub 凭据送过去等于泄露（ADR-0006 决策 13）。
 # token = "github_pat_xxx"
 
 # 插件配置：一律放在 [plugins.<name>] 下，由 Host.Config() 读取

@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/knight000/go_qqbot/internal/assetsrc"
 )
 
 // 本包把自更新的**可单测部分**收在一起：检查元数据、流式下载与校验、
@@ -58,8 +60,9 @@ type Options struct {
 	Enabled bool
 	// APIBase 是元数据通道（index.json 与 checksums.txt 永远走它）。
 	APIBase string
-	// AssetBase 是二进制通道（镜像），只在没有 token 时生效。
-	AssetBase string
+	// AssetSource 是二进制通道：官方 / 镜像预设 / 自定义模板（#70）。
+	// 零值等价于官方通道。只在没有 token 时生效。
+	AssetSource assetsrc.AssetSource
 	// Token 是私有仓凭据。设了它三个产物全走 api_base。
 	Token string
 	// Repo 是 owner/repo。
@@ -114,8 +117,10 @@ func New(o Options) *Upgrader {
 	if strings.TrimSpace(o.APIBase) == "" {
 		o.APIBase = DefaultAPIBase
 	}
-	if strings.TrimSpace(o.AssetBase) == "" {
-		o.AssetBase = DefaultAssetBase
+	// 零值 AssetSource 是"没配置"，语义只能是官方通道。模板留空由 newClient
+	// 补默认（拼装前还有一道同样的兜底），这里只补档位——Describe 读它。
+	if strings.TrimSpace(o.AssetSource.Source) == "" {
+		o.AssetSource.Source = assetsrc.SourceOfficial
 	}
 	if strings.TrimSpace(o.Repo) == "" {
 		o.Repo = DefaultRepo
@@ -126,7 +131,7 @@ func New(o Options) *Upgrader {
 	}
 	return &Upgrader{
 		opt: o,
-		c:   newClient(o.APIBase, o.AssetBase, o.Token, o.Repo),
+		c:   newClient(o.APIBase, o.AssetSource.Template, o.Token, o.Repo),
 		log: logger,
 		now: now,
 	}
@@ -166,6 +171,12 @@ type Report struct {
 	CoreSize int64
 	UpToDate bool
 	Plugins  []PluginDelta
+	// Channel 是"当前二进制通道"的一句话（含 token 对 source 的覆盖）。
+	Channel string
+	// SourceURL 是用本平台核心产物拼出的**完整示例地址**：回答"我到底走没走
+	// 镜像"不该靠翻配置文件（#70 可见性）。有 token 时为空——那时产物根本不
+	// 走这条通道。
+	SourceURL string
 }
 
 // PluginDelta 是一个已加载插件相对最新发布的变化。
@@ -196,13 +207,15 @@ func (u *Upgrader) Preview(ctx context.Context) (Report, error) {
 	}
 
 	rep := Report{
-		Current:  u.opt.Current,
-		Latest:   rel.Version,
-		Tag:      rel.Tag,
-		Platform: currentPlatform(),
-		CoreName: rel.CoreName,
-		CoreSize: rel.CoreSize,
-		Plugins:  u.deltas(rel.Index),
+		Current:   u.opt.Current,
+		Latest:    rel.Version,
+		Tag:       rel.Tag,
+		Platform:  currentPlatform(),
+		CoreName:  rel.CoreName,
+		CoreSize:  rel.CoreSize,
+		Plugins:   u.deltas(rel.Index),
+		Channel:   assetsrc.ChannelText(u.opt.AssetSource, u.opt.Token),
+		SourceURL: u.sourceURL(rel.Tag, rel.CoreName),
 	}
 	if cmp, ok := Compare(u.opt.Current, rel.Version); ok && cmp >= 0 {
 		rep.UpToDate = true
@@ -219,12 +232,18 @@ func (r Report) Text() string {
 	if r.UpToDate {
 		fmt.Fprintf(&b, "当前已是最新版本（%s，%s）。\n", r.Current, r.Platform)
 		fmt.Fprintf(&b, "发布 %s 的核心产物 %s（%s）与本平台一致，无需升级。", r.Tag, r.CoreName, humanSize(r.CoreSize))
+		if line := r.channelLine(); line != "" {
+			fmt.Fprintf(&b, "\n%s", line)
+		}
 		return b.String()
 	}
 	b.WriteString("自更新预览（未改动任何文件）\n")
 	fmt.Fprintf(&b, "当前 %s｜%s\n", r.Current, r.Platform)
 	fmt.Fprintf(&b, "最新 %s（%s）\n", r.Latest, r.Tag)
 	fmt.Fprintf(&b, "核心产物 %s（%s）\n", r.CoreName, humanSize(r.CoreSize))
+	if line := r.channelLine(); line != "" {
+		fmt.Fprintf(&b, "%s\n", line)
+	}
 	if len(r.Plugins) == 0 {
 		b.WriteString("插件 无已加载插件\n")
 	} else {
@@ -235,6 +254,31 @@ func (r Report) Text() string {
 	}
 	b.WriteString("用 /upgrade apply 应用核心升级：会先快照数据库，再重启进程。")
 	return b.String()
+}
+
+// channelLine 是预览里那句"当前通道 + 示例地址"（#70 可见性）。
+//
+// 通道说明与启动日志逐字相同（ChannelText）：同一件事在两处说不同的话，
+// 排查时就得先判断"这两句是不是同一个意思"。
+func (r Report) channelLine() string {
+	if r.Channel == "" {
+		return ""
+	}
+	if r.SourceURL == "" {
+		return "通道 " + r.Channel
+	}
+	return "通道 " + r.Channel + "｜示例 " + r.SourceURL
+}
+
+// sourceURL 用本平台的核心产物名拼出一个完整地址，供预览展示。
+//
+// 有 token 时不拼：那时产物走 api_base 的资产端点，展示一个镜像地址会让
+// 人以为它在用镜像。
+func (u *Upgrader) sourceURL(tag, asset string) string {
+	if strings.TrimSpace(u.opt.Token) != "" {
+		return ""
+	}
+	return u.c.binaryURL(tag, asset)
 }
 
 // deltas 把 index.json 的插件版本与已加载的 manifest 逐一比较。

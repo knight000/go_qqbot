@@ -13,10 +13,11 @@ import (
 	"testing"
 )
 
-// 无 token：索引里的 url 已经是 github 直链，只把 host 换成 asset_base。
+// 无 token：索引里的 url 已经是 github 直链，只把前缀换成二进制通道模板。
 // tag 必须原样保留——它可能比当前发布旧。
 func TestAssetURLKeepsTagFromIndexURLWithoutToken(t *testing.T) {
-	c := newClient("https://api.invalid", "https://mirror.example", "", "o/r")
+	c := newClient("https://api.invalid",
+		"https://mirror.example/{owner}/{repo}/releases/download/{tag}/{asset}", "", "o/r")
 	rel := &Release{Tag: "v1.2.4"}
 	raw := "https://github.com/o/r/releases/download/v1.2.3/qqbot-plugin-echo-0.2.0-linux-amd64"
 
@@ -36,7 +37,7 @@ func TestAssetURLFetchesReleaseByIndexTagAndCaches(t *testing.T) {
 	f := newFakeRelease(t, "1.2.4", peHeader("core"))
 	asset := f.addPluginAtTag("echo", "0.2.0", "v1.2.3", []byte("plugin-bytes"))
 
-	c := newClient(f.api.URL, f.asset.URL, "secret", "o/r")
+	c := newClient(f.api.URL, f.assetTemplate(), "secret", "o/r")
 	rel := &Release{Tag: f.tag}
 	raw := "https://github.com/o/r/releases/download/v1.2.3/" + asset
 
@@ -64,7 +65,7 @@ func TestAssetURLUsesLatestReleaseWhenTagMatches(t *testing.T) {
 	f := newFakeRelease(t, "1.2.4", peHeader("core"))
 	asset := f.addPlugin("echo", "0.2.0", []byte("plugin-bytes"))
 
-	c := newClient(f.api.URL, f.asset.URL, "secret", "o/r")
+	c := newClient(f.api.URL, f.assetTemplate(), "secret", "o/r")
 	// 只给 gh，不给可用的 tag 端点：走错了会失败。
 	rel := &Release{Tag: f.tag, gh: mustGHRelease(t, f.tag, asset, 101)}
 
@@ -123,6 +124,11 @@ func TestUpgradePluginsWithTokenFetchesCarriedTag(t *testing.T) {
 	}
 	if n := f.tagHits.Load(); n != 1 {
 		t.Errorf("应恰好为旧 tag 查一次发布，实际 %d 次", n)
+	}
+	// 有 token 时二进制通道一次请求都不发：私有产物在镜像上匿名取不到，
+	// 凭据更不能发给它（ADR-0006 决策 13，本票不放宽）。
+	if n := f.assetHits.Load(); n != 0 {
+		t.Errorf("有 token 时不该触碰二进制通道，实际命中 %d 次", n)
 	}
 	if string(r.got) != string(blob) {
 		t.Error("换上去的字节与发布里的产物不一致")
