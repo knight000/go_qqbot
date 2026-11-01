@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/knight000/go_qqbot/pkg/host"
@@ -32,6 +33,9 @@ type HostClient struct {
 	cfg  host.Params
 	bot  host.BotInfo
 	log  *slog.Logger
+	// fallbackOnce 让「这次调用没有 Bot 上下文」的告警每份客户端只打一次。
+	// 共享进程下每个事件都可能走到那条路，逐次打会把 journald 淹掉。
+	fallbackOnce sync.Once
 }
 
 var _ host.Host = (*HostClient)(nil)
@@ -57,20 +61,56 @@ func (h *HostClient) Config() host.Params { return h.cfg }
 func (h *HostClient) Log() *slog.Logger   { return h.log }
 func (h *HostClient) Bot() host.BotInfo   { return h.bot }
 
-// botFor 解析「这次调用属于哪个 Bot」。
+// botFor 解析「这次调用属于哪个 Bot」，三级优先级：
 //
-// ctx 里带着另一个绑定的 HostClient（核心在投递时放进来的当前 Bot 的那份）
-// 就用它；否则用自己创建时的绑定。这是插件无感的关键：存进结构体的 h 在
-// Handle 里被调用时，作用域由调用参数决定，而不是由 h 自身决定。
+//  1. ctx 里显式标注的 Bot（`host.WithBot(ctx, h.Bot())`）。**插件自己的后台
+//     协程用它**：goroutine 里没有「当前事件」，只有它捕获到的那份 h，把 Bot
+//     钉进 ctx 才不会落到别人的库上。显式钉住的比"环境"优先——写下来的是意图。
+//  2. ctx 里那份 HostClient——核心在投递 handle / start / run_job 时放进去的
+//     「当前 Bot」。这是事件处理里唯一正确的来源，也是插件把 Init 的 h 存进
+//     结构体却依然不会串库的原因。
+//  3. 本绑定的 Bot（Init 时核心告知的那个）。
+//
+// 顺序把 1 放在 2 前面还有一层原因：插件侧 ctx 里只有 Host（BotOf 是核心侧
+// 跨进程之前用的），所以两者本来就不会撞；而先看 BotOf 能保证"显式钉了 Bot"
+// 的调用不再去摸 host.From——那条路会在 ctx 缺 Host 时打一条与本次调用无关的
+// 「返回拒绝性替身」告警。
+//
+// 第三级不能删——`Scheduler().Register` 的签名里没有 ctx（契约如此），它只能
+// 用本绑定；插件在 Init 里为某个 Bot 注册任务正是靠这个语义。但它也是唯一
+// 「可能不是你以为的那个 Bot」的路径：把一个 Init 拿到的 h 存进结构体、又在
+// 另一个 Bot 的事件里发无 ctx 的调用，落点就是上一次 Init 的 Bot。所以走到
+// 第三级时记一条 warn（每份客户端一次），把静默串库变成日志里看得见的一行。
 //
 // 只认 *HostClient：ctx 里若是别的 Host 实现（进程内插件、测试替身），本方法
-// 没有它的线协议可用，回落到自己的绑定——那是唯一正确的做法，插件本来也只
-// 该在收到的那份 Host 上调。
+// 没有它的线协议可用，同样落到第三级。
 func (h *HostClient) botFor(ctx context.Context) host.BotInfo {
+	if b, ok := host.BotOf(ctx); ok && !b.IsZero() {
+		return b
+	}
 	if o, ok := host.From(ctx).(*HostClient); ok && !o.bot.IsZero() {
 		return o.bot
 	}
+	h.noteFallback()
 	return h.bot
+}
+
+// noteFallback 把「用了第三级」这件事记下来。
+//
+// 为什么是 warn 而不是错误：错误会打断一条本来就合法的调用（Init 里注册任务、
+// 单 Bot 部署下的随手调用），而这里要解决的是「静默」——同一条 warn 里给出正确
+// 写法，插件作者改一次就再也不会看到它。
+func (h *HostClient) noteFallback() {
+	h.fallbackOnce.Do(func() {
+		if h.bot.IsZero() {
+			h.log.Warn("这次调用没有 Bot 上下文，本客户端也没绑定 Bot：host.* 会被核心按「缺少 bot_id」拒绝",
+				"hint", "用 Init 收到的 Host 发起带 ctx 的调用，或用 host.WithBot(ctx, h.Bot()) 钉住 Bot")
+			return
+		}
+		h.log.Warn("这次调用没有 Bot 上下文，回落到 Init 时的绑定",
+			"bot", h.bot.AppID,
+			"hint", "后台协程请用 host.WithBot(ctx, h.Bot()) 钉住 Bot；把某个 Bot 的 Init Host 存进结构体、再到别的 Bot 的事件里发无 ctx 调用，落点就是那个 Bot")
+	})
 }
 
 func (h *HostClient) Sender() host.Sender         { return senderClient{h} }

@@ -57,6 +57,10 @@ func WithHost(ctx context.Context, h Host) context.Context {
 
 // From 取回 ctx 里的 Host。**永不返回 nil**：没有时返回一个拒绝一切的替身，
 // 并（只）打一条 warn——静默返回零接口会让插件在第一次调用时 panic。
+//
+// 注意它与会回落的调用点不是一回事：`rpc.HostClient` 的方法在 ctx 里没有 Host
+// 时仍能发出调用（落到 Init 时的绑定，并另记一条 warn），而通过 `From(ctx)`
+// 拿到的替身会让每个能力直接失败。两者都在日志里留了痕，别指望其中一条静默。
 func From(ctx context.Context) Host {
 	if ctx != nil {
 		if h, ok := ctx.Value(hostCtxKey{}).(Host); ok && h != nil {
@@ -64,15 +68,21 @@ func From(ctx context.Context) Host {
 		}
 	}
 	missingHostOnce.Do(func() {
-		slog.Default().Warn("host.From：ctx 里没有 Bot 的 Host，使用拒绝性替身",
-			"hint", "只有 manifest / close 这类进程级路径可以没有 Host；进程内请用 Init 拿到的 Host 走带 ctx 的调用")
+		slog.Default().Warn("host.From：ctx 里没有 Bot 的 Host，返回拒绝性替身",
+			"hint", "只有 manifest / close 这类进程级路径可以没有 Host；事件处理里请用 Init 收到的 Host，或用 host.WithBot 把 Bot 钉进 ctx")
 	})
 	return missingHost{}
 }
 
-// WithBot 标注「这次调用属于哪个 Bot」。核心侧唯一用途是让共享的插件句柄
-// 按 Bot 分发（一个进程服务 N 个 Bot，而 Init / Handle / RunJob 的签名里
-// 没有 bot 参数）。
+// WithBot 标注「这次调用属于哪个 Bot」。
+//
+// 两个用途，方向不同：
+//   - 核心侧（主要用途）：一个进程服务 N 个 Bot，而 Init / Handle / RunJob 的
+//     签名里没有 bot 参数，核心用它告诉共享的插件句柄「这次调用属于谁」。
+//     这一路不出现在插件看到的线协议里。
+//   - 插件侧：给自己的后台协程钉住 Bot。goroutine 里没有「当前事件」，
+//     `host.WithBot(context.Background(), h.Bot())` 是不串库的写法——不带它
+//     的调用会落到那份 HostClient 绑定的 Bot，而那未必是你以为的那个。
 func WithBot(ctx context.Context, b BotInfo) context.Context {
 	return context.WithValue(ctxOr(ctx), botCtxKey{}, b)
 }

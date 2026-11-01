@@ -869,6 +869,19 @@ go run ./tools/build all -target linux/amd64 -o bin/qqbot
 
 从 v14 起，一套插件进程服务核心里的**所有 Bot**（ADR-0008 决策 11）：同一个插件实例会**先后收到不同 Bot 的事件**。Bot 上下文只从**当前调用的 ctx** 取——`host.From(ctx).Bot()` 拿 appid 与认证类型，`host.From(ctx).Config()` 读当前 Bot 的业务面配置；不要用包级变量或"当前 Bot"字段缓存它，那会串库。Init 拿到的 `h` 可以照常存进结构体：带 ctx 的调用会自动落到当前事件所属的 Bot 上（`Config()` 例外，它没有 ctx，返回的是本实例绑定的那个 Bot 的配置）。
 
+**自己的后台协程必须把 Bot 钉进 ctx。** 协程里没有"当前事件"，你手里只有当初捕获的那份 `h`，所以：
+
+```go
+// Init 是按 Bot 各调一次的：这里为每个 Bot 起一个自己的循环
+func (p *plugin) Init(ctx context.Context, h host.Host) error {
+	bot := h.Bot()                    // 这一轮 Init 属于哪个 Bot
+	go p.loop(host.WithBot(context.Background(), bot), h)
+	return nil
+}
+```
+
+少了 `host.WithBot` 这一步，`h.KV()`、`h.Sender()` 这类调用会落回 **`h` 绑定**的那个 Bot——把一个 Bot 的 `h` 存进结构体、再到另一个 Bot 的事件里发无 ctx 的调用，数据就写进了别人的库。这类调用现在会打一条 warn（每份客户端一次，带 `bot=` 与正确写法），见到它说明调用姿势有问题，不要当成噪声。`Scheduler().Register` 是例外：它的签名里没有 ctx，永远用本绑定的 Bot（在 Init 里为这个 Bot 注册任务，正是它的语义）。
+
 ### 一条命令生成使用面
 
 使用面由工具静态扫描生成，**不要手写**。在插件 module 根目录：
