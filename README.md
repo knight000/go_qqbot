@@ -569,7 +569,7 @@ QQ 机器人 v2 **不下发 QQ 号**。但事件载荷里的 `author.id` 是平�
 | 软预算（每分钟） | `[quota.<档名>] single_qpm` / `group_qpm` | Bot 级、按场景的每分钟上限（平台频控的 50%），与每日额度同为库里一次原子 upsert；超限拒发并返回 `ErrActiveQuota`，**不排队、不跨天补发** |
 | 每日预算 | `[quota.<档名>] daily_per_peer` | 每 (场景, 收件人) 每天最多 N 条，落库记账（重启不清零、跨日按调度时区 `Asia/Shanghai` 换桶，与 cron 同源），先扣预算再发 HTTP；平台明确拒绝时归还，网络失败不归还。`[active] daily_per_peer` 是它的全局临时覆盖（0 = 跟随档位） |
 | 超限通知 | 自动 | 当天首次超限私聊 Bot 所有者一条，之后不重复；通知本身不占软预算，仍受 429 冷却约束 |
-| 重启抑制 | `[plugins.bootnotice] min_interval` | 距上次启动不足该间隔则整轮跳过，防崩溃重启刷屏 |
+| 重启抑制 | `[plugins.bootnotice] min_interval` | 距上次启动不足该间隔则整轮跳过，防崩溃重启刷屏；**计划内重启例外**（`/reload`、`/upgrade` 换盘、回滚），否则"重启后确认更新是否生效"没有回执 |
 | 重试 | `[plugins.bootnotice] retry_delay` | 失败只重试一次；主动消息没有 `msg_id` 幂等键，多试等于重复推送 |
 
 优先级是 **429 冷却 > 软预算**（平台才是真相）：冷却期内一律返回 `ErrRateLimited`。
@@ -622,6 +622,22 @@ retry_delay = "30s"
    - Windows：没有 `execve`，拉起新进程后旧进程退出；此时网关与数据库都已关闭，不会出现两个实例抢同一个 session。
 
 `/upgrade apply` 走的是同一条序列，只在第 5 步之前多一次换盘（`qqbot.new` → `qqbot`）。
+
+**重启之后怎么确认"现在跑的是哪个版本"**：
+
+```bash
+/var/lib/qqbot/bin/qqbot version     # 0.1.1 4634a818 —— 版本 + 短 commit
+```
+
+`version` 在加载配置**之前**处理，所以配置写坏了也能用（#70 之前它会被当成"用默认配置启动"，报的是配置文件不存在）。换盘走 `execve` 时 PID 不变、`NRestarts` 不涨，判断"那次 `/upgrade` 到底生效没有"要看日志里的重启原因：
+
+| 触发 | 日志 |
+|---|---|
+| `/reload`、`/restart` | `本次启动由/reload触发` |
+| `/upgrade apply` 换盘后 | `本次启动由升级换盘触发` |
+| 升级后没活过 30 秒观察窗、自动回滚 | `本次启动由升级回滚触发` |
+
+启动通知（bootnotice 私聊）里也带同一句：`（/reload）`、`（升级换盘）`、`（升级回滚）`。
 
 重启后 `bootnotice` 会私聊「机器人已上线」，`/ping` 首行显示版本，两边对比就能确认：
 

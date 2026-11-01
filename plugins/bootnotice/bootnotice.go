@@ -41,7 +41,7 @@ type Plugin struct {
 func (p *Plugin) Manifest() host.Manifest {
 	return host.Manifest{
 		Name:         "bootnotice",
-		Version:      "0.1.1",
+		Version:      "0.1.2",
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.active", "admin.directory", "kv", "log"},
 		// 不发消息事件：本插件只在启动时动作，不参与路由匹配。
@@ -106,9 +106,9 @@ func (p *Plugin) run(ctx context.Context) {
 			"reason", "管理员列表为空，或授权里没有可用的 openid")
 		return
 	}
-	// /reload 是管理员显式要求重启，此时必须发——否则"重启后确认更新是否生效"
-	// 会被崩溃抑制窗口吞掉，变成一次没有回执的操作。
-	if hasPrev && p.minInterval > 0 && time.Since(prev) < p.minInterval && !buildinfo.RestartedByReload() {
+	// 计划内重启（/reload、/upgrade 换盘、回滚）是管理员显式要求的，此时必须发——
+	// 否则"重启后确认更新是否生效"会被崩溃抑制窗口吞掉，变成一次没有回执的操作。
+	if hasPrev && p.minInterval > 0 && time.Since(prev) < p.minInterval && !buildinfo.Restarted() {
 		p.log.Info("距上次启动不足 min_interval，跳过通知",
 			"last", prev.Format(time.RFC3339), "min_interval", p.minInterval.String())
 		return
@@ -170,8 +170,10 @@ func compose(start, prev time.Time, hasPrev bool) string {
 	b.WriteString("机器人已上线\n")
 	bi := buildinfo.Get()
 	fmt.Fprintf(&b, "版本 %s", bi.String())
-	if buildinfo.RestartedByReload() {
-		b.WriteString("（/reload 重启）")
+	// 原因要写出来：升级换盘与 /reload 走同一条重启路径，只写 /reload 会让
+	// owner 以为自己的 /upgrade 没生效（#70）。
+	if reason := buildinfo.RestartReason(); reason != "" {
+		b.WriteString("（" + buildinfo.RestartCause(reason) + "）")
 	}
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "启动 %s｜%s/%s\n", start.Format("01-02 15:04:05"), runtime.GOOS, runtime.GOARCH)

@@ -12,7 +12,8 @@ import (
 // 安全性来自调用时机：run 返回时网关已断开、session 已落盘、SQLite 已关闭，
 // 新进程起来时不会和旧进程抢同一个 gateway session 与数据库写锁。
 // 子进程继承控制台，前台运行时输出仍然可见。
-func restartSelf(exe string) error {
+// reason 会写进 QQBOT_RESTARTED，新进程据此说明"为什么重启"。
+func restartSelf(exe, reason string) error {
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -20,7 +21,7 @@ func restartSelf(exe string) error {
 	if wd, err := os.Getwd(); err == nil {
 		cmd.Dir = wd
 	}
-	cmd.Env = withRestartEnv(os.Environ())
+	cmd.Env = withRestartEnv(os.Environ(), reason)
 	if err := cmd.Start(); err != nil {
 		return err
 	}

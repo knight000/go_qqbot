@@ -21,9 +21,21 @@ import (
 // Version 是发布版本号，默认 dev；构建时可由 -ldflags 覆盖。
 var Version = "dev"
 
-// RestartEnv 是 /reload 重新执行自身时写入的环境变量。
-// 启动日志据此标注"本次是重载启动"，bootnotice 据此跳过崩溃抑制窗口。
+// RestartEnv 是重新执行自身时写入的环境变量，值是**重启原因**（见下面三个常量）。
+//
+// 为什么不是 bool：/reload 与 /upgrade apply 走的是同一条重启路径（ADR-0006
+// 决策 8），旧版本无条件写 "1"，于是升级换盘之后日志照样打「本次启动由 /reload
+// 触发」——而 owner 恰恰是靠这一行判断"我那次 /upgrade 到底有没有生效"（#70）。
 const RestartEnv = "QQBOT_RESTARTED"
+
+// 重启原因（RestartEnv 的取值）。
+//
+// 老版本写的是 "1"，只能解释成 /reload：那时升级后的重启也是同一条路径。
+const (
+	RestartReload   = "reload"   // /reload、/restart
+	RestartUpgrade  = "upgrade"  // /upgrade apply 换盘后
+	RestartRollback = "rollback" // 升级没成：换盘失败，或新版本没活过观察窗
+)
 
 // SupervisorEnv 由 tools/devrun 注入。设置后 /reload 不再自行换进程映像，
 // 而是以 ExitRestartRequired 退出，把「重新产出插件产物 + 编译核心 + 拉起」
@@ -100,8 +112,44 @@ func (i Info) String() string {
 	return i.Version + " " + i.Commit
 }
 
-// RestartedByReload 报告本进程是否由 /reload 拉起。
-func RestartedByReload() bool { return os.Getenv(RestartEnv) == "1" }
+// RestartReason 返回本次进程是怎么被拉起来的：空串表示不是重启（首次启动）。
+//
+// 老版本写的 "1" 解释成 /reload——那时还没有原因这个概念，而唯一会写它的
+// 就是 /reload 与升级，两者当时在日志里本来也分不开。
+// 未知取值原样返回：新原因不该让老核心把它当成"没重启"。
+func RestartReason() string {
+	switch v := strings.TrimSpace(os.Getenv(RestartEnv)); v {
+	case "", "0":
+		return ""
+	case "1":
+		return RestartReload
+	default:
+		return v
+	}
+}
+
+// Restarted 报告本进程是否由一次计划内的重启拉起。
+//
+// 用它的地方只关心"是不是重启"（拿锁等久一点、跳过启动通知的抑制窗口），
+// 不关心原因；关心原因的地方读 RestartReason。
+func Restarted() bool { return RestartReason() != "" }
+
+// RestartCause 是原因的短名词短语，供调用方拼进自己的句子：
+// 启动日志「本次启动由 X 触发」、启动通知「（X）」。
+//
+// 放这里而不是各处各写一份 switch：这是同一组取值的展示口径，两处说法不一致
+// 时，排障的人得先判断"这两句是不是同一个意思"。
+func RestartCause(reason string) string {
+	switch reason {
+	case RestartReload:
+		return "/reload"
+	case RestartUpgrade:
+		return "升级换盘"
+	case RestartRollback:
+		return "升级回滚"
+	}
+	return reason
+}
 
 // Supervised 报告本进程是否由 tools/devrun 托管。
 // 托管时 /reload 退化为「退出码 75」，由父进程重新编译后再拉起。
