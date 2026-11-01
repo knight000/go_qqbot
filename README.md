@@ -64,7 +64,7 @@ $EDITOR config/config.local.toml
 启动日志里能确认插件真的装上了（这几行都在连网关之前，网关连不上照样打）：
 
 ```text
-[INFO] 发现插件 component=pluginproc plugin=echo version=0.1.0 api_version=14 commands=2 optional=0
+[INFO] 发现插件 component=pluginproc plugin=echo version=0.1.1 api_version=14 commands=2 optional=0
 [INFO] 进程级插件已装配 plugins=4 plugin_names=adminping,bootnotice,echo,md
 [INFO] 核心已启动 bot=102xxxxx plugins=4 sandbox=true
 [INFO] Bot 已启动 bot=102xxxxx db=...\bots\102xxxxx\qqbot.db lock=... app_lock=... plugins=4

@@ -41,7 +41,7 @@ type Plugin struct {
 func (p *Plugin) Manifest() host.Manifest {
 	return host.Manifest{
 		Name:         "bootnotice",
-		Version:      "0.1.0",
+		Version:      "0.1.1",
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.active", "admin.directory", "kv", "log"},
 		// 不发消息事件：本插件只在启动时动作，不参与路由匹配。

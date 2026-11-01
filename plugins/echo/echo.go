@@ -23,7 +23,7 @@ type Plugin struct {
 func (p *Plugin) Manifest() host.Manifest {
 	return host.Manifest{
 		Name:         "echo",
-		Version:      "0.1.0",
+		Version:      "0.1.1",
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.reply", "log"},
 		Intents:      []string{"message"},

@@ -40,7 +40,7 @@ type Plugin struct {
 func (p *Plugin) Manifest() host.Manifest {
 	return host.Manifest{
 		Name:         "adminping",
-		Version:      "0.2.0",
+		Version:      "0.2.1",
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.reply", "log"},
 		Intents:      []string{"message"},

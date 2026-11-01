@@ -45,7 +45,7 @@ type Plugin struct {
 func (p *Plugin) Manifest() host.Manifest {
 	return host.Manifest{
 		Name:         "md",
-		Version:      "0.3.0",
+		Version:      "0.3.1",
 		APIVersion:   host.APIVersion,
 		Capabilities: []string{"sender.reply", "render", "log"},
 		Intents:      []string{"message"},
