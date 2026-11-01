@@ -30,6 +30,7 @@ import (
 	// 不嵌的话 time.LoadLocation("Asia/Shanghai") 会失败并回退 UTC，cron 时间整体偏移 8 小时。
 	_ "time/tzdata"
 
+	"github.com/knight000/go_qqbot/internal/assetsrc"
 	"github.com/knight000/go_qqbot/internal/buildinfo"
 	"github.com/knight000/go_qqbot/internal/config"
 	"github.com/knight000/go_qqbot/internal/core"
@@ -268,15 +269,17 @@ func run() (*core.RestartRequest, error) {
 		UpgradeFor: func(b config.Bot, db *store.DB, plugins []host.Plugin) core.UpgradeService {
 			// 升级是进程级的（换的是这个二进制），但快照落在该 Bot 自己的库上。
 			return upgrade.New(upgrade.Options{
-				Enabled:   cfg.UpgradeEnabled(),
-				APIBase:   cfg.Upgrade.APIBase,
-				AssetBase: cfg.Upgrade.AssetBase,
-				Token:     cfg.Upgrade.Token,
-				Exe:       exePath,
-				DataDir:   datadir,
-				Current:   buildinfo.Get().Version,
-				Plugins:   loadedPlugins(plugins),
-				Snapshots: db,
+				Enabled: cfg.UpgradeEnabled(),
+				APIBase: cfg.Upgrade.APIBase,
+				// 二进制通道已在 config 层解析成模板（#70）：官方 / 镜像预设 /
+				// 自定义，三档在这里不再分支。
+				AssetSource: cfg.Upgrade.AssetSource(),
+				Token:       cfg.Upgrade.Token,
+				Exe:         exePath,
+				DataDir:     datadir,
+				Current:     buildinfo.Get().Version,
+				Plugins:     loadedPlugins(plugins),
+				Snapshots:   db,
 				// 快照按 Bot 分开：裁剪只留 2 份，共用目录等于让两个租户
 				// 互相删备份。state.json 仍在 <datadir>/upgrade（进程级标记）。
 				SnapshotRoot: cfg.BotDataDir(b),
@@ -314,6 +317,10 @@ func run() (*core.RestartRequest, error) {
 	if buildinfo.RestartedByReload() {
 		log.Info("本次启动由 /reload 触发", "version", bi.String())
 	}
+	// 升级通道（#70）：回答"我到底走没走镜像"不该靠翻配置文件。与 /upgrade
+	// 预览里的那行是同一句文案（assetsrc.ChannelText），两处说法必须一致。
+	// 关掉自更新时照打：那是配置事实，而"关掉了"另有 enabled 这一项可查。
+	log.Info(upgradeChannelLine(cfg))
 	if cfg.Debug.Enabled {
 		if cfg.Debug.Level == config.DebugPlugin {
 			log.Info("调试模式已开启", "level", cfg.Debug.Level,
@@ -489,4 +496,12 @@ func logStartup(log *slog.Logger, in startupInfo) {
 		"platform", in.Platform,
 		"go", in.GoVersion,
 		"restarted", in.Restarted)
+}
+
+// upgradeChannelLine 是启动日志里那行通道说明（#70）。
+//
+// 抽成函数只为可测：它必须与 /upgrade 预览里的那句逐字一致，而"启动日志与
+// 预览都能看出当前通道"是本票的验收之一。
+func upgradeChannelLine(cfg *config.Config) string {
+	return "升级通道 " + assetsrc.ChannelText(cfg.Upgrade.AssetSource(), cfg.Upgrade.Token)
 }

@@ -12,13 +12,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/knight000/go_qqbot/internal/assetsrc"
 )
 
-// 默认地址。api_base 是元数据通道，asset_base 是二进制通道（决策 3）。
+// 默认地址。api_base 是元数据通道，二进制走 AssetSource 解析出的模板（决策 3）。
 const (
-	DefaultAPIBase   = "https://api.github.com"
-	DefaultAssetBase = "https://github.com"
-	DefaultRepo      = "knight000/go_qqbot"
+	DefaultAPIBase = "https://api.github.com"
+	DefaultRepo    = "knight000/go_qqbot"
 
 	// MaxAssetBytes 是单个产物的上限。40 MB 的核心产物 + 交叉编译留足余量，
 	// 但必须有天花板：没有它，一个被投毒/配错的元数据就能把磁盘写满。
@@ -50,16 +51,19 @@ const (
 	bodyTimeout = 15 * time.Minute
 )
 
-// client 只认识 api_base / asset_base 两个地址，不共用 internal/httpx：
+// client 只认识 api_base 与"二进制通道模板"两样东西，不共用 internal/httpx：
 // 后者是插件出站通道（8 MiB 上限、只解 JSON、占插件的配额桶，见 ADR-0006
 // 「为什么下载不走 httpx」）。
 type client struct {
-	apiBase   string
-	assetBase string
-	token     string
-	repo      string
-	meta      *http.Client
-	body      *http.Client
+	apiBase string
+	// assetTemplate 是二进制通道的 URL 模板（{owner} {repo} {tag} {asset}），
+	// 由 [upgrade].source / mirror / asset_url 解析而来（#70）。持有模板而不是
+	// 前缀：镜像要的形状不止一种，客户端不该知道"哪种镜像要哪种形状"。
+	assetTemplate string
+	token         string
+	repo          string
+	meta          *http.Client
+	body          *http.Client
 
 	// tags 缓存按 tag 取过的发布：一次 /upgrade plugin all 里多个插件可能
 	// 指向同一个旧 tag，只查一次（#52）。
@@ -67,24 +71,24 @@ type client struct {
 	tags map[string]*ghRelease
 }
 
-func newClient(apiBase, assetBase, token, repo string) *client {
+func newClient(apiBase, assetTemplate, token, repo string) *client {
 	if strings.TrimSpace(apiBase) == "" {
 		apiBase = DefaultAPIBase
 	}
-	if strings.TrimSpace(assetBase) == "" {
-		assetBase = DefaultAssetBase
+	if strings.TrimSpace(assetTemplate) == "" {
+		assetTemplate = assetsrc.DefaultTemplate
 	}
 	if strings.TrimSpace(repo) == "" {
 		repo = DefaultRepo
 	}
 	return &client{
-		apiBase:   strings.TrimRight(apiBase, "/"),
-		assetBase: strings.TrimRight(assetBase, "/"),
-		token:     strings.TrimSpace(token),
-		repo:      strings.Trim(repo, "/"),
-		meta:      &http.Client{Timeout: metaTimeout},
-		body:      &http.Client{Timeout: bodyTimeout},
-		tags:      map[string]*ghRelease{},
+		apiBase:       strings.TrimRight(apiBase, "/"),
+		assetTemplate: strings.TrimSpace(assetTemplate),
+		token:         strings.TrimSpace(token),
+		repo:          strings.Trim(repo, "/"),
+		meta:          &http.Client{Timeout: metaTimeout},
+		body:          &http.Client{Timeout: bodyTimeout},
+		tags:          map[string]*ghRelease{},
 	}
 }
 
@@ -99,7 +103,7 @@ type ghAsset struct {
 	Digest string `json:"digest"`
 }
 
-// forRepo 是"同一个 api_base / asset_base / token，另一个仓"的 client（#53）。
+// forRepo 是"同一个 api_base / 模板 / token，另一个仓"的 client（#53）。
 //
 // 为什么必须另起一个：repo 是构造期固定的，releases/latest 与资产地址都由它
 // 拼出；而 tags 缓存只按 tag 做键——同一个 tag 名在两个仓含义不同，复用核心
@@ -107,13 +111,13 @@ type ghAsset struct {
 // 都是主机级的），tag 缓存各一份。
 func (c *client) forRepo(repo string) *client {
 	return &client{
-		apiBase:   c.apiBase,
-		assetBase: c.assetBase,
-		token:     c.token,
-		repo:      strings.Trim(repo, "/"),
-		meta:      c.meta,
-		body:      c.body,
-		tags:      map[string]*ghRelease{},
+		apiBase:       c.apiBase,
+		assetTemplate: c.assetTemplate,
+		token:         c.token,
+		repo:          strings.Trim(repo, "/"),
+		meta:          c.meta,
+		body:          c.body,
+		tags:          map[string]*ghRelease{},
 	}
 }
 
@@ -161,9 +165,9 @@ func (c *client) checkIndex(ctx context.Context) (*Release, error) {
 //
 // 通道语义（决策 3 + 私有仓扩展）：
 //   - index.json 与 checksums.txt **永远**走 api_base；
-//   - 没有 token 时二进制走 asset_base（可指向镜像）；
+//   - 没有 token 时二进制走二进制通道模板（官方 / 镜像 / 自定义，#70）；
 //   - 有 token 时三份产物全走 api_base 的 release asset 端点——私有仓的
-//     资产无法在镜像上匿名取，而且 token 绝不能发给 asset_base 的主机。
+//     资产无法在镜像上匿名取，而且 token 绝不能发给二进制通道的主机。
 func (c *client) check(ctx context.Context) (*Release, error) {
 	out, err := c.checkIndex(ctx)
 	if err != nil {
@@ -194,7 +198,7 @@ func (c *client) check(ctx context.Context) (*Release, error) {
 	if c.token != "" {
 		out.CoreURL = c.apiAssetURL(id)
 	} else {
-		out.CoreURL = c.mirrorURL(tag, name)
+		out.CoreURL = c.binaryURL(tag, name)
 	}
 	return out, nil
 }
@@ -240,16 +244,32 @@ func (c *client) apiAssetURL(id int64) string {
 	return fmt.Sprintf("%s/repos/%s/releases/assets/%d", c.apiBase, c.repo, id)
 }
 
-// mirrorURL 是镜像通道的地址。owner/repo 必须出现在路径里：镜像站
-// 只是把 https://github.com 换掉的前缀（决策 3）。
-func (c *client) mirrorURL(tag, asset string) string {
-	return c.assetBase + "/" + c.repo + "/releases/download/" + tag + "/" + asset
+// binaryURL 是二进制通道的地址：按模板把 owner / repo / tag / 资产名填进去。
+//
+// 模板的三种形状（官方 / 镜像预设 / 自定义）都收敛到这一处（#70）：镜像站
+// 只是"换前缀"还是"把整个 github 地址塞进路径"的差别，拼装逻辑不该有两份。
+func (c *client) binaryURL(tag, asset string) string {
+	owner, repo := splitRepo(c.repo)
+	return assetsrc.Render(c.assetTemplate, owner, repo, tag, asset)
+}
+
+// splitRepo 把 owner/repo 拆成两段，供 {owner} {repo} 两个占位符使用。
+//
+// 没有 "/" 时整串当 repo、owner 留空：Repo 的默认值由本包给（DefaultRepo），
+// 走到这里的一定是 "owner/repo" 形状，多一层校验没有意义。
+func splitRepo(repo string) (owner, name string) {
+	repo = strings.Trim(repo, "/")
+	if i := strings.IndexByte(repo, '/'); i >= 0 {
+		return repo[:i], repo[i+1:]
+	}
+	return "", repo
 }
 
 // get 发一次 GET，把非 2xx 变成能读懂的错误。
 //
-// Authorization 只加给 api_base 的主机：token 是私有仓凭据，asset_base
-// 是用户可配置的镜像，把凭据发给它等于泄露（本包唯一的硬性约束）。
+// Authorization 只加给 api_base 的主机：token 是私有仓凭据，二进制通道是
+// 用户可配置的地址（可能是别人搭的镜像），把凭据发给它等于泄露（本包唯一的
+// 硬性约束）。
 func (c *client) get(ctx context.Context, hc *http.Client, rawURL, accept string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -270,7 +290,7 @@ func (c *client) get(ctx context.Context, hc *http.Client, rawURL, accept string
 	}
 	if resp.StatusCode/100 != 2 {
 		resp.Body.Close()
-		return nil, &httpError{url: rawURL, status: resp.Status, hint: hintFor(resp.StatusCode)}
+		return nil, &httpError{url: rawURL, status: resp.Status, hint: c.hintFor(rawURL, resp.StatusCode)}
 	}
 	return resp.Body, nil
 }
@@ -304,9 +324,21 @@ func (c *client) sameHost(rawURL, base string) bool {
 
 // hintFor 把最常见的几个状态码翻译成人话。失败文案是 owner 唯一能看到的
 // 现场（决策「代价」一节：每条失败模式都要有明确的用户可见文案）。
-func hintFor(code int) string {
+//
+// 404 多一句通道建议：自定义模板最常见的错是"镜像要的是完整
+// https://github.com 路径，而这里只给了域名前缀"——两种写法都合法，只有
+// 拿真实地址去请求才分得清（#70 实测：gh-proxy.com 只认前一种）。
+//
+// 这句只加给**二进制通道**的请求：get 同时服务元数据与产物，元数据 404
+// （仓名写错、没有 release）与镜像形状毫无关系，把 owner 引到镜像上去
+// 只会让人查错方向。
+func (c *client) hintFor(rawURL string, code int) string {
 	switch code {
 	case http.StatusNotFound:
+		if !c.sameHost(rawURL, c.apiBase) && c.assetTemplate != assetsrc.DefaultTemplate {
+			return "（发布或资产不存在：检查私有仓的 token 权限、tag 与产物名；" +
+				"当前二进制通道不是官方直连，确认镜像要的是完整 https://github.com 路径还是纯路径前缀）"
+		}
 		return "（发布或资产不存在：检查私有仓的 token 权限、tag 与产物名）"
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return "（凭据无效或无权访问：检查 [upgrade].token）"

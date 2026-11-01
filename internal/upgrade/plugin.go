@@ -310,10 +310,10 @@ func (u *Upgrader) upgradePluginFromUpstream(ctx context.Context, tgt PluginTarg
 		return d
 	}
 
-	// 地址永远由 api_base / asset_base + tag + 资产名拼出，不读 manifest 里的
-	// 任何地址字段。这里把"上游仓的直链"当成索引里的那种地址交给 assetURL：
-	// 通道选择（有 token 走 api 资产端点、没有走镜像直链）只该有一份实现。
-	raw := cl.assetBase + "/" + up + "/releases/download/" + tag + "/" + asset.name
+	// 地址永远由模板 + tag + 资产名拼出，不读 manifest 里的任何地址字段。
+	// 这里把"上游仓的直链"当成索引里的那种地址交给 assetURL：通道选择（有
+	// token 走 api 资产端点、没有走二进制通道模板）只该有一份实现。
+	raw := cl.binaryURL(tag, asset.name)
 	url, err := cl.assetURL(ctx, &Release{Tag: tag, gh: rel}, raw)
 	if err != nil {
 		d.Action = "失败（" + err.Error() + "）"
@@ -625,7 +625,8 @@ func (b *tailBuffer) tail() string {
 //   - 有 token：按**URL 里自带的 tag** 取该 tag 的发布，再按资产名回查 id，
 //     走 api_base 的资产端点——私有仓的产物在镜像上根本取不到，而且 token
 //     绝不能发给镜像主机；
-//   - 没有 token：按 tag + 资产名拼 asset_base 的直链（可能是镜像）。
+//   - 没有 token：按 tag + 资产名套二进制通道模板拼地址（官方 / 镜像 / 自定义，
+//     #70 的三档收敛到同一处）。
 //
 // tag 必须从 URL 里取而不是用当前发布的 tag：没更新的插件会沿用上一条目，
 // 它的地址指向上一版 tag（#52）。用当前 tag 重新拼会 404。
@@ -638,7 +639,7 @@ func (c *client) assetURL(ctx context.Context, rel *Release, raw string) (string
 		tag = rel.Tag
 	}
 	if c.token == "" {
-		return c.mirrorURL(tag, name), nil
+		return c.binaryURL(tag, name), nil
 	}
 	gh := rel.gh
 	if tag != rel.Tag {
