@@ -14,7 +14,7 @@ import (
 	"github.com/knight000/go_qqbot/pkg/host"
 )
 
-// ErrPassiveExhausted 是本地被动窗口用尽（群 5 次/5 分钟、单聊 4 次/小时）。
+// ErrPassiveExhausted 是本地被动窗口用尽（群 5 次/5 分钟、单聊 4 次/60 分钟）。
 //
 // 主动消息的三类失败不在这里：它们定义在 host（插件唯一能 import 的包），
 // 核心内部直接引用 host 侧的名字，不给同一个哨兵起第二个名字（#34）。
@@ -91,6 +91,11 @@ type quotaNoticeStore interface {
 //   - 单聊：60 分钟内最多 4 次；
 //   - msg_seq 在同一 msg_id 下单调递增，窗口过期只重置剩余次数、不回退序号；
 //   - msg_id + msg_seq 全局唯一，重试不得复用同一 seq。
+//
+// 主动消息那边平台有三条维度（Bot 维度 qpm/qps、单关系 20 qpm、单关系每日
+// 1000 条），本地只记「Bot 维度分钟」与「单关系每日」两个桶；单关系 20 qpm
+// 不记账，触顶由 429 与 (scene, peer) 冷却兜底——它可重试，不像被动配额那样
+// 直接丢消息。
 type Sender struct {
 	api    messageAPI
 	log    *slog.Logger
@@ -251,7 +256,7 @@ func (s *Sender) sendImageFailureNotice(ctx context.Context, ev *host.Event) {
 //
 // 平台一条消息只有一种 msg_type，图文合并表达不出来，只能拆成两条：
 // 先文本、后图片。代价是一次 Reply 消耗两次被动回复配额（群 5 次/5 分钟、
-// 单聊 4 次/小时），顺序固定是为了让"说明在上、图在下"符合阅读习惯。
+// 单聊 4 次/60 分钟），顺序固定是为了让"说明在上、图在下"符合阅读习惯。
 func splitReply(msg host.Reply) ([]host.Reply, error) {
 	if !msg.Image.Valid() {
 		// 富媒体消息没有 media 字段只会被平台拒绝，在本地拦掉更好排障。
@@ -371,7 +376,7 @@ func (s *Sender) startCooldown(scene host.Scene, peer string, d time.Duration) {
 // releasePassiveOnBusinessError 把一格被动配额还回去。
 //
 // 只认业务错误：网络失败/超时时请求可能已经到达平台，还回去等于允许实际发送
-// 超过窗口上限（群 5 次/5 分钟、单聊 4 次/小时都是平台硬约束）。
+// 超过窗口上限（群 5 次/5 分钟、单聊 4 次/60 分钟都是平台硬约束）。
 //
 // seq 不回退：被拒的那次可能已经占用平台的 (msg_id, msg_seq) 判重记录，
 // 回退会让下一条撞上同一个序号。
@@ -589,7 +594,8 @@ func (s *Sender) sendActiveOne(ctx context.Context, scene host.Scene, peerID str
 		return rateLimitedError(scene, peerID, wait)
 	}
 	// 主动消息的日预算比被动窗口稀缺得多（按天计），所以先扣预算再上传：
-	// 额度已尽时不该再浪费一次上传。被动回复反过来——窗口 5 分钟就过期。
+	// 额度已尽时不该再浪费一次上传。被动回复反过来——窗口按条算，群 5 分钟、
+	// 单聊 60 分钟，过期就作废，所以必须先发再谈别的。
 	//
 	// 扣额度是库里的一次原子 upsert（§4.1 active_usage），因此不存在
 	// "内存清零"或"重启后从 0 重来"的问题：进程只是账本的读者之一。

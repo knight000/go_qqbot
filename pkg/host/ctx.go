@@ -28,8 +28,9 @@ import (
 // BotInfo 是「当前是哪个 Bot」：appid 是 Bot 的唯一标识（线协议里的 bot_id
 // 就是它），CertType 是平台认证档位（unverified / personal / enterprise）。
 //
-// CertType 跟着 Bot 走而不是靠插件自己查配置：认证类型决定「这个 Bot 能触及
-// 谁」，同一份插件代码在不同租户下的行为可能因此不同（ADR-0008 决策 6）。
+// CertType 跟着 Bot 走而不是靠插件自己查配置：认证类型既决定「这个 Bot 能触及
+// 谁」，也决定主动消息的 Bot 维度频控（企业/个人同档，未认证更低）。同一份插件
+// 代码在不同租户下的行为可能因此不同（ADR-0008 决策 6）。
 type BotInfo struct {
 	AppID    string
 	CertType string

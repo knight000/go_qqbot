@@ -437,7 +437,7 @@ func TestSenderPassiveSlotReleasedOnBusinessError(t *testing.T) {
 }
 
 // 网络失败时那一格不能还：请求可能已经到达平台，还回去等于允许实际发送
-// 超过窗口上限（群 5 次/5 分钟、单聊 4 次/小时都是平台的硬约束）。
+// 超过窗口上限（群 5 次/5 分钟、单聊 4 次/60 分钟都是平台的硬约束）。
 func TestSenderPassiveSlotKeptOnNetworkError(t *testing.T) {
 	f := &fakeAPI{failSendAt: 1}
 	s := NewSender(f, slog.New(slog.DiscardHandler), ActivePolicy{}, nil, time.Local)

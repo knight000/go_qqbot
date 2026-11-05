@@ -73,8 +73,9 @@ func (db *DB) RefundActiveBudget(ctx context.Context, key ActiveUsageKey) error 
 
 // ActiveRateKey 是主动消息**每分钟**额度的维度：一分钟、一个场景。
 //
-// 没有 peer：平台频控是 Bot 级的（群聊 60 qpm、单聊 10 qps 都是整个 Bot 的
-// 合计），按会话建桶等于把平台的额度乘以会话数——那正好是超发。
+// 没有 peer：这张表只管平台的 Bot 维度（群聊 60 qpm、单聊 10 qps 都是整个 Bot
+// 的合计），按会话建桶等于把平台的额度乘以会话数——那正好是超发。平台还有一维
+// 「单关系 20 qpm」不在这张表里，本地不记账（见 ARCHITECTURE §7）。
 type ActiveRateKey struct {
 	// Minute 是调度时区的分钟键（YYYY-MM-DDTHH:MM）：与日额度同源，
 	// 所以跨时区部署不会在"哪一分钟"上分叉。

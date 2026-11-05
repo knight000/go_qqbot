@@ -813,7 +813,9 @@ path = "./data/qqbot.db"
 
 // ---- 软预算档位（#67）----
 
-// 默认档取平台值的 50%：群 60 qpm→30、单聊 10 qps→300/min、每关系 1000/天→500。
+// 默认档取企业/个人认证档平台值的 50%：群 60 qpm→30、单聊 10 qps→300/min、
+// 每关系 1000/天→500。未认证档更低（群 30 qpm、单聊 30 qpm 且 5 qps），默认档
+// 不对它自动分叉——要用 quota_profile 收紧。
 // 三个数都必须是数字常量而不是"未配置"：软预算静默变成不限量是最坏的形态。
 func TestQuotaDefaultsAreHalfOfPlatform(t *testing.T) {
 	t.Setenv("QQ_APP_ID", "")
