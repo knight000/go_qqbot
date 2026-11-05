@@ -112,6 +112,8 @@ plugins = ["bootnotice"]
 # （分钟桶装不下 qps，50% 就是给这个换算留的余量）。
 # 未认证 Bot 想严格对齐，就把它的 quota_profile 指到 single_qpm 与 group_qpm
 # 都不超过 15 的档位：默认档对它偏高约十倍（300/min 对平台 30 qpm）。
+# 不按 cert_type 自动分叉（2026-11-05 定：不做）——同一份配置在不同 Bot 上
+# 解出不同额度，排障时看不见。
 # 三项写 0 或整段省略都等于取默认档的值——不允许"某一维不限"。
 [quota.default]
 single_qpm = 300       # 单聊每分钟（全部单聊会话合计）
